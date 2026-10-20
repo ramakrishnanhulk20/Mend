@@ -1,0 +1,36 @@
+# Private planning files: never pushed (CLAUDE.md section 11)
+CLAUDE.md
+INTAKE.md
+PLAN.md
+STATE.md
+DECISIONS.md
+AGENT-RETROS.md
+SPEC.md
+docs/RD-BRIEF.md
+docs/AUDIT-PACKET.md
+.claude/
+scratchpad/
+reference/
+
+# Secrets
+.env
+.env.*
+!.env.example
+
+# Build output and dependencies
+node_modules/
+.next/
+.next-verify/
+dist/
+__pycache__/
+.venv/
+*.log
+
+# Local dev database (pgserver)
+.pgdata/
+
+# Engine data cache (downloaded datasets)
+.data/
+*.egg-info/
+.pytest_cache/
+.hypothesis/

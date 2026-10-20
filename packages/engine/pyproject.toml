@@ -1,0 +1,34 @@
+[build-system]
+requires = ["setuptools==84.2.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mend-engine"
+version = "0.1.0"
+description = "Mend engine: reads a shop's PayPal history and sends guarded cashback payouts in the PayPal sandbox."
+requires-python = ">=3.12"
+dependencies = [
+    "httpx==0.28.1",
+    "psycopg[binary]==3.3.6",
+    "paypal-server-sdk==2.4.0",
+    "pgserver==0.1.4",
+    "numpy==2.5.4",
+    "scipy==1.18.1",
+    "openpyxl==3.1.5",
+    "tzdata==2026.5",
+]
+
+[project.optional-dependencies]
+test = [
+    "pytest==9.1.1",
+    "hypothesis==6.170.5",
+]
+
+[tool.setuptools.packages.find]
+include = ["mend_engine*"]
+
+[tool.setuptools.package-data]
+mend_engine = ["db/schema.sql"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

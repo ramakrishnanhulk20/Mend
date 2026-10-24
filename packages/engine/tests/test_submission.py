@@ -18,7 +18,8 @@ from mend_engine.campaigns.approval import approve, review_hash, set_amount
 from mend_engine.campaigns.spend import CapExceeded
 from mend_engine.campaigns.submission import REFUSED_REASON, submit
 from mend_engine.config import SANDBOX_API_HOST, Config
-from mend_engine.db.connect import PGDATA, SCHEMA_PATH
+from mend_engine.db.connect import PGDATA
+from mend_engine.db.migrate import apply_schema
 from mend_engine.members.consent import DEMO_SHOP_NAME
 from mend_engine.members.membership import join_member
 from mend_engine.paypal import payouts
@@ -65,7 +66,7 @@ def open_conn(server_url: str, schema: str) -> psycopg.Connection:
 @pytest.fixture
 def conn(server_url: str, schema: str) -> Iterator[psycopg.Connection]:
     with open_conn(server_url, schema) as connection:
-        connection.execute(SCHEMA_PATH.read_text(encoding="utf-8"))
+        apply_schema(connection)
         yield connection
 
 

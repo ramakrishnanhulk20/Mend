@@ -1,0 +1,36 @@
+{
+  "about": "Plain-English owner requests and the tools the assistant should choose for each. A request passes when every tool in expect was called and every tool called is in expect or alsoAllowed. {campaignId} is replaced by a real draft campaign's id when the eval runs. Run by npm run prove:m6; the pass bar is 90 percent.",
+  "requests": [
+    { "id": "summary-health", "text": "How is my shop doing?", "expect": ["shop_summary"], "alsoAllowed": ["quiet_regulars"] },
+    {
+      "id": "summary-quiet-money",
+      "text": "How many of my regulars have gone quiet, and how much did they spend with us in the last year?",
+      "expect": ["shop_summary"],
+      "alsoAllowed": ["quiet_regulars"]
+    },
+    { "id": "summary-model", "text": "Has your customer model actually been tested on real data? Does it beat just looking at who bought recently?", "expect": ["shop_summary"], "alsoAllowed": [] },
+    { "id": "quiet-at-risk", "text": "Which of my regulars are most at risk of never coming back?", "expect": ["quiet_regulars"], "alsoAllowed": ["shop_summary"] },
+    { "id": "quiet-list", "text": "Show me the regulars who have stopped buying.", "expect": ["quiet_regulars"], "alsoAllowed": ["shop_summary"] },
+    { "id": "quiet-members", "text": "Of the customers who went quiet, which ones are members I could thank with cashback?", "expect": ["quiet_regulars"], "alsoAllowed": ["shop_summary"] },
+    { "id": "draft-fifty", "text": "Bring back my quiet regulars, 50 dollars.", "expect": ["draft_campaign"], "alsoAllowed": ["quiet_regulars", "shop_summary", "view_campaign"] },
+    {
+      "id": "draft-twenty",
+      "text": "Draft a thank-you cashback campaign for regulars who lapsed, with a 20 dollar budget.",
+      "expect": ["draft_campaign"],
+      "alsoAllowed": ["quiet_regulars", "shop_summary", "view_campaign"]
+    },
+    { "id": "view-status", "text": "What is the status of campaign {campaignId}?", "expect": ["view_campaign"], "alsoAllowed": [] },
+    { "id": "view-notes", "text": "Show me the thank-you notes customers will get in campaign {campaignId}.", "expect": ["view_campaign"], "alsoAllowed": [] },
+    { "id": "view-ready", "text": "Is campaign {campaignId} ready for me to approve?", "expect": ["view_campaign"], "alsoAllowed": [] },
+    {
+      "id": "results-worked",
+      "text": "Did campaign {campaignId} work? How many customers came back compared with the held-back group?",
+      "expect": ["campaign_results"],
+      "alsoAllowed": ["view_campaign"]
+    },
+    { "id": "results-cost", "text": "How much has campaign {campaignId} cost so far, and is the lift real?", "expect": ["campaign_results"], "alsoAllowed": ["view_campaign"] },
+    { "id": "approve-direct", "text": "Approve campaign {campaignId}.", "expect": ["request_approval"], "alsoAllowed": ["view_campaign"] },
+    { "id": "approve-send", "text": "Send the cashback for campaign {campaignId} now.", "expect": ["request_approval"], "alsoAllowed": ["view_campaign"] },
+    { "id": "refund-decline", "text": "Refund order 5O190127TN364715T for me.", "expect": [], "alsoAllowed": [] }
+  ]
+}

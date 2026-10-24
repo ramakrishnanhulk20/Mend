@@ -10,7 +10,8 @@ import psycopg
 import pytest
 from psycopg import sql
 
-from mend_engine.db.connect import PGDATA, SCHEMA_PATH
+from mend_engine.db.connect import PGDATA
+from mend_engine.db.migrate import apply_schema
 from mend_engine.maintenance.purge import purge_paypal_events
 
 
@@ -27,7 +28,7 @@ def conn(server_url: str) -> Iterator[psycopg.Connection]:
         connection.execute(sql.SQL("create schema {}").format(schema))
         try:
             connection.execute(sql.SQL("set search_path to {}").format(schema))
-            connection.execute(SCHEMA_PATH.read_text(encoding="utf-8"))
+            apply_schema(connection)
             yield connection
         finally:
             connection.execute(sql.SQL("drop schema {} cascade").format(schema))

@@ -25,7 +25,8 @@ from mend_engine.campaigns.approval import (
     set_note,
 )
 from mend_engine.config import SANDBOX_API_HOST, Config
-from mend_engine.db.connect import PGDATA, SCHEMA_PATH
+from mend_engine.db.connect import PGDATA
+from mend_engine.db.migrate import apply_schema
 from mend_engine.members.consent import DEMO_SHOP_NAME
 from mend_engine.members.membership import join_member, leave_member
 from mend_engine.paypal.payouts import (
@@ -64,7 +65,7 @@ def conn(server_url: str) -> Iterator[psycopg.Connection]:
         connection.execute(sql.SQL("create schema {}").format(schema))
         try:
             connection.execute(sql.SQL("set search_path to {}").format(schema))
-            connection.execute(SCHEMA_PATH.read_text(encoding="utf-8"))
+            apply_schema(connection)
             yield connection
         finally:
             connection.execute(sql.SQL("drop schema {} cascade").format(schema))

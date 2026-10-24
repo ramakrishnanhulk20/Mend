@@ -1,3 +1,8 @@
+-- First statement, so two connections applying this file take turns before either
+-- touches a table. connect() and the test fixtures send the whole file as one
+-- statement batch, which runs as one transaction, so the lock holds to the end.
+select pg_advisory_xact_lock(7731300001);
+
 create table if not exists payout_batches (
     sender_batch_id text primary key,
     campaign_id text not null,
@@ -353,3 +358,70 @@ begin
         for each statement execute function mend_refuse_change();
 end
 $mend_status_guard$;
+
+-- Console sign-in sessions (C18). session_id is the SHA-256 of the cookie value, so
+-- the token a browser holds is never stored and never equals any record id. A
+-- session ends 2 hours after last_seen_at or at expires_at, whichever comes first.
+create table if not exists sessions (
+    session_id text primary key check (session_id ~ '^[0-9a-f]{64}$'),
+    role text not null check (role in ('owner', 'demo')),
+    created_at timestamptz not null default now(),
+    last_seen_at timestamptz not null default now(),
+    expires_at timestamptz not null
+);
+
+create index if not exists sessions_expires_at on sessions (expires_at);
+
+-- Which session created each campaign (C19). A demo session may act only on the
+-- campaigns recorded against it here; the owner may act on any.
+create table if not exists campaign_owners (
+    campaign_id uuid primary key references campaigns,
+    role text not null check (role in ('owner', 'demo')),
+    session_id text not null check (session_id ~ '^[0-9a-f]{64}$')
+);
+
+create index if not exists campaign_owners_session_id on campaign_owners (session_id);
+
+-- One row per request a rate limit let through (C20), keyed on something the caller
+-- cannot choose: a client address or a session id. Rows older than the longest
+-- window are deleted as new ones arrive.
+create table if not exists rate_limit_hits (
+    bucket text not null,
+    subject text not null,
+    at timestamptz not null default now()
+);
+
+create index if not exists rate_limit_hits_lookup on rate_limit_hits (bucket, subject, at);
+create index if not exists rate_limit_hits_at on rate_limit_hits (at);
+
+-- A campaign's owner never changes and is never removed, so a demo session cannot be
+-- handed another visitor's campaign, nor a campaign's creator erased (C19). Same lock
+-- and re-run rules as the guard blocks above.
+do $mend_owner_guard$
+begin
+    perform pg_advisory_xact_lock(7731300001);
+
+    drop trigger if exists campaign_owners_append_only on campaign_owners;
+    create trigger campaign_owners_append_only before update or delete on campaign_owners
+        for each row execute function mend_refuse_change();
+end
+$mend_owner_guard$;
+
+-- The model's headline proof numbers (the published CDNOW benchmark and the UCI
+-- backtest), written only by the operator command python -m mend_engine.store_facts
+-- and read by the landing page summary. A missing row means the numbers are not shown.
+create table if not exists model_facts (
+    key text primary key,
+    value jsonb not null,
+    computed_at timestamptz not null default now()
+);
+
+-- Which session started each engine run a route answered 202 for, so only that
+-- session may poll it at GET /api/runs/[runId] (C19). session_id_hash is the sessions
+-- table's session_id, the SHA-256 of the cookie, never the cookie itself.
+create table if not exists run_owners (
+    run_id text primary key,
+    session_id_hash text not null,
+    task text not null,
+    created_at timestamptz not null default now()
+);

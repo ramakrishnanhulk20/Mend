@@ -21,6 +21,7 @@ import psycopg
 from mend_engine.config import ConfigError, load_config
 from mend_engine.data.uci import CACHE_DIR, UCI_SIZE, SourceError, cleaning_report, ensure_source, iter_clean_lines_by_sheet
 from mend_engine.db.connect import connect
+from mend_engine.db.migrate import migrate
 from mend_engine.shop.identities import SYNTHETIC_DOMAIN
 from mend_engine.shop.import_orders import (
     GBP_TO_USD,
@@ -193,6 +194,7 @@ def run() -> bool:
 
     try:
         config = load_config(str(ENV_PATH) if ENV_PATH.is_file() else None)
+        migrate(config)
         conn = connect(config)
     except Exception as exc:
         proof.line(False, f"database: {describe(exc)}")

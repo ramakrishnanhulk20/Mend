@@ -46,6 +46,7 @@ from mend_engine.campaigns.submission import SubmissionResult, submit
 from mend_engine.config import Config, ConfigError, load_config
 from mend_engine.data.uci import CACHE_DIR, SourceError, ensure_source
 from mend_engine.db.connect import connect
+from mend_engine.db.migrate import migrate
 from mend_engine.maintenance.purge import purge_paypal_events
 from mend_engine.members.consent import DEMO_SHOP_NAME
 from mend_engine.members.membership import (
@@ -577,6 +578,7 @@ def run() -> bool:
         config = load_config(str(ENV_PATH) if ENV_PATH.is_file() else None)
         if not config.test_receiver:
             raise ConfigError("MEND_TEST_RECEIVER is not set")
+        migrate(config)
         conn = connect(config)
     except Exception as exc:
         proof.line(False, f"database: {describe(exc)}")

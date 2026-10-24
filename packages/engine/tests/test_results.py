@@ -12,7 +12,8 @@ from psycopg import sql
 
 from mend_engine.campaigns.attribution import attribute_purchase
 from mend_engine.campaigns.results import TOO_EARLY, campaign_results, lift_p_value
-from mend_engine.db.connect import PGDATA, SCHEMA_PATH
+from mend_engine.db.connect import PGDATA
+from mend_engine.db.migrate import apply_schema
 from mend_engine.paypal.payouts import BatchSnapshot, PayoutItemSpec, canonical_json, snapshot_hash
 
 
@@ -29,7 +30,7 @@ def conn(server_url: str) -> Iterator[psycopg.Connection]:
         connection.execute(sql.SQL("create schema {}").format(name))
         try:
             connection.execute(sql.SQL("set search_path to {}").format(name))
-            connection.execute(SCHEMA_PATH.read_text(encoding="utf-8"))
+            apply_schema(connection)
             yield connection
         finally:
             connection.execute(sql.SQL("drop schema {} cascade").format(name))

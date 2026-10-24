@@ -42,6 +42,7 @@ from mend_engine.campaigns.simulate import SimulateFailed, SimulateRefused, read
 from mend_engine.campaigns.submission import submit
 from mend_engine.config import ConfigError, load_config
 from mend_engine.db.connect import connect
+from mend_engine.db.migrate import migrate
 from mend_engine.events.payout_status import as_seen, effective
 from mend_engine.events.process import process_events
 from mend_engine.maintenance.purge import purge_paypal_events
@@ -612,6 +613,7 @@ def run() -> bool:
         config = load_config(str(ENV_PATH) if ENV_PATH.is_file() else None)
         if not config.test_receiver:
             raise ConfigError("MEND_TEST_RECEIVER is not set")
+        migrate(config)
         conn = connect(config)
     except Exception as exc:
         proof.line(False, f"database: {describe(exc)}")

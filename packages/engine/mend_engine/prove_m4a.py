@@ -28,6 +28,7 @@ from mend_engine.campaigns.holdout import DEFAULT_HOLDOUT_SHARE, holdout_size
 from mend_engine.campaigns.scoring import ScoreSet, paid_net_of_refunds, score_customers
 from mend_engine.config import Config, ConfigError, load_config
 from mend_engine.db.connect import connect
+from mend_engine.db.migrate import migrate
 from mend_engine.members.consent import CONSENT_VERSION, DEMO_SHOP_NAME, consent_hash, consent_text_for
 from mend_engine.members.membership import (
     LEFT_REASON,
@@ -313,6 +314,7 @@ def run() -> bool:
     proof = Proof()
     try:
         config = load_config(str(ENV_PATH) if ENV_PATH.is_file() else None)
+        migrate(config)
         conn = connect(config)
     except Exception as exc:
         proof.line(False, f"database: {describe(exc)}")

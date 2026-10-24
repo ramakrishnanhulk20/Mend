@@ -25,6 +25,7 @@ from psycopg.types.json import Jsonb
 
 from mend_engine.config import SANDBOX_API_HOST, Config, ConfigError, load_config
 from mend_engine.db.connect import connect
+from mend_engine.db.migrate import migrate
 from mend_engine.money import MoneyError, to_decimal_string, to_minor
 from mend_engine.paypal.http import HostRefused, PayPalError, PayPalHttp
 from mend_engine.paypal.payouts import (
@@ -448,6 +449,7 @@ def run(captured: io.StringIO) -> bool:
         return False
     config, http = started
     try:
+        migrate(config)
         proof.conn = connect(config)
     except Exception as exc:
         print(f"       NOTE: ledger database unavailable ({describe(exc)}); no payout will be sent.", flush=True)

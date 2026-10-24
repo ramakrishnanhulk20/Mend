@@ -21,7 +21,8 @@ from pathlib import Path
 import pgserver
 
 from mend_engine.config import ConfigError, load_config
-from mend_engine.db.connect import PGDATA, connect
+from mend_engine.db.connect import PGDATA
+from mend_engine.db.migrate import migrate
 
 ENV_PATH = Path(__file__).resolve().parents[4] / ".env"
 
@@ -35,11 +36,10 @@ def dev_url(*, hold: bool) -> str:
     config = load_config(str(ENV_PATH) if ENV_PATH.is_file() else None)
     if not config.dev:
         raise ConfigError("MEND_DEV must be on to use the local dev database")
-    # pgserver keeps one handle per data directory per process, so connect() reuses this
+    # pgserver keeps one handle per data directory per process, so migrate() reuses this
     # one and its cleanup mode. None leaves Postgres running after this process exits.
     server = pgserver.get_server(PGDATA, cleanup_mode="stop" if hold else None)
-    conn = connect(dataclasses.replace(config, database_url=None))
-    conn.close()
+    migrate(dataclasses.replace(config, database_url=None))
     return server.get_uri()
 
 

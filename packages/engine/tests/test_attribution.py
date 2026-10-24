@@ -18,7 +18,8 @@ from mend_engine.campaigns.attribution import (
     submitted_at,
     utc_time,
 )
-from mend_engine.db.connect import PGDATA, SCHEMA_PATH
+from mend_engine.db.connect import PGDATA
+from mend_engine.db.migrate import apply_schema
 
 START = datetime(2026, 9, 1, 12, 0, tzinfo=timezone.utc)
 TICK = timedelta(microseconds=1)
@@ -37,7 +38,7 @@ def conn(server_url: str) -> Iterator[psycopg.Connection]:
         connection.execute(sql.SQL("create schema {}").format(name))
         try:
             connection.execute(sql.SQL("set search_path to {}").format(name))
-            connection.execute(SCHEMA_PATH.read_text(encoding="utf-8"))
+            apply_schema(connection)
             yield connection
         finally:
             connection.execute(sql.SQL("drop schema {} cascade").format(name))

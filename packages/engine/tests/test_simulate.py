@@ -22,7 +22,8 @@ from mend_engine.campaigns.simulate import (
     simulate_return,
 )
 from mend_engine.config import SANDBOX_API_HOST, Config
-from mend_engine.db.connect import PGDATA, SCHEMA_PATH
+from mend_engine.db.connect import PGDATA
+from mend_engine.db.migrate import apply_schema
 from mend_engine.paypal.http import PayPalError, PayPalHttp
 
 CONFIG = Config(
@@ -52,7 +53,7 @@ def conn(server_url: str) -> Iterator[psycopg.Connection]:
         connection.execute(sql.SQL("create schema {}").format(name))
         try:
             connection.execute(sql.SQL("set search_path to {}").format(name))
-            connection.execute(SCHEMA_PATH.read_text(encoding="utf-8"))
+            apply_schema(connection)
             yield connection
         finally:
             connection.execute(sql.SQL("drop schema {} cascade").format(name))

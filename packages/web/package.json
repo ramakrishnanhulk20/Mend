@@ -9,9 +9,14 @@
     "start": "next start",
     "lint": "eslint",
     "test": "vitest run",
-    "prove:m1b": "tsx scripts/prove-m1b.ts"
+    "prove:m1b": "tsx scripts/prove-m1b.ts",
+    "prove:m6": "tsx scripts/prove-m6.ts",
+    "prove:m7a": "tsx scripts/prove-m7a.ts",
+    "prove:m7b": "tsx scripts/prove-m7b.ts"
   },
   "dependencies": {
+    "@anthropic-ai/sdk": "1.3.0",
+    "@renderinc/sdk": "1.3.0",
     "next": "16.4.2",
     "pg": "8.23.1",
     "react": "19.3.1",

@@ -11,7 +11,8 @@ import pytest
 from psycopg import sql
 from psycopg.types.json import Jsonb
 
-from mend_engine.db.connect import PGDATA, SCHEMA_PATH
+from mend_engine.db.connect import PGDATA
+from mend_engine.db.migrate import apply_schema
 
 REFUSED = psycopg.errors.RaiseException
 
@@ -29,7 +30,7 @@ def schema(server_url: str) -> Iterator[tuple[psycopg.Connection, str]]:
         connection.execute(sql.SQL("create schema {}").format(sql.Identifier(name)))
         try:
             connection.execute(sql.SQL("set search_path to {}").format(sql.Identifier(name)))
-            connection.execute(SCHEMA_PATH.read_text(encoding="utf-8"))
+            apply_schema(connection)
             yield connection, name
         finally:
             connection.execute("reset role")
@@ -84,8 +85,8 @@ def test_the_trigger_fires_for_a_role_granted_every_privilege_on_the_table(schem
 
 def test_applying_the_schema_again_leaves_one_of_each_guard(schema: tuple) -> None:
     conn, _name = schema
-    conn.execute(SCHEMA_PATH.read_text(encoding="utf-8"))
-    conn.execute(SCHEMA_PATH.read_text(encoding="utf-8"))
+    apply_schema(conn)
+    apply_schema(conn)
     triggers = conn.execute(
         "select c.relname, t.tgname from pg_trigger t join pg_class c on c.oid = t.tgrelid "
         "where not t.tgisinternal and c.relnamespace = current_schema()::regnamespace order by 1, 2"
@@ -97,6 +98,7 @@ def test_applying_the_schema_again_leaves_one_of_each_guard(schema: tuple) -> No
         ("audit_log", "audit_log_no_truncate"),
         ("campaign_members", "campaign_members_frozen"),
         ("campaign_members", "campaign_members_no_truncate"),
+        ("campaign_owners", "campaign_owners_append_only"),
         ("campaign_status_moves", "campaign_status_moves_append_only"),
         ("campaign_status_moves", "campaign_status_moves_no_truncate"),
         ("campaigns", "campaigns_status_guard"),

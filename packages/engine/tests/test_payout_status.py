@@ -11,7 +11,8 @@ from hypothesis import given
 from hypothesis import strategies as st
 from psycopg import sql
 
-from mend_engine.db.connect import PGDATA, SCHEMA_PATH
+from mend_engine.db.connect import PGDATA
+from mend_engine.db.migrate import apply_schema
 from mend_engine.events.payout_status import (
     FINAL_STATUSES,
     KNOWN_STATUSES,
@@ -83,7 +84,7 @@ def conn(server_url: str) -> Iterator[psycopg.Connection]:
         connection.execute(sql.SQL("create schema {}").format(name))
         try:
             connection.execute(sql.SQL("set search_path to {}").format(name))
-            connection.execute(SCHEMA_PATH.read_text(encoding="utf-8"))
+            apply_schema(connection)
             for sender in ("mend-a", "mend-b"):
                 connection.execute(
                     "insert into payout_batches (sender_batch_id, campaign_id, snapshot_hash, payout_batch_id, status) "

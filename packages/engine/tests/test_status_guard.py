@@ -10,7 +10,8 @@ import psycopg
 import pytest
 from psycopg import sql
 
-from mend_engine.db.connect import PGDATA, SCHEMA_PATH
+from mend_engine.db.connect import PGDATA
+from mend_engine.db.migrate import apply_schema
 
 STATUSES = (
     "draft", "awaiting_approval", "approved", "submitting", "submitted",
@@ -43,7 +44,7 @@ def conn(server_url: str) -> Iterator[psycopg.Connection]:
         connection.execute(sql.SQL("create schema {}").format(name))
         try:
             connection.execute(sql.SQL("set search_path to {}").format(name))
-            connection.execute(SCHEMA_PATH.read_text(encoding="utf-8"))
+            apply_schema(connection)
             yield connection
         finally:
             connection.execute(sql.SQL("drop schema {} cascade").format(name))
@@ -128,8 +129,8 @@ def test_the_record_of_moves_can_be_added_to_but_never_changed(conn: psycopg.Con
 
 
 def test_applying_the_schema_again_keeps_one_guard_and_one_record_per_move(conn: psycopg.Connection) -> None:
-    conn.execute(SCHEMA_PATH.read_text(encoding="utf-8"))
-    conn.execute(SCHEMA_PATH.read_text(encoding="utf-8"))
+    apply_schema(conn)
+    apply_schema(conn)
     triggers = conn.execute(
         "select c.relname, t.tgname from pg_trigger t join pg_class c on c.oid = t.tgrelid "
         "where not t.tgisinternal and c.relnamespace = current_schema()::regnamespace "

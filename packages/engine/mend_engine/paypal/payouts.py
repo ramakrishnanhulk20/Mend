@@ -34,6 +34,13 @@ SANDBOX_TRIGGER_PREFIXES = ("POSPYO", "ERRPYO", "POSPOI", "ERRPOI")
 RETRY_BACKOFF_SECONDS = (2, 5)
 
 _LONG_DIGIT_RUN = re.compile(r"[0-9]{7,}")
+_LETTER_RUN = re.compile(r"[a-z]+", re.ASCII)
+# A word, a dot and two or more letters with no space between, such as "evil.example"
+# or "x.co": the same pattern the web app's note rule uses.
+_DOMAIN_LIKE = re.compile(r"[A-Za-z0-9-]\.[A-Za-z]{2,}", re.ASCII)
+# PayPal's Payouts Terms forbid implying PayPal or Venmo sponsors the offer; a note
+# never needs to name either.
+_PAYMENT_BRANDS = {"paypal": "PayPal", "venmo": "Venmo"}
 _PAYOUT_ID = re.compile(r"[A-Z0-9]{1,32}", re.ASCII)
 _SENDER_ITEM_ID = re.compile(r"[A-Za-z0-9_-]{1,63}", re.ASCII)
 _CAMPAIGN_ID = re.compile(r"[A-Za-z0-9_.:-]{1,64}", re.ASCII)
@@ -165,9 +172,11 @@ def sender_batch_id_for(snapshot: BatchSnapshot) -> str:
 def _text_problem(text: object, max_chars: int) -> str | None:
     """Why text may not reach a customer's inbox, or None if it may.
 
-    Allows printable ASCII only. Covers links, email addresses, long numbers such as
-    phone or card numbers, control characters and sandbox test codes. Does not
-    cover persuasive wording; the owner reads every note at approval for that.
+    Allows printable ASCII only. Covers links and domain-like words, markup (any "<"
+    or ">"), email addresses, long numbers such as phone or card numbers, control
+    characters, sandbox test codes and the names PayPal and Venmo in any case or
+    spacing. Does not cover persuasive wording or lookalike spellings such as
+    "PayPaI"; the owner reads every note at approval for that.
     """
     if type(text) is not str:
         return "is not text"
@@ -179,8 +188,10 @@ def _text_problem(text: object, max_chars: int) -> str | None:
         return "has non-ASCII characters"
     if any(ord(ch) < 0x20 or ord(ch) == 0x7F for ch in text):
         return "has a control character"
+    if "<" in text or ">" in text:
+        return "has markup"
     lowered = text.lower()
-    if "http" in lowered or "www." in lowered:
+    if "http" in lowered or "www." in lowered or _DOMAIN_LIKE.search(text):
         return "looks like a link"
     if "@" in text:
         return "contains @"
@@ -188,6 +199,30 @@ def _text_problem(text: object, max_chars: int) -> str | None:
         return "has a run of 7 or more digits"
     if text.lstrip().upper().startswith(SANDBOX_TRIGGER_PREFIXES):
         return "starts with a PayPal sandbox test code"
+    brand = _named_brand(lowered)
+    if brand:
+        return f"names {brand}"
+    return None
+
+
+def _named_brand(lowered: str) -> str | None:
+    """PayPal or Venmo if lowered text spells either, in one word or across whole words.
+
+    "PayPal's", "Pay Pal" and "v-e-n-m-o" match; "even more" and "seven months" do
+    not, because a name split over words must start and end on word edges.
+    """
+    words = _LETTER_RUN.findall(lowered)
+    for brand, shown in _PAYMENT_BRANDS.items():
+        for start, word in enumerate(words):
+            if brand in word:
+                return shown
+            joined = word
+            for following in words[start + 1 :]:
+                if not brand.startswith(joined):
+                    break
+                joined += following
+                if joined == brand:
+                    return shown
     return None
 
 
@@ -202,8 +237,9 @@ def validate_snapshot(snapshot: BatchSnapshot, config: Config) -> None:
     (after normalise_email) or sender_item_id; an amount below 1 cent or above the
     per-item cap; a total above the campaign cap; a currency other than USD; a
     malformed receiver, campaign id or sender_item_id; a note or subject that is
-    empty, too long, non-ASCII, has a control character, "http", "www.", "@", a run
-    of 7 or more digits, or starts with a sandbox test code.
+    empty, too long, non-ASCII, has a control character, "<" or ">", "http", "www.",
+    a domain-like word, "@", a run of 7 or more digits, starts with a sandbox test
+    code, or names PayPal or Venmo.
     """
     if not isinstance(snapshot, BatchSnapshot):
         raise SnapshotRefused("not a BatchSnapshot")

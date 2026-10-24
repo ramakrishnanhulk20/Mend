@@ -135,6 +135,20 @@ def test_two_hundred_items_pass_and_two_hundred_one_do_not() -> None:
         snapshot(item(sender_item_id="x" * 64)),
         snapshot(email_subject="Go to http now"),
         snapshot(campaign_id=""),
+        snapshot(item(note="PayPal is giving you this thank-you")),
+        snapshot(item(note="a gift from paypal")),
+        snapshot(item(note="Thanks from Pay Pal")),
+        snapshot(item(note="Thanks from P.a.y-P a l")),
+        snapshot(email_subject="A PAYPAL reward"),
+        snapshot(item(note="Venmo sent you this")),
+        snapshot(item(note="A treat from VENMO's team")),
+        snapshot(item(note="Thanks from Ven mo")),
+        snapshot(item(note="a v-e-n-m-o thank-you")),
+        snapshot(item(note="<b>Thanks</b>")),
+        snapshot(item(note="Thanks > everything")),
+        snapshot(item(note="Visit evil.example for a bonus")),
+        snapshot(item(note="See x.co today")),
+        snapshot(email_subject="A thank-you from shop.example"),
     ],
 )
 def test_validate_refuses(bad: BatchSnapshot) -> None:
@@ -145,6 +159,22 @@ def test_validate_refuses(bad: BatchSnapshot) -> None:
 def test_exactly_400_characters_and_six_digits_are_allowed() -> None:
     validate_snapshot(snapshot(item(note="x" * 400)), make_config())
     validate_snapshot(snapshot(item(note="Order 123456 thanks")), make_config())
+
+
+def test_the_note_rule_names_why_paypal_or_venmo_is_refused_and_passes_ordinary_thanks() -> None:
+    assert payouts.note_problem("We hope PayPal makes this easy", 400) == "names PayPal"
+    assert payouts.note_problem("Sent with Venmo", 400) == "names Venmo"
+    for ordinary in (
+        "Thanks for the candles and the tea towels, we have missed you.",
+        "Pay day treat from your pals",
+        "We would love to see you even more often",
+        "It has been seven months, so here is a thank-you",
+        "You have given more to us than you know",
+        "Thanks. See you soon, e.g. for the 3.5 inch candles.",
+    ):
+        assert payouts.note_problem(ordinary, 400) is None
+    assert payouts.note_problem("<i>hi</i>", 400) == "has markup"
+    assert payouts.note_problem("Visit evil.example", 400) == "looks like a link"
 
 
 class PayPalScript:

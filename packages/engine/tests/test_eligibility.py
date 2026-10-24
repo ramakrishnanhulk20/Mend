@@ -13,7 +13,8 @@ from psycopg import sql
 
 from mend_engine.campaigns.eligibility import Candidate, quiet_regular_members
 from mend_engine.campaigns.scoring import ScoreSet, paid_net_of_refunds, score_customers
-from mend_engine.db.connect import PGDATA, SCHEMA_PATH
+from mend_engine.db.connect import PGDATA
+from mend_engine.db.migrate import apply_schema
 from mend_engine.members.consent import DEMO_SHOP_NAME
 from mend_engine.members.membership import join_member
 
@@ -33,7 +34,7 @@ def conn(server_url: str) -> Iterator[psycopg.Connection]:
         connection.execute(sql.SQL("create schema {}").format(schema))
         try:
             connection.execute(sql.SQL("set search_path to {}").format(schema))
-            connection.execute(SCHEMA_PATH.read_text(encoding="utf-8"))
+            apply_schema(connection)
             yield connection
         finally:
             connection.execute(sql.SQL("drop schema {} cascade").format(schema))

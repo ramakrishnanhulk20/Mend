@@ -75,3 +75,281 @@ create table if not exists paypal_events (
     purge_after timestamptz not null,
     raw text not null
 );
+
+-- Customers who joined the shop's thank-you list with Log in with PayPal (C28).
+-- Only what PayPal returned and what they agreed to. paypal_email is stored after
+-- the one email normaliser, so the unique constraint compares normalised values.
+-- Leaving deletes the row; nothing here is kept after a member leaves.
+create table if not exists members (
+    member_id uuid primary key default gen_random_uuid(),
+    paypal_email text not null unique,
+    paypal_payer_id text unique,
+    email_verified boolean not null,
+    consent_version text not null,
+    consent_text_sha256 text not null,
+    client_id text not null,
+    joined_at timestamptz not null default now()
+);
+
+create table if not exists campaigns (
+    campaign_id uuid primary key default gen_random_uuid(),
+    shop_name text not null,
+    goal_text text not null,
+    as_of date not null,
+    budget_minor integer not null check (budget_minor > 0),
+    per_recipient_minor integer not null check (per_recipient_minor > 0),
+    holdout_share numeric(3,2) not null check (holdout_share between 0.20 and 0.50),
+    status text not null check (status in ('draft','awaiting_approval','approved','submitting','submitted','submission_unknown','exists_unresolved','completed','voided')),
+    void_reason text,
+    created_at timestamptz not null default now()
+);
+
+-- One row per candidate in a campaign, holdout included. ref ("R1", "R2", ...) is the
+-- only identifier a language model will ever see. member_id goes null when a member
+-- leaves after the campaign was submitted, so the record of what was sent survives.
+create table if not exists campaign_members (
+    campaign_id uuid not null references campaigns on delete cascade,
+    ref text not null,
+    member_id uuid references members on delete set null,
+    role text not null check (role in ('reward','holdout')),
+    rank integer not null,
+    score double precision not null,
+    amount_minor integer check (amount_minor is null or amount_minor > 0),
+    note text,
+    primary key (campaign_id, ref),
+    unique (campaign_id, member_id)
+);
+
+create index if not exists campaign_members_member_id on campaign_members (member_id);
+
+-- The demo shop's cancellation invoices from the same UCI file, one row per invoice,
+-- in USD cents with the same week shift and identities as shop_orders (C4: what a
+-- customer paid is counted net of these).
+create table if not exists shop_refunds (
+    refund_ref text primary key,
+    customer_ref text not null references shop_customers,
+    refunded_at timestamptz not null,
+    amount_minor integer not null check (amount_minor > 0)
+);
+
+create index if not exists shop_refunds_customer_refunded_at on shop_refunds (customer_ref, refunded_at);
+
+-- The exact snapshot a person approved, frozen at approval (C2): the hash they were
+-- shown, the canonical text it is the hash of, and who approved when. Submission
+-- builds the batch from canonical_json alone, never from live member or campaign rows.
+create table if not exists approved_snapshots (
+    campaign_id uuid primary key references campaigns,
+    snapshot_hash text not null,
+    canonical_json text not null,
+    approved_at timestamptz not null,
+    approved_by text not null
+);
+
+-- The 48-hour purge (C27) deletes by purge_after.
+create index if not exists paypal_events_purge_after on paypal_events (purge_after);
+
+-- Guards in the database itself (C2, C23). Triggers fire for every role, the table
+-- owner included, so no code path that reaches the database can step around them.
+-- One block, so running it again replaces the functions and recreates the triggers.
+do $mend_guards$
+begin
+    -- Two connections running this block at once would both rewrite the same
+    -- function rows and one would fail; the lock makes them take turns.
+    perform pg_advisory_xact_lock(7731300001);
+
+    create or replace function mend_refuse_change() returns trigger
+    language plpgsql as $fn$
+    begin
+        raise exception '%: % refused, rows in this table are permanent', tg_table_name, lower(tg_op);
+    end
+    $fn$;
+
+    -- A campaign's rows may change while it is a draft, awaiting approval or voided.
+    -- From approval on they are frozen. The one change allowed after a batch was
+    -- sent is the foreign key emptying member_id when a member leaves, so the record
+    -- of what was sent survives (C28). Before that, leaving voids the campaign first.
+    create or replace function mend_campaign_rows_frozen() returns trigger
+    language plpgsql as $fn$
+    declare
+        involved uuid[];
+        states text[];
+    begin
+        if tg_op = 'TRUNCATE' then
+            raise exception 'campaign_members: truncate refused, it would erase approved and sent campaigns';
+        elsif tg_op = 'INSERT' then
+            involved := array[new.campaign_id];
+        elsif tg_op = 'DELETE' then
+            involved := array[old.campaign_id];
+        else
+            involved := array[old.campaign_id, new.campaign_id];
+        end if;
+        -- The schema of the table that fired, so each schema guards its own rows.
+        execute format(
+            'select coalesce(array_agg(status), ''{}'') from %I.campaigns where campaign_id = any($1)',
+            tg_table_schema
+        ) into states using involved;
+        if 'approved' = any(states) then
+            raise exception 'campaign_members: % refused, the campaign is approved and its rows are frozen', lower(tg_op);
+        end if;
+        if states && array['submitting', 'submitted', 'submission_unknown', 'exists_unresolved', 'completed'] then
+            if tg_op = 'UPDATE' and old.member_id is not null and new.member_id is null
+               and (new.campaign_id, new.ref, new.role, new.rank, new.score, new.amount_minor, new.note)
+                   is not distinct from
+                   (old.campaign_id, old.ref, old.role, old.rank, old.score, old.amount_minor, old.note) then
+                return new;
+            end if;
+            raise exception 'campaign_members: % refused, the campaign has been sent and its rows are frozen', lower(tg_op);
+        end if;
+        if tg_op = 'DELETE' then
+            return old;
+        end if;
+        return new;
+    end
+    $fn$;
+
+    drop trigger if exists audit_log_append_only on audit_log;
+    create trigger audit_log_append_only before update or delete on audit_log
+        for each row execute function mend_refuse_change();
+    drop trigger if exists audit_log_no_truncate on audit_log;
+    create trigger audit_log_no_truncate before truncate on audit_log
+        for each statement execute function mend_refuse_change();
+
+    -- A snapshot row exists only from approval on, so it is refused always.
+    drop trigger if exists approved_snapshots_append_only on approved_snapshots;
+    create trigger approved_snapshots_append_only before update or delete on approved_snapshots
+        for each row execute function mend_refuse_change();
+    drop trigger if exists approved_snapshots_no_truncate on approved_snapshots;
+    create trigger approved_snapshots_no_truncate before truncate on approved_snapshots
+        for each statement execute function mend_refuse_change();
+
+    drop trigger if exists campaign_members_frozen on campaign_members;
+    create trigger campaign_members_frozen before insert or update or delete on campaign_members
+        for each row execute function mend_campaign_rows_frozen();
+    drop trigger if exists campaign_members_no_truncate on campaign_members;
+    create trigger campaign_members_no_truncate before truncate on campaign_members
+        for each statement execute function mend_campaign_rows_frozen();
+end
+$mend_guards$;
+
+-- What the engine decided for each verified webhook delivery, one row per
+-- transmission id (C10, C23). No foreign key to paypal_events: those rows are
+-- purged at 48 hours and these stay (C27), so detail holds ids and statuses only,
+-- never a raw payload, an email or a name.
+create table if not exists event_outcomes (
+    transmission_id text primary key,
+    processed_at timestamptz not null default now(),
+    outcome text not null,
+    detail jsonb not null
+);
+
+-- Return purchases the simulate button created (C21). The row is written before
+-- PayPal is called, so the per-campaign limit counts orders whose answer was lost,
+-- and paypal_order_id is filled in from PayPal's answer. A purchase is labelled
+-- simulated only through this table, never through a field a buyer can set (C8).
+create table if not exists simulated_orders (
+    simulated_order_id uuid primary key,
+    paypal_order_id text unique,
+    campaign_id uuid not null,
+    ref text not null,
+    created_at timestamptz not null default now()
+);
+
+create index if not exists simulated_orders_campaign_id on simulated_orders (campaign_id);
+
+-- A purchase linked to the campaign that rewarded or held back its buyer (C8).
+-- source_order is unique, so the same purchase seen twice is attributed once.
+create table if not exists attributions (
+    attribution_id bigserial primary key,
+    campaign_id uuid not null,
+    ref text not null,
+    role text not null,
+    purchased_at timestamptz not null,
+    amount_minor integer not null check (amount_minor > 0),
+    simulated boolean not null,
+    source_order text not null unique
+);
+
+create index if not exists attributions_campaign_id on attributions (campaign_id);
+
+-- Every campaign status change, written by the status guard below, so the time a
+-- campaign reached each status is on record whichever code path moved it. A row
+-- inserted straight into a status has from_status null.
+create table if not exists campaign_status_moves (
+    campaign_id uuid not null,
+    from_status text,
+    to_status text not null,
+    moved_at timestamptz not null default now()
+);
+
+create index if not exists campaign_status_moves_campaign_id on campaign_status_moves (campaign_id, to_status, moved_at);
+
+-- The status guard: a campaign moves only along the arrows below, and each move is
+-- recorded. Updates only; inserts may start in any status (tests build campaigns
+-- that way) and are recorded with from_status null. Same lock and re-run rules as
+-- the block above.
+do $mend_status_guard$
+begin
+    perform pg_advisory_xact_lock(7731300001);
+
+    create or replace function mend_campaign_status_guard() returns trigger
+    language plpgsql as $fn$
+    begin
+        if new.status is not distinct from old.status then
+            return new;
+        end if;
+        -- Deny by default: a move is allowed only if it is one of these pairs.
+        if (old.status, new.status) in (
+            ('draft', 'awaiting_approval'), ('draft', 'approved'), ('draft', 'voided'),
+            ('awaiting_approval', 'approved'), ('awaiting_approval', 'voided'),
+            ('approved', 'submitting'), ('approved', 'voided'),
+            ('submitting', 'submitted'), ('submitting', 'submission_unknown'),
+            ('submitting', 'exists_unresolved'), ('submitting', 'voided'),
+            ('submission_unknown', 'submitting'), ('submission_unknown', 'submitted'),
+            ('submission_unknown', 'exists_unresolved'),
+            ('exists_unresolved', 'submitted'),
+            ('submitted', 'completed')
+        ) then
+            return new;
+        end if;
+        raise exception 'campaigns: status % to % refused', old.status, new.status;
+    end
+    $fn$;
+
+    create or replace function mend_campaign_status_record() returns trigger
+    language plpgsql as $fn$
+    begin
+        -- The schema of the table that fired, as in mend_campaign_rows_frozen.
+        if tg_op = 'INSERT' then
+            execute format(
+                'insert into %I.campaign_status_moves (campaign_id, from_status, to_status) values ($1, null, $2)',
+                tg_table_schema
+            ) using new.campaign_id, new.status;
+        else
+            execute format(
+                'insert into %I.campaign_status_moves (campaign_id, from_status, to_status) values ($1, $2, $3)',
+                tg_table_schema
+            ) using new.campaign_id, old.status, new.status;
+        end if;
+        return null;
+    end
+    $fn$;
+
+    drop trigger if exists campaigns_status_guard on campaigns;
+    create trigger campaigns_status_guard before update of status on campaigns
+        for each row execute function mend_campaign_status_guard();
+    drop trigger if exists campaigns_status_inserted on campaigns;
+    create trigger campaigns_status_inserted after insert on campaigns
+        for each row execute function mend_campaign_status_record();
+    drop trigger if exists campaigns_status_moved on campaigns;
+    create trigger campaigns_status_moved after update of status on campaigns
+        for each row when (old.status is distinct from new.status)
+        execute function mend_campaign_status_record();
+
+    drop trigger if exists campaign_status_moves_append_only on campaign_status_moves;
+    create trigger campaign_status_moves_append_only before update or delete on campaign_status_moves
+        for each row execute function mend_refuse_change();
+    drop trigger if exists campaign_status_moves_no_truncate on campaign_status_moves;
+    create trigger campaign_status_moves_no_truncate before truncate on campaign_status_moves
+        for each statement execute function mend_refuse_change();
+end
+$mend_status_guard$;

@@ -38,6 +38,8 @@ _PAYOUT_ID = re.compile(r"[A-Z0-9]{1,32}", re.ASCII)
 _SENDER_ITEM_ID = re.compile(r"[A-Za-z0-9_-]{1,63}", re.ASCII)
 _CAMPAIGN_ID = re.compile(r"[A-Za-z0-9_.:-]{1,64}", re.ASCII)
 _EMAIL_SHAPE = re.compile(r"[!-?A-~]+@[!-?A-~]+\.[!-?A-~]+", re.ASCII)
+# The receiver rule, shared so a member who can join is a member a batch can pay.
+EMAIL_SHAPE = _EMAIL_SHAPE
 
 # Module-level so tests can replace the wait without a real 7 second pause.
 _sleep = time.sleep
@@ -187,6 +189,10 @@ def _text_problem(text: object, max_chars: int) -> str | None:
     if text.lstrip().upper().startswith(SANDBOX_TRIGGER_PREFIXES):
         return "starts with a PayPal sandbox test code"
     return None
+
+
+# The note rule, shared so a note accepted anywhere is a note the batch will accept.
+note_problem = _text_problem
 
 
 def validate_snapshot(snapshot: BatchSnapshot, config: Config) -> None:

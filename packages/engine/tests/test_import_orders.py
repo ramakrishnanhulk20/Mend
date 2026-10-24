@@ -20,6 +20,7 @@ from mend_engine.data.uci import COLUMNS, SHEETS, XLSX_NAME
 from mend_engine.db.connect import PGDATA, SCHEMA_PATH
 from mend_engine.shop.import_orders import (
     ImportRefused,
+    import_refunds,
     import_uci,
     shifted_utc,
     usd_minor,
@@ -212,3 +213,50 @@ def test_refuses_a_connection_that_is_not_autocommit(server_url: str, source: Pa
     with psycopg.connect(server_url) as connection:
         with pytest.raises(ImportRefused):
             import_uci(connection, source)
+
+
+REFUND_OVERLAP = [(
+    "C536400", 71053, "WHITE METAL LANTERN", -2, datetime(2010, 12, 2, 10, 0), 3.39, 17850, "United Kingdom",
+)]
+REFUNDS_FIRST = [
+    ("C489500", 21232, "STRAWBERRY CERAMIC TRINKET BOX", -4, datetime(2009, 12, 5, 9, 0), 1, 13085, "United Kingdom"),
+    ("C489500", "M", "Manual", -1, datetime(2009, 12, 5, 9, 1), 0.5, 13085, "United Kingdom"),
+    ("C489501", 22350, "CAT BOWL", -1, datetime(2009, 12, 5, 9, 2), 2.55, None, "United Kingdom"),
+    *REFUND_OVERLAP,
+]
+
+
+def refunds_fingerprint(conn: psycopg.Connection) -> str:
+    return conn.execute("select md5(string_agg(r.xmin::text || r::text, '|' order by r.refund_ref)) from shop_refunds r").fetchone()[0]
+
+
+def test_refunds_are_one_row_per_cancellation_with_the_m2_rules_and_a_second_run_changes_nothing(
+    conn: psycopg.Connection, tmp_path: Path
+) -> None:
+    path = write_source(tmp_path / "online_retail_ii.zip", FIRST_SHEET + REFUNDS_FIRST, SECOND_SHEET + REFUND_OVERLAP)
+    import_uci(conn, path)
+
+    first = import_refunds(conn, path)
+
+    stored = conn.execute("select refund_ref, customer_ref, refunded_at, amount_minor from shop_refunds order by 1").fetchall()
+    # 4 x 160 + 1 x 80 for C489500; the overlap's 2 x 542 once; C489449's customer has no orders.
+    assert stored == [
+        ("C489500", "C13085", datetime(2024, 10, 12, 8, 0, tzinfo=timezone.utc), 720),
+        ("C536400", "C17850", datetime(2025, 10, 9, 9, 0, tzinfo=timezone.utc), 1084),  # BST
+    ]
+    assert (first.refunds, first.inserted_refunds, first.unknown_customer, first.total_minor) == (2, 2, 1, 1804)
+    assert (first.lines_kept, first.week_shift) == (5, 775)
+    before = refunds_fingerprint(conn)
+    second = import_refunds(conn, path)
+    assert (second.refunds, second.inserted_refunds) == (2, 0) and refunds_fingerprint(conn) == before
+    runs = [r[0] for r in conn.execute("select source from import_runs order by id")]
+    assert runs == ["online_retail_ii.zip", "online_retail_ii.zip (refunds)", "online_retail_ii.zip (refunds)"]
+
+
+def test_a_refund_copy_that_differs_between_sheets_is_refused_before_writing(conn: psycopg.Connection, tmp_path: Path) -> None:
+    changed = [(*REFUND_OVERLAP[0][:3], -3, *REFUND_OVERLAP[0][4:])]
+    path = write_source(tmp_path / "online_retail_ii.zip", FIRST_SHEET + REFUNDS_FIRST, SECOND_SHEET + changed)
+    import_uci(conn, path)
+    with pytest.raises(ImportRefused):
+        import_refunds(conn, path)
+    assert conn.execute("select (select count(*) from shop_refunds), (select count(*) from import_runs)").fetchone() == (0, 1)

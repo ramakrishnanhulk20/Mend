@@ -1,0 +1,373 @@
+# Not covered here: signature verification (the web receiver, C9, tested in
+# packages/web), real PayPal answers and delivery timing (prove_m5), and two event
+# runs on separate machines (they share the one database lock shown below).
+import json
+import uuid
+from collections.abc import Iterator
+from datetime import datetime, timedelta, timezone
+
+import httpx
+import pgserver
+import psycopg
+import pytest
+from psycopg import sql
+
+from mend_engine.config import SANDBOX_API_HOST, Config
+from mend_engine.db.connect import PGDATA, SCHEMA_PATH
+from mend_engine.events.process import EVENT_LOCK, MAX_ATTEMPTS, process_events
+from mend_engine.maintenance.purge import purge_paypal_events
+from mend_engine.paypal.http import PayPalHttp
+
+CONFIG = Config(
+    paypal_client_id="cid",
+    paypal_client_secret="csecret",
+    paypal_api_host=SANDBOX_API_HOST,
+    database_url=None,
+    dev=True,
+    test_receiver=None,
+    item_cap_minor=1000,
+    campaign_cap_minor=10000,
+    daily_cap_minor=20000,
+)
+SIM_ORDER = "5O190127TN364715T"
+NOW = datetime.now(timezone.utc)
+
+
+@pytest.fixture(scope="module")
+def server_url() -> Iterator[str]:
+    server = pgserver.get_server(PGDATA)
+    yield server.get_uri()
+
+
+@pytest.fixture
+def conn(server_url: str) -> Iterator[psycopg.Connection]:
+    name = sql.Identifier("m5_events_" + uuid.uuid4().hex[:12])
+    with psycopg.connect(server_url, autocommit=True) as connection:
+        connection.execute(sql.SQL("create schema {}").format(name))
+        try:
+            connection.execute(sql.SQL("set search_path to {}").format(name))
+            connection.execute(SCHEMA_PATH.read_text(encoding="utf-8"))
+            yield connection
+        finally:
+            connection.execute(sql.SQL("drop schema {} cascade").format(name))
+
+
+def campaign(conn: psycopg.Connection, route: tuple[str, ...], sender_batch_id: str, payout_batch_id: str | None) -> uuid.UUID:
+    """R1 rewarded, R2 held back, moved along route, with its ledger row."""
+    campaign_id = conn.execute(
+        "insert into campaigns (shop_name, goal_text, as_of, budget_minor, per_recipient_minor, holdout_share, status) "
+        "values ('Shop', 'goal', '2026-10-16', 1000, 100, 0.5, 'draft') returning campaign_id"
+    ).fetchone()[0]
+    conn.execute(
+        "insert into campaign_members (campaign_id, ref, role, rank, score, amount_minor, note) values "
+        "(%s, 'R1', 'reward', 1, 0.1, 100, 'Thanks'), (%s, 'R2', 'holdout', 2, 0.2, null, null)",
+        (campaign_id, campaign_id),
+    )
+    for step in route:
+        conn.execute("update campaigns set status = %s where campaign_id = %s", (step, campaign_id))
+    conn.execute(
+        "insert into payout_batches (sender_batch_id, campaign_id, snapshot_hash, payout_batch_id, status) values (%s, %s, 'h', %s, %s)",
+        (sender_batch_id, str(campaign_id), payout_batch_id, route[-1]),
+    )
+    return campaign_id
+
+
+def sent(conn: psycopg.Connection) -> uuid.UUID:
+    campaign_id = campaign(conn, ("approved", "submitting", "submitted"), "mend-ours", "BATCHOURS")
+    # Backdated, so a purchase made an hour ago falls inside the window.
+    conn.execute(
+        "insert into campaign_status_moves (campaign_id, from_status, to_status, moved_at) values (%s, 'submitting', 'submitted', %s)",
+        (campaign_id, NOW - timedelta(days=1)),
+    )
+    return campaign_id
+
+
+def deliver(conn: psycopg.Connection, event_type: str, resource: dict, *, raw: str | None = None, age_minutes: int = 0) -> str:
+    """A delivery as the web receiver stores one after PayPal verified it."""
+    transmission_id = str(uuid.uuid4())
+    body = raw if raw is not None else json.dumps({"id": "WH-" + transmission_id, "event_type": event_type, "resource": resource})
+    conn.execute(
+        "insert into paypal_events (transmission_id, event_id, event_type, received_at, purge_after, raw) "
+        "values (%s, %s, %s, now() - make_interval(mins => %s), now() + interval '48 hours', %s)",
+        (transmission_id, "WH-" + transmission_id, event_type, age_minutes, body),
+    )
+    return transmission_id
+
+
+def item_answer(item_id: str, status: str, sender_batch_id: str = "mend-ours", payout_batch_id: str = "BATCHOURS") -> dict:
+    return {
+        "payout_item_id": item_id,
+        "transaction_status": status,
+        "payout_batch_id": payout_batch_id,
+        "sender_batch_id": sender_batch_id,
+        "payout_item_fee": {"currency": "USD", "value": "0.25"},
+        "payout_item": {"sender_item_id": "R1", "receiver": "m1@shop.example", "recipient_name": {"full_name": "Maya R."}},
+    }
+
+
+def order_answer(simulated_order_id: uuid.UUID, *, status: str = "COMPLETED", created: datetime | None = None) -> dict:
+    when = (created or NOW - timedelta(hours=1)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    return {
+        "id": SIM_ORDER,
+        "status": status,
+        "payment_source": {"card": {"name": "Test Buyer", "last_digits": "1111"}},
+        "purchase_units": [
+            {
+                "custom_id": str(simulated_order_id),
+                "payments": {
+                    "captures": [
+                        {"id": "CAP1", "status": "COMPLETED", "amount": {"currency_code": "USD", "value": "12.50"}, "create_time": when}
+                    ]
+                },
+            }
+        ],
+    }
+
+
+class FakePayPal:
+    """Answers re-reads from answers, keyed by path; a path missing from it answers 503."""
+
+    def __init__(self, answers: dict[str, dict] | None = None) -> None:
+        self.answers = answers or {}
+        self.reads: list[str] = []
+
+    def __call__(self, request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/v1/oauth2/token":
+            return httpx.Response(200, json={"access_token": "tok", "expires_in": 32000})
+        assert request.method == "GET", "event processing never writes to PayPal"
+        self.reads.append(request.url.path)
+        if request.url.path not in self.answers:
+            return httpx.Response(503, json={"name": "SERVICE_UNAVAILABLE", "debug_id": "dbg1"})
+        return httpx.Response(200, json=self.answers[request.url.path])
+
+    def http(self) -> PayPalHttp:
+        return PayPalHttp(CONFIG, transport=httpx.MockTransport(self))
+
+
+def outcome(conn: psycopg.Connection, transmission_id: str) -> tuple | None:
+    return conn.execute("select outcome, detail from event_outcomes where transmission_id = %s", (transmission_id,)).fetchone()
+
+
+def item_status(conn: psycopg.Connection, item_id: str) -> str | None:
+    row = conn.execute("select status from payout_items where payout_item_id = %s", (item_id,)).fetchone()
+    return row[0] if row else None
+
+
+def test_item_events_follow_paypal_and_a_stale_success_cannot_undo_returned(conn: psycopg.Connection) -> None:
+    sent(conn)
+    paypal = FakePayPal()
+    statuses = iter(["UNCLAIMED", "RETURNED", "SUCCESS"])
+    tids = []
+    for _ in range(3):
+        paypal.answers["/v1/payments/payouts-item/ITEM1"] = item_answer("ITEM1", next(statuses))
+        tids.append(deliver(conn, "PAYMENT.PAYOUTS-ITEM.UNCLAIMED", {"payout_item_id": "ITEM1"}))
+        process_events(conn, paypal.http())
+    decisions = [(outcome(conn, t)[0], outcome(conn, t)[1]["decision"]) for t in tids]
+    assert decisions == [("status recorded", "new"), ("status recorded", "moved"), ("status refused", "refused")]
+    assert outcome(conn, tids[2])[1]["from"] == "RETURNED" and item_status(conn, "ITEM1") == "RETURNED"
+    assert conn.execute("select fee_minor from payout_items").fetchone()[0] == 25
+
+
+def test_only_the_item_id_is_taken_from_the_event_and_a_batch_we_did_not_create_changes_nothing(conn: psycopg.Connection) -> None:
+    campaign_id = sent(conn)
+    # The event claims success in our batch; PayPal's own answer puts the item in someone else's.
+    lie = {"payout_item_id": "ITEM9", "payout_batch_id": "BATCHOURS", "transaction_status": "SUCCESS", "sender_batch_id": "mend-ours"}
+    paypal = FakePayPal({"/v1/payments/payouts-item/ITEM9": item_answer("ITEM9", "SUCCESS", "theirs-1", "BATCHTHEIRS")})
+    forged = deliver(conn, "PAYMENT.PAYOUTS-ITEM.SUCCEEDED", lie)
+    # An item PayPal places in our sender_batch_id but under another payout_batch_id is not ours either.
+    paypal.answers["/v1/payments/payouts-item/ITEM8"] = item_answer("ITEM8", "SUCCESS", "mend-ours", "BATCHOTHER")
+    mixed = deliver(conn, "PAYMENT.PAYOUTS-ITEM.SUCCEEDED", {"payout_item_id": "ITEM8"})
+    before = conn.execute("select status from campaigns where campaign_id = %s", (campaign_id,)).fetchone()
+
+    report = process_events(conn, paypal.http())
+
+    assert report.outcomes == {"not ours": 2}
+    assert outcome(conn, forged)[1]["reason"] == "the batch is not in our ledger"
+    assert outcome(conn, mixed)[1]["reason"] == "PayPal's batch is not the one in our ledger"
+    assert conn.execute("select count(*) from payout_items").fetchone()[0] == 0
+    assert conn.execute("select status from campaigns where campaign_id = %s", (campaign_id,)).fetchone() == before
+
+
+def test_a_batch_event_resolves_a_campaign_paypal_holds_and_then_its_waiting_items(conn: psycopg.Connection) -> None:
+    campaign_id = campaign(conn, ("approved", "submitting", "exists_unresolved"), "mend-unres", None)
+    batch = {"batch_header": {"payout_batch_id": "BATCHU", "batch_status": "SUCCESS",
+                              "sender_batch_header": {"sender_batch_id": "mend-unres"}}}
+    paypal = FakePayPal({
+        "/v1/payments/payouts-item/ITEMU": item_answer("ITEMU", "SUCCESS", "mend-unres", "BATCHU"),
+        "/v1/payments/payouts/BATCHU": batch,
+    })
+    early_item = deliver(conn, "PAYMENT.PAYOUTS-ITEM.SUCCEEDED", {"payout_item_id": "ITEMU"}, age_minutes=2)
+    first = process_events(conn, paypal.http())
+    assert (first.outcomes, first.retrying, outcome(conn, early_item)) == ({}, 1, None)
+
+    batch_event = deliver(conn, "PAYMENT.PAYOUTSBATCH.SUCCESS", {"batch_header": {"payout_batch_id": "BATCHU"}})
+    second = process_events(conn, paypal.http())
+
+    # Oldest first: the item is tried again before the batch event fills in the ledger, so it waits one more run.
+    assert (second.outcomes, second.retrying) == ({"batch resolved": 1}, 1)
+    assert outcome(conn, batch_event)[0] == "batch resolved"
+    assert conn.execute("select status from campaigns where campaign_id = %s", (campaign_id,)).fetchone()[0] == "submitted"
+    assert conn.execute("select payout_batch_id, status from payout_batches where sender_batch_id = 'mend-unres'").fetchone() == (
+        "BATCHU", "resolved_by_event",
+    )
+    moves = conn.execute(
+        "select from_status, to_status from campaign_status_moves where campaign_id = %s and to_status = 'submitted'", (campaign_id,)
+    ).fetchall()
+    assert moves == [("exists_unresolved", "submitted")]
+    process_events(conn, paypal.http())
+    assert outcome(conn, early_item)[0] == "status recorded" and item_status(conn, "ITEMU") == "SUCCESS"
+
+
+def test_batch_events_for_other_batches_or_settled_campaigns_change_nothing(conn: psycopg.Connection) -> None:
+    sent(conn)
+    unknown = campaign(conn, ("approved", "submitting", "submission_unknown"), "mend-two", "BATCHKNOWN")
+
+    def batch(payout_batch_id: str, sender_batch_id: str) -> dict:
+        return {"batch_header": {"payout_batch_id": payout_batch_id, "sender_batch_header": {"sender_batch_id": sender_batch_id}}}
+
+    paypal = FakePayPal({
+        "/v1/payments/payouts/BATCHOURS": batch("BATCHOURS", "mend-ours"),
+        "/v1/payments/payouts/BATCHTHEIRS": batch("BATCHTHEIRS", "theirs-1"),
+        "/v1/payments/payouts/BATCHWRONG": batch("BATCHWRONG", "mend-two"),
+    })
+    settled = deliver(conn, "PAYMENT.PAYOUTSBATCH.SUCCESS", {"batch_header": {"payout_batch_id": "BATCHOURS"}})
+    theirs = deliver(conn, "PAYMENT.PAYOUTSBATCH.SUCCESS", {"batch_header": {"payout_batch_id": "BATCHTHEIRS"}})
+    wrong = deliver(conn, "PAYMENT.PAYOUTSBATCH.SUCCESS", {"batch_header": {"payout_batch_id": "BATCHWRONG"}})
+
+    process_events(conn, paypal.http())
+
+    assert outcome(conn, settled)[0] == "batch unchanged" and outcome(conn, settled)[1]["campaign_status"] == "submitted"
+    assert outcome(conn, theirs)[0] == "not ours"
+    assert outcome(conn, wrong)[1]["reason"] == "the ledger holds a different payout_batch_id"
+    assert conn.execute("select status from campaigns where campaign_id = %s", (unknown,)).fetchone()[0] == "submission_unknown"
+
+
+def test_a_verified_capture_of_our_simulated_order_is_attributed_to_the_right_arm(conn: psycopg.Connection) -> None:
+    campaign_id = sent(conn)
+    simulated_order_id = uuid.uuid4()
+    conn.execute(
+        "insert into simulated_orders (simulated_order_id, paypal_order_id, campaign_id, ref) values (%s, %s, %s, 'R2')",
+        (simulated_order_id, SIM_ORDER, campaign_id),
+    )
+    paypal = FakePayPal({f"/v2/checkout/orders/{SIM_ORDER}": order_answer(simulated_order_id)})
+    capture = {"id": "CAP1", "custom_id": "ignored", "supplementary_data": {"related_ids": {"order_id": SIM_ORDER}}}
+    tid = deliver(conn, "PAYMENT.CAPTURE.COMPLETED", capture)
+    again = deliver(conn, "PAYMENT.CAPTURE.COMPLETED", capture)
+
+    process_events(conn, paypal.http())
+
+    assert outcome(conn, tid)[0] == "purchase recorded" and outcome(conn, tid)[1]["role"] == "holdout"
+    assert (outcome(conn, again)[0], outcome(conn, again)[1]["reason"]) == ("purchase refused", "the purchase is already attributed")
+    assert conn.execute("select ref, role, amount_minor, simulated, source_order from attributions").fetchall() == [
+        ("R2", "holdout", 1250, True, SIM_ORDER),
+    ]
+
+
+def test_a_capture_of_any_other_order_is_not_ours_and_is_never_read(conn: psycopg.Connection) -> None:
+    sent(conn)
+    paypal = FakePayPal()
+    tid = deliver(conn, "PAYMENT.CAPTURE.COMPLETED", {"supplementary_data": {"related_ids": {"order_id": "STRANGER1"}}})
+    process_events(conn, paypal.http())
+    assert outcome(conn, tid)[0] == "not ours" and paypal.reads == []
+    assert conn.execute("select count(*) from attributions").fetchone()[0] == 0
+
+
+@pytest.mark.parametrize(
+    ("change", "reason"),
+    [
+        ({"status": "APPROVED"}, "PayPal does not say the order is COMPLETED"),
+        ({"custom_id": "someone-else"}, "the order's custom_id is not the one this server set"),
+        ({"created": NOW - timedelta(days=3)}, "the purchase is outside the 30-day window"),
+    ],
+)
+def test_a_capture_is_refused_unless_paypal_confirms_a_completed_order_of_ours_in_the_window(
+    conn: psycopg.Connection, change: dict, reason: str
+) -> None:
+    campaign_id = sent(conn)
+    simulated_order_id = uuid.uuid4()
+    conn.execute(
+        "insert into simulated_orders (simulated_order_id, paypal_order_id, campaign_id, ref) values (%s, %s, %s, 'R1')",
+        (simulated_order_id, SIM_ORDER, campaign_id),
+    )
+    answer = order_answer(simulated_order_id, status=change.get("status", "COMPLETED"), created=change.get("created"))
+    if "custom_id" in change:
+        answer["purchase_units"][0]["custom_id"] = change["custom_id"]
+    paypal = FakePayPal({f"/v2/checkout/orders/{SIM_ORDER}": answer})
+    tid = deliver(conn, "PAYMENT.CAPTURE.COMPLETED", {"supplementary_data": {"related_ids": {"order_id": SIM_ORDER}}})
+    process_events(conn, paypal.http())
+    assert outcome(conn, tid)[0] == "purchase refused" and outcome(conn, tid)[1]["reason"] == reason
+    assert conn.execute("select count(*) from attributions").fetchone()[0] == 0
+
+
+def test_other_types_are_ignored_and_unreadable_bodies_are_malformed(conn: psycopg.Connection) -> None:
+    paypal = FakePayPal()
+    ignored = deliver(conn, "CHECKOUT.ORDER.APPROVED", {"id": "X"})
+    repeated = deliver(conn, "PAYMENT.PAYOUTS-ITEM.SUCCEEDED", {}, raw='{"event_type":"PAYMENT.PAYOUTS-ITEM.SUCCEEDED","resource":{"payout_item_id":"A"},"resource":{"payout_item_id":"B"}}')
+    retyped = deliver(conn, "PAYMENT.PAYOUTS-ITEM.SUCCEEDED", {}, raw=json.dumps({"event_type": "PAYMENT.CAPTURE.COMPLETED", "resource": {}}))
+    no_id = deliver(conn, "PAYMENT.PAYOUTS-ITEM.SUCCEEDED", {"payout_item_id": "../../oauth2"})
+
+    report = process_events(conn, paypal.http())
+
+    assert report.outcomes == {"ignored": 1, "malformed": 3} and paypal.reads == []
+    assert [outcome(conn, t)[0] for t in (ignored, repeated, retyped, no_id)] == ["ignored", "malformed", "malformed", "malformed"]
+
+
+def test_a_failed_reread_leaves_the_event_for_the_next_run_and_the_fifth_failure_gives_up(conn: psycopg.Connection) -> None:
+    sent(conn)
+    paypal = FakePayPal()
+    tid = deliver(conn, "PAYMENT.PAYOUTS-ITEM.SUCCEEDED", {"payout_item_id": "ITEM1"})
+    for run in range(1, MAX_ATTEMPTS):
+        report = process_events(conn, paypal.http())
+        assert (report.retrying, report.outcomes, outcome(conn, tid)) == (1, {}, None), run
+    final = process_events(conn, paypal.http())
+    assert final.outcomes == {"gave up": 1}
+    given_up = outcome(conn, tid)
+    assert given_up[0] == "gave up"
+    assert (given_up[1]["attempts"], given_up[1]["status"], given_up[1]["name"]) == (5, 503, "SERVICE_UNAVAILABLE")
+    assert len(paypal.reads) == MAX_ATTEMPTS
+    assert process_events(conn, paypal.http()).processed == 0 and len(paypal.reads) == MAX_ATTEMPTS
+
+
+def test_each_delivery_gets_one_outcome_oldest_first_and_a_second_run_waits_for_the_lock(
+    conn: psycopg.Connection, server_url: str
+) -> None:
+    newer = deliver(conn, "CHECKOUT.ORDER.APPROVED", {}, age_minutes=1)
+    older = deliver(conn, "CHECKOUT.ORDER.APPROVED", {}, age_minutes=5)
+    paypal = FakePayPal()
+    with psycopg.connect(server_url, autocommit=True) as other:
+        other.execute("select pg_advisory_lock(%s)", (EVENT_LOCK,))
+        assert process_events(conn, paypal.http()).ran is False
+        other.execute("select pg_advisory_unlock(%s)", (EVENT_LOCK,))
+    assert process_events(conn, paypal.http(), limit=1).outcomes == {"ignored": 1}
+    assert outcome(conn, older) is not None and outcome(conn, newer) is None
+    process_events(conn, paypal.http())
+    process_events(conn, paypal.http())
+    assert conn.execute("select count(*) from event_outcomes").fetchone()[0] == 2
+    for bad in (0, 501, 1.5, True):
+        with pytest.raises(ValueError):
+            process_events(conn, paypal.http(), limit=bad)
+
+
+def test_outcomes_hold_no_payload_email_or_name_and_survive_the_purge(conn: psycopg.Connection) -> None:
+    campaign_id = sent(conn)
+    simulated_order_id = uuid.uuid4()
+    conn.execute(
+        "insert into simulated_orders (simulated_order_id, paypal_order_id, campaign_id, ref) values (%s, %s, %s, 'R1')",
+        (simulated_order_id, SIM_ORDER, campaign_id),
+    )
+    paypal = FakePayPal({
+        "/v1/payments/payouts-item/ITEM1": item_answer("ITEM1", "SUCCESS"),
+        f"/v2/checkout/orders/{SIM_ORDER}": order_answer(simulated_order_id),
+    })
+    deliver(conn, "PAYMENT.PAYOUTS-ITEM.SUCCEEDED", {"payout_item_id": "ITEM1", "payout_item": {"receiver": "m1@shop.example"}})
+    deliver(conn, "PAYMENT.CAPTURE.COMPLETED", {"payee": {"email_address": "shop@example.com"},
+                                                "supplementary_data": {"related_ids": {"order_id": SIM_ORDER}}})
+    process_events(conn, paypal.http())
+
+    deleted = purge_paypal_events(conn, NOW + timedelta(hours=49))
+    texts = conn.execute(
+        "select coalesce(string_agg(outcome || ' ' || detail::text, ' '), '') from event_outcomes"
+    ).fetchone()[0] + " " + conn.execute("select coalesce(string_agg(a::text, ' '), '') from attributions a").fetchone()[0]
+    assert deleted == 2 and conn.execute("select count(*) from event_outcomes").fetchone()[0] == 2
+    for forbidden in ("@", "Maya", "Test Buyer", "recipient_name", "payment_source", "resource"):
+        assert forbidden not in texts

@@ -1,4 +1,4 @@
-"""Loads the UCI sales history as the demo shop's own order records (M2).
+"""Loads the UCI sales history as the demo shop's own order records (M2) and refunds (M4b).
 
 Real behaviour, synthetic people: dates, amounts and items come from the source
 file, and every name and email is generated from the source customer number (C25).
@@ -17,7 +17,7 @@ from zoneinfo import ZoneInfo
 
 import psycopg
 
-from mend_engine.data.uci import CleaningTally, iter_clean_lines_by_sheet
+from mend_engine.data.uci import CleaningTally, RefundTally, iter_clean_lines_by_sheet, iter_refund_lines_by_sheet
 from mend_engine.shop.identities import customer_ref, display_name, synthetic_email
 
 # Approximate average of the 2010 to 2011 exchange rate. The README states it,
@@ -64,9 +64,18 @@ _UPSERT_LINE = (
     "is distinct from (excluded.stock_code, excluded.description, excluded.quantity, excluded.unit_price_minor)"
 )
 _COUNT_EXISTING = "select count(*) from shop_orders where order_ref = any(%s)"
+_UPSERT_REFUND = (
+    "insert into shop_refunds (refund_ref, customer_ref, refunded_at, amount_minor) values (%s, %s, %s, %s) "
+    "on conflict (refund_ref) do update set "
+    "customer_ref = excluded.customer_ref, refunded_at = excluded.refunded_at, amount_minor = excluded.amount_minor "
+    "where (shop_refunds.customer_ref, shop_refunds.refunded_at, shop_refunds.amount_minor) "
+    "is distinct from (excluded.customer_ref, excluded.refunded_at, excluded.amount_minor)"
+)
+_COUNT_EXISTING_REFUNDS = "select count(*) from shop_refunds where refund_ref = any(%s)"
 _INSERT_RUN = (
     "insert into import_runs (source, source_bytes, lines_read, lines_kept, week_shift) values (%s, %s, %s, %s, %s)"
 )
+REFUNDS_SOURCE_SUFFIX = " (refunds)"
 
 
 @dataclass
@@ -76,6 +85,20 @@ class ImportResult:
     customers: int
     orders: int
     inserted_orders: int
+    total_minor: int
+    week_shift: int
+
+
+@dataclass
+class RefundImportResult:
+    """refunds counts the cancellation invoices stored; unknown_customer counts those
+    skipped because their customer has no order record in the shop."""
+
+    lines_read: int
+    lines_kept: int
+    refunds: int
+    inserted_refunds: int
+    unknown_customer: int
     total_minor: int
     week_shift: int
 
@@ -90,6 +113,14 @@ class _Order:
     customer_id: int
     first_local: datetime
     lines: list[tuple[str, str, int, int]] = field(default_factory=list)
+
+
+@dataclass(slots=True)
+class _Refund:
+    sheet: str
+    customer_id: int
+    first_local: datetime
+    lines: list[tuple[str, int, int]] = field(default_factory=list)
 
 
 def weeks_to_shift(last_day: date = SOURCE_LAST_DAY, target_day: date = SHIFT_TARGET_DAY) -> int:
@@ -200,6 +231,99 @@ def import_uci(conn: psycopg.Connection, zip_path: Path) -> ImportResult:
         total_minor=sum(row[3] for row in order_rows),
         week_shift=weeks,
     )
+
+
+def import_refunds(conn: psycopg.Connection, zip_path: Path) -> RefundImportResult:
+    """Load the UCI file's cancellation invoices as the shop's refunds, one row per invoice.
+
+    Each invoice starting with C becomes one shop_refunds row keyed on its invoice
+    number, for the sum of quantity x unit price over its lines, with the same
+    rules as the orders: GBP to whole US cents through usd_minor, the same week
+    shift on the UK wall clock, the same customer_ref. Invoices both sheets carry
+    are stored once, and the import refuses to run if the two copies differ. An
+    invoice whose customer has no shop record is skipped and counted, never given a
+    new customer. Re-running with the same file changes no row. Each run appends one
+    row to import_runs with " (refunds)" after the file name.
+
+    Precondition: conn is in autocommit mode and import_uci has loaded the same
+    file. Raises ImportRefused or SourceError before writing anything if the file
+    breaks a rule.
+    """
+    if not conn.autocommit:
+        raise ImportRefused("import_refunds needs an autocommit connection so each batch commits on its own")
+    weeks = weeks_to_shift()
+    tally = RefundTally()
+    refunds = _read_refunds(zip_path, tally)
+    known = {row[0] for row in conn.execute("select customer_ref from shop_customers")}
+
+    rows = []
+    unknown = 0
+    for ref in sorted(refunds):
+        refund = refunds[ref]
+        owner = customer_ref(refund.customer_id)
+        if owner not in known:
+            unknown += 1
+            continue
+        amount = sum(quantity * unit for _code, quantity, unit in refund.lines)
+        if not 0 < amount <= MAX_INTEGER:
+            raise ImportRefused(f"refund {ref} amount does not fit the integer column")
+        rows.append((ref, owner, shifted_utc(refund.first_local, weeks), amount))
+
+    inserted = 0
+    for start in range(0, len(rows), ORDERS_PER_BATCH):
+        batch = rows[start : start + ORDERS_PER_BATCH]
+        with conn.transaction(), conn.cursor() as cur:
+            existing = cur.execute(_COUNT_EXISTING_REFUNDS, ([row[0] for row in batch],)).fetchone()[0]
+            cur.executemany(_UPSERT_REFUND, batch)
+        inserted += len(batch) - existing
+
+    with conn.transaction():
+        conn.execute(
+            _INSERT_RUN,
+            (zip_path.name + REFUNDS_SOURCE_SUFFIX, zip_path.stat().st_size, tally.read, tally.kept, weeks),
+        )
+
+    return RefundImportResult(
+        lines_read=tally.read,
+        lines_kept=tally.kept,
+        refunds=len(rows),
+        inserted_refunds=inserted,
+        unknown_customer=unknown,
+        total_minor=sum(row[3] for row in rows),
+        week_shift=weeks,
+    )
+
+
+def _read_refunds(zip_path: Path, tally: RefundTally) -> dict[str, _Refund]:
+    refunds: dict[str, _Refund] = {}
+    copies: dict[str, _Refund] = {}
+    cents_for: dict[Decimal, int] = {}
+    for sheet, line in iter_refund_lines_by_sheet(zip_path, tally):
+        if line.invoiced_at_local.date() > SOURCE_LAST_DAY:
+            raise ImportRefused(f"invoice {line.invoice} is dated after {SOURCE_LAST_DAY}")
+        first = refunds.get(line.invoice)
+        book = copies if first is not None and first.sheet != sheet else refunds
+        refund = book.get(line.invoice)
+        if refund is None:
+            refund = book[line.invoice] = _Refund(sheet, line.customer_id, line.invoiced_at_local)
+        elif refund.customer_id != line.customer_id:
+            raise ImportRefused(f"invoice {line.invoice} names two customers")
+        if line.invoiced_at_local < refund.first_local:
+            refund.first_local = line.invoiced_at_local
+        unit = cents_for.get(line.price_gbp)
+        if unit is None:
+            unit = cents_for[line.price_gbp] = usd_minor(line.price_gbp)
+        refund.lines.append((line.stock_code, line.quantity, unit))
+
+    for ref, copy in copies.items():
+        first = refunds[ref]
+        if (copy.customer_id, copy.first_local, Counter(copy.lines)) != (
+            first.customer_id,
+            first.first_local,
+            Counter(first.lines),
+        ):
+            raise ImportRefused(f"invoice {ref} differs between the two sheets")
+    return refunds
 
 
 def _read_orders(zip_path: Path, tally: CleaningTally) -> tuple[dict[str, _Order], dict[int, str]]:

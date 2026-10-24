@@ -19,6 +19,7 @@ import sys
 import time
 import zipfile
 from collections.abc import Iterator
+from contextlib import closing
 from dataclasses import dataclass, field
 from datetime import datetime
 from decimal import Decimal
@@ -66,7 +67,20 @@ RULES = (
     "non_product_code",
 )
 
+# The same, for reading cancellation invoices as refunds. Every stock code counts
+# on a cancellation, postage and manual credits included: orders count products
+# only, so a paid amount net of these can only come out lower than the truth, never
+# higher (C4 fails closed). In the real file every cancellation line has a negative
+# quantity and a positive price, so the last two rules never fire there.
+REFUND_RULES = (
+    "not_cancelled",
+    "no_customer_id",
+    "quantity_not_negative",
+    "price_not_positive",
+)
+
 _INVOICE = re.compile(r"[0-9]{6}", re.ASCII)
+_CANCELLATION = re.compile(r"C[0-9]{6}", re.ASCII)
 
 
 class SourceError(ValueError):
@@ -85,6 +99,18 @@ class SaleLine:
     country: str
 
 
+@dataclass(frozen=True)
+class RefundLine:
+    """One line of a cancellation invoice. quantity is the number of units given back, above 0."""
+
+    invoice: str
+    stock_code: str
+    quantity: int
+    price_gbp: Decimal
+    invoiced_at_local: datetime
+    customer_id: int
+
+
 @dataclass
 class CleaningTally:
     """Counts filled in while a scan runs: rows read, rows kept, rows dropped per rule."""
@@ -95,6 +121,15 @@ class CleaningTally:
 
     def as_report(self) -> dict:
         return {"read": self.read, "kept": self.kept, "dropped": dict(self.dropped)}
+
+
+@dataclass
+class RefundTally:
+    """CleaningTally's counterpart for a refunds scan, with REFUND_RULES."""
+
+    read: int = 0
+    kept: int = 0
+    dropped: dict[str, int] = field(default_factory=lambda: dict.fromkeys(REFUND_RULES, 0))
 
 
 def ensure_source(cache_dir: Path) -> Path:
@@ -175,6 +210,40 @@ def iter_clean_lines_by_sheet(zip_path: Path, tally: CleaningTally | None = None
     name lets a caller that needs each invoice once take it from one sheet only.
     """
     tally = tally if tally is not None else CleaningTally()
+    with closing(_source_rows(zip_path)) as rows:
+        for sheet, where, row in rows:
+            tally.read += 1
+            line, reason = _clean(row, where)
+            if line is None:
+                tally.dropped[reason] += 1
+                continue
+            tally.kept += 1
+            yield sheet, line
+
+
+def iter_refund_lines_by_sheet(zip_path: Path, tally: RefundTally | None = None) -> Iterator[tuple[str, RefundLine]]:
+    """Yield (sheet name, line) for every cancellation line that names a customer, filling tally.
+
+    A cancellation is an invoice starting with C. Keeps a line only if it has a
+    Customer ID, a negative Quantity and a Price above 0, whatever its StockCode.
+    Applies the same cell checks as iter_clean_lines_by_sheet to every row. The two
+    sheets overlap as they do for sales, so a caller must take each invoice once.
+    Raises SourceError on any file whose shape or cell types differ from the real one.
+    """
+    tally = tally if tally is not None else RefundTally()
+    with closing(_source_rows(zip_path)) as rows:
+        for sheet, where, row in rows:
+            tally.read += 1
+            line, reason = _refund(row, where)
+            if line is None:
+                tally.dropped[reason] += 1
+                continue
+            tally.kept += 1
+            yield sheet, line
+
+
+def _source_rows(zip_path: Path) -> Iterator[tuple[str, str, tuple]]:
+    """Yield (sheet, "<sheet> row <n>", row) for every data row, after the workbook shape checks."""
     workbook = _open_workbook(zip_path)
     try:
         if tuple(workbook.sheetnames) != SHEETS:
@@ -186,13 +255,7 @@ def iter_clean_lines_by_sheet(zip_path: Path, tally: CleaningTally | None = None
             for row_number, row in enumerate(rows, start=2):
                 if row_number > MAX_ROWS_PER_SHEET + 1:
                     raise SourceError(f"{sheet}: more than {MAX_ROWS_PER_SHEET} rows")
-                tally.read += 1
-                line, reason = _clean(row, f"{sheet} row {row_number}")
-                if line is None:
-                    tally.dropped[reason] += 1
-                    continue
-                tally.kept += 1
-                yield sheet, line
+                yield sheet, f"{sheet} row {row_number}", row
     finally:
         workbook.close()
 
@@ -214,7 +277,8 @@ def _open_workbook(zip_path: Path):
     return load_workbook(io.BytesIO(data), read_only=True, data_only=True)
 
 
-def _clean(row: tuple, where: str) -> tuple[SaleLine | None, str]:
+def _cells(row: tuple, where: str) -> tuple:
+    """The row's cells after the type checks every row must pass, kept or not."""
     if len(row) != len(COLUMNS):
         raise SourceError(f"{where}: expected {len(COLUMNS)} cells")
     invoice_cell, code_cell, description_cell, quantity, invoiced_at, price_cell, customer, country = row
@@ -225,6 +289,42 @@ def _clean(row: tuple, where: str) -> tuple[SaleLine | None, str]:
     price = _exact_price(price_cell, where)
     if customer is not None and (type(customer) is not int or customer < 1):
         raise SourceError(f"{where}: Customer ID is not a positive whole number")
+    return invoice, stock_code, description_cell, quantity, invoiced_at, price, customer, country
+
+
+def _check_kept(price: Decimal, invoiced_at: object, where: str) -> None:
+    if price.as_tuple().exponent < -MAX_PRICE_PLACES:
+        raise SourceError(f"{where}: Price has more than {MAX_PRICE_PLACES} decimal places")
+    if type(invoiced_at) is not datetime or invoiced_at.tzinfo is not None:
+        raise SourceError(f"{where}: InvoiceDate is not a plain local date and time")
+
+
+def _refund(row: tuple, where: str) -> tuple[RefundLine | None, str]:
+    invoice, stock_code, _description, quantity, invoiced_at, price, customer, _country = _cells(row, where)
+    if not invoice.startswith("C"):
+        return None, "not_cancelled"
+    if customer is None:
+        return None, "no_customer_id"
+    if quantity is None or quantity >= 0:
+        return None, "quantity_not_negative"
+    if price is None or price <= 0:
+        return None, "price_not_positive"
+    if not _CANCELLATION.fullmatch(invoice):
+        raise SourceError(f"{where}: Invoice is not C and six digits")
+    _check_kept(price, invoiced_at, where)
+    line = RefundLine(
+        invoice=sys.intern(invoice),
+        stock_code=sys.intern(stock_code),
+        quantity=-quantity,
+        price_gbp=price,
+        invoiced_at_local=invoiced_at,
+        customer_id=customer,
+    )
+    return line, ""
+
+
+def _clean(row: tuple, where: str) -> tuple[SaleLine | None, str]:
+    invoice, stock_code, description_cell, quantity, invoiced_at, price, customer, country = _cells(row, where)
 
     if invoice.startswith("C"):
         return None, "cancelled_invoice"
@@ -241,10 +341,7 @@ def _clean(row: tuple, where: str) -> tuple[SaleLine | None, str]:
 
     if not _INVOICE.fullmatch(invoice):
         raise SourceError(f"{where}: Invoice is not six digits")
-    if price.as_tuple().exponent < -MAX_PRICE_PLACES:
-        raise SourceError(f"{where}: Price has more than {MAX_PRICE_PLACES} decimal places")
-    if type(invoiced_at) is not datetime or invoiced_at.tzinfo is not None:
-        raise SourceError(f"{where}: InvoiceDate is not a plain local date and time")
+    _check_kept(price, invoiced_at, where)
     # Interned because hundreds of thousands of lines share a few thousand values.
     line = SaleLine(
         invoice=sys.intern(invoice),

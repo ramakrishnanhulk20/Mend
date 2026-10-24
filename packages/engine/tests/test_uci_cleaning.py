@@ -18,11 +18,14 @@ from mend_engine.data.uci import (
     NON_PRODUCT_CODES,
     SHEETS,
     XLSX_NAME,
+    RefundLine,
+    RefundTally,
     SaleLine,
     SourceError,
     cleaning_report,
     ensure_source,
     iter_clean_lines,
+    iter_refund_lines_by_sheet,
 )
 
 AT = datetime(2009, 12, 1, 7, 45)
@@ -209,3 +212,29 @@ def test_a_missing_file_is_downloaded_once_into_the_cache(tmp_path: Path, monkey
     ensure_source(tmp_path)
     assert calls == [uci.UCI_URL]
     assert sorted(p.name for p in tmp_path.iterdir()) == ["online_retail_ii.zip"]
+
+
+def test_refund_lines_are_cancellations_that_name_a_customer_whatever_the_code(tmp_path: Path) -> None:
+    rows = [
+        VALID[0],
+        DROPPED[0],
+        ("C489450", "M", "Manual", -1, AT, 4.5, 13085, "United Kingdom"),
+        ("C489451", 22087, "PAPER BUNTING WHITE LACE", -2, AT, 2.95, None, "Australia"),
+        ("C489452", 22087, "PAPER BUNTING WHITE LACE", 2, AT, 2.95, 16321, "Australia"),
+        ("C489453", 22087, "PAPER BUNTING WHITE LACE", -2, AT, 0, 16321, "Australia"),
+    ]
+    tally = RefundTally()
+    lines = list(iter_refund_lines_by_sheet(write_source(tmp_path / "s.zip", rows), tally))
+    assert lines == [
+        (SHEETS[0], RefundLine("C489449", "22087", 12, Decimal("2.95"), AT, 16321)),
+        (SHEETS[0], RefundLine("C489450", "M", 1, Decimal("4.5"), AT, 13085)),
+    ]
+    assert (tally.read, tally.kept) == (6, 2)
+    assert tally.dropped == {"not_cancelled": 1, "no_customer_id": 1, "quantity_not_negative": 1, "price_not_positive": 1}
+
+
+@pytest.mark.parametrize("invoice", ["C48944", "C4894490", "CX89449"])
+def test_refuses_a_cancellation_invoice_that_is_not_c_and_six_digits(tmp_path: Path, invoice: str) -> None:
+    row = (invoice, 22087, "PAPER BUNTING WHITE LACE", -12, AT, 2.95, 16321, "Australia")
+    with pytest.raises(SourceError):
+        list(iter_refund_lines_by_sheet(write_source(tmp_path / "s.zip", [row])))

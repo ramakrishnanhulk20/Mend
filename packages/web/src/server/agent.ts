@@ -10,8 +10,9 @@
  * turn stops at 8 tool calls, 10 model rounds and 60 seconds. The reply comes back as
  * plain text with images, HTML and email addresses removed.
  *
- * paypalReadTools() is the seam where PayPal's read-only tools plug in once their
- * design is decided. It returns none today, so the agent has no PayPal access at all.
+ * paypalReadTools() adds PayPal's four read-only lookups. Mend's server calls PayPal's
+ * MCP server for them (paypal-mcp.ts); the model never connects to PayPal, never sees
+ * the token, and gets back only the fields paypal-mcp.ts keeps (C1, C15, C16, C17).
  */
 import type Anthropic from "@anthropic-ai/sdk";
 import { betaZodTool } from "@anthropic-ai/sdk/helpers/beta/zod";
@@ -20,6 +21,8 @@ import { cachedSystem, ClaudeSession, claudeClient, FAILURE_MESSAGES, failureOf,
 import { askEngine, cleanGoal, planCampaign, type Asked } from "./goal";
 import { writeLog } from "./log";
 import { writeNotes } from "./notes";
+import { HostRefused } from "./paypal";
+import { callPayPalTool, McpFailed, McpRefused, READ_TOOL_INPUTS, type FailedReason, type ReadTool, type RefusedReason } from "./paypal-mcp";
 import { isAllowed, scrubbed, type Action, type SignedIn } from "./permissions";
 import { LIMITS, takeHit } from "./ratelimit";
 
@@ -158,14 +161,70 @@ const RESULTS = z.object({
   verdict: z.string(),
 });
 
+const PAYPAL_REFUSALS: Readonly<Record<RefusedReason | FailedReason | "host_refused", string>> = {
+  not_allowed: "Mend only reads orders, disputes and products from PayPal.",
+  invalid_input: "That is not an id PayPal uses.",
+  not_found: "PayPal has nothing with that id for this shop.",
+  timeout: "PayPal did not answer in time. Try again later.",
+  unreachable: "PayPal could not be reached right now. Try again later.",
+  too_large: "PayPal's answer was too large to read.",
+  protocol: "PayPal answered in a way Mend cannot read. Try again later.",
+  paypal_error: "PayPal refused that lookup. Try again later.",
+  tool_error: "PayPal could not run that lookup. Try again later.",
+  host_refused: "PayPal's server pointed somewhere Mend does not send requests, so nothing was sent there.",
+};
+
+const PAYPAL_MONEY = "PayPal amounts are a currency code and a decimal value in that currency, for example 12.50 USD is twelve dollars fifty, not cents.";
+
 /**
- * PayPal's read-only tools, once their design is decided (pending Ram's call on how the
- * agent reads PayPal data). None today. Whatever lands here must check its own action
- * in the permission table and list the fields it returns, like the tools below.
+ * PayPal's four read-only lookups (C1, C12, C15, C16, C17). Each passes guardedTool,
+ * so it needs paypal.read in the permission table and counts against the turn's tool
+ * cap and Claude caps. Mend's server makes the call through PayPal's MCP server with
+ * the strict input paypal-mcp.ts checks again, and the model gets only the fields
+ * paypal-mcp.ts keeps: no payer, payee, shipping, email, phone or address. A failure
+ * reaches the model as a fixed sentence and the log as its reason, never PayPal's text.
  */
 export function paypalReadTools(turn: Turn): AgentTool[] {
-  void turn;
-  return [];
+  const read = async (tool: ReadTool, input: unknown): Promise<unknown> => {
+    try {
+      return await callPayPalTool(tool, input, { signal: turn.session.signal });
+    } catch (error) {
+      if (!(error instanceof McpRefused || error instanceof McpFailed || error instanceof HostRefused)) throw error;
+      const reason = error instanceof HostRefused ? "host_refused" : error.reason;
+      writeLog({ kind: "paypal_mcp", ref: turn.ref, tool, outcome: reason, status: error instanceof McpFailed ? error.status : null });
+      throw new ToolRefusal(PAYPAL_REFUSALS[reason]);
+    }
+  };
+  return [
+    guardedTool(turn, {
+      name: "get_order",
+      action: "paypal.read",
+      description: `Call when the owner asks what happened with a PayPal order and gives its order id. Reads it from PayPal and returns its status, when it was created and last updated, the amount, item names and quantities, and each capture's id and status; never who paid or where it ships. ${PAYPAL_MONEY} Read only.`,
+      input: READ_TOOL_INPUTS.get_order,
+      run: (input) => read("get_order", input),
+    }),
+    guardedTool(turn, {
+      name: "list_disputes",
+      action: "paypal.read",
+      description: `Call when the owner asks whether the shop has any PayPal disputes, chargebacks or buyer complaints. Returns up to 20 disputes, each with its id, reason, status, stage, amount, dates and the date a reply is due; never the buyer. ${PAYPAL_MONEY} Read only.`,
+      input: READ_TOOL_INPUTS.list_disputes,
+      run: (input) => read("list_disputes", input),
+    }),
+    guardedTool(turn, {
+      name: "get_dispute",
+      action: "paypal.read",
+      description: `Call when the owner asks about one PayPal dispute and gives its id. Returns its reason, status, stage, amount, dates and the date a reply is due; never the buyer or the messages. ${PAYPAL_MONEY} Read only.`,
+      input: READ_TOOL_INPUTS.get_dispute,
+      run: (input) => read("get_dispute", input),
+    }),
+    guardedTool(turn, {
+      name: "show_product_details",
+      action: "paypal.read",
+      description: "Call when the owner asks about a product in the shop's PayPal catalog and gives its product id. Returns its name, description, type and category. Read only.",
+      input: READ_TOOL_INPUTS.show_product_details,
+      run: (input) => read("show_product_details", input),
+    }),
+  ];
 }
 
 /** Every tool the agent may call in this turn, each bound to the turn's caller and caps. */

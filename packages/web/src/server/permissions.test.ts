@@ -132,6 +132,10 @@ describe("the permission table", () => {
     }
   });
 
+  it("lets demo and owner read PayPal through the assistant's MCP tools, and nobody signed out", () => {
+    expect([isAllowed("paypal.read", "anonymous"), isAllowed("paypal.read", "demo"), isAllowed("paypal.read", "owner")]).toEqual([false, true, true]);
+  });
+
   it("gives the owner every action and the demo role every action but the scheduled jobs", () => {
     expect(ACTIONS.filter((action) => !isAllowed(action, "owner"))).toEqual([]);
     expect(ACTIONS.filter((action) => !isAllowed(action, "demo"))).toEqual(["admin.events", "admin.reconcile", "admin.purge"]);

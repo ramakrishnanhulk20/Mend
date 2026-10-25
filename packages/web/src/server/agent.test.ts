@@ -1,11 +1,13 @@
 // Covers the assistant: the exact tool list (no tool that approves, pays, refunds or
-// reaches PayPal), each tool's role check, strict inputs and listed outputs, the cap of
-// 8 tool calls a turn, held-back rows never shown to the model, the request sent to
-// Claude, refusals reported without running that turn's tools, the reply stripped to
-// plain text, and the route's guards, no-key answer and daily limit. The engine's
-// answers come from a recorder standing in for runAndWait, Claude's from a stubbed
-// fetch playing back scripted turns. Does NOT cover: how well the real model picks
-// tools (evals/owner-requests.json, run by npm run prove:m6) or the real engine.
+// writes to PayPal, and only PayPal's four read tools), each tool's role check, strict
+// inputs and listed outputs, the cap of 8 tool calls a turn, held-back rows never shown
+// to the model, the request sent to Claude, refusals reported without running that
+// turn's tools, the reply stripped to plain text, and the route's guards, no-key answer
+// and daily limit. The engine's answers come from a recorder standing in for
+// runAndWait, PayPal's from a recorder standing in for callPayPalTool, Claude's from a
+// stubbed fetch playing back scripted turns. Does NOT cover: how well the real model
+// picks tools (evals/owner-requests.json, run by npm run prove:m6), the real engine, or
+// the MCP client itself (paypal-mcp.test.ts, and the live sandbox in npm run prove:m6).
 import { randomBytes, randomUUID } from "node:crypto";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { sessionIdFor } from "./sessions";
@@ -17,7 +19,21 @@ const state = vi.hoisted(() => ({
   engine: {} as Record<string, (args: unknown[]) => unknown>,
   claude: [] as Record<string, unknown>[],
   turns: [] as { content: unknown[]; stop: string }[],
+  paypalCalls: [] as { name: string; args: unknown; signal: unknown }[],
+  paypal: null as unknown,
 }));
+
+vi.mock("./paypal-mcp", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("./paypal-mcp")>();
+  return {
+    ...actual,
+    callPayPalTool: vi.fn(async (name: string, args: unknown, options: { signal?: unknown } = {}) => {
+      state.paypalCalls.push({ name, args, signal: options.signal });
+      if (state.paypal instanceof Error) throw state.paypal;
+      return state.paypal;
+    }),
+  };
+});
 
 vi.mock("./ratelimit", async (importOriginal) => {
   const actual = await importOriginal<typeof import("./ratelimit")>();
@@ -59,6 +75,8 @@ vi.mock("@/server/permissions", async () => await import("./permissions"));
 const { agentTools, MAX_TOOL_CALLS, paypalReadTools, runAgent } = await import("./agent");
 const { ClaudeSession, MODEL } = await import("./claude");
 const { csrfTokenForSession } = await import("./csrf");
+const { HostRefused } = await import("./paypal");
+const { McpFailed, McpRefused } = await import("./paypal-mcp");
 const { POST } = await import("../app/api/agent/route");
 
 const BASE = "http://127.0.0.1:3000";
@@ -93,6 +111,16 @@ const VIEW = {
   review_hash: "a".repeat(64),
   review_problem: null,
 };
+const ORDER_ID = "9BP88160VF536100T";
+const ORDER_VIEW = {
+  id: ORDER_ID,
+  status: "COMPLETED",
+  create_time: "2026-10-24T08:13:20Z",
+  update_time: "2026-10-24T08:14:02Z",
+  purchase_units: [{ amount: { currency_code: "USD", value: "12.50" }, items: [], captures: [{ id: "3C679366HH908993F", status: "COMPLETED" }] }],
+};
+const MEND_TOOLS = ["shop_summary", "quiet_regulars", "draft_campaign", "view_campaign", "campaign_results", "request_approval"];
+const PAYPAL_TOOLS = ["get_order", "list_disputes", "get_dispute", "show_product_details"];
 
 function turn(role: "owner" | "demo" = "owner") {
   const principal = { ...OWNER, role };
@@ -120,6 +148,8 @@ beforeEach(() => {
   state.engineCalls = [];
   state.claude = [];
   state.turns = [];
+  state.paypalCalls = [];
+  state.paypal = ORDER_VIEW;
   state.engine = {
     shop_summary: () => SUMMARY,
     view_campaign: () => VIEW,
@@ -159,14 +189,73 @@ afterEach(() => {
 });
 
 describe("the agent's tools", () => {
-  it("are exactly Mend's six guarded tools, with strict inputs, and no PayPal tool yet", () => {
+  it("are exactly Mend's six guarded tools and PayPal's four read tools, with strict inputs", () => {
     const current = turn();
     const tools = runnable(agentTools(current));
     current.session.close();
-    expect(tools.map((candidate) => candidate.name)).toEqual(["shop_summary", "quiet_regulars", "draft_campaign", "view_campaign", "campaign_results", "request_approval"]);
-    expect(tools.map((candidate) => candidate.name).join(" ")).not.toMatch(/approve_campaign|submit|pay|refund|send|order|dispute|transaction|webhook/);
-    expect(paypalReadTools(current)).toEqual([]);
+    expect(tools.map((candidate) => candidate.name)).toEqual([...MEND_TOOLS, ...PAYPAL_TOOLS]);
+    expect(runnable(paypalReadTools(current)).map((candidate) => candidate.name)).toEqual(PAYPAL_TOOLS);
+    expect(tools.map((candidate) => candidate.name).join(" ")).not.toMatch(/approve_campaign|submit|pay|refund|send|create|update|capture|accept|cancel|invoice|transaction|webhook/);
     for (const candidate of tools) expect(candidate.input_schema.additionalProperties, candidate.name).toBe(false);
+  });
+
+  it("check paypal.read in the permission table before reaching PayPal", async () => {
+    const current = { ...turn(), principal: { ...OWNER, role: "anonymous" as unknown as "owner" } };
+    const tools = agentTools(current);
+    await expect(tool(tools, "get_order")({ id: ORDER_ID })).rejects.toThrow("not allowed");
+    await expect(tool(tools, "list_disputes")({})).rejects.toThrow("not allowed");
+    await expect(tool(tools, "get_dispute")({ dispute_id: "PP-D-27803" })).rejects.toThrow("not allowed");
+    await expect(tool(tools, "show_product_details")({ product_id: "PROD-5FD60555F23244316" })).rejects.toThrow("not allowed");
+    current.session.close();
+    expect(state.paypalCalls).toEqual([]);
+  });
+
+  it("refuse a malformed PayPal id or a customer filter without reaching PayPal", () => {
+    const current = turn();
+    const tools = agentTools(current);
+    expect(() => tool(tools, "get_order")({ id: "9bp88160vf536100t" })).toThrow();
+    expect(() => tool(tools, "get_order")({ id: `${ORDER_ID}/../refund` })).toThrow();
+    expect(() => tool(tools, "list_disputes")({ buyer_email: "buyer@example.com" })).toThrow();
+    expect(() => tool(tools, "get_dispute")({ dispute_id: "PP-D-1 or 1=1" })).toThrow();
+    expect(() => tool(tools, "show_product_details")({ product_id: "x" })).toThrow();
+    current.session.close();
+    expect(state.paypalCalls).toEqual([]);
+  });
+
+  it("read PayPal through Mend's MCP client with the turn's deadline, and turn its failures into fixed sentences", async () => {
+    const current = turn("demo");
+    const getOrder = tool(agentTools(current), "get_order");
+    expect(JSON.parse(String(await getOrder({ id: ORDER_ID })))).toEqual(ORDER_VIEW);
+    expect(state.paypalCalls).toEqual([{ name: "get_order", args: { id: ORDER_ID }, signal: current.session.signal }]);
+
+    const lines: string[] = [];
+    vi.spyOn(process.stdout, "write").mockImplementation(((chunk: string) => {
+      lines.push(String(chunk));
+      return true;
+    }) as typeof process.stdout.write);
+    for (const [error, sentence] of [
+      [new McpFailed("not_found", 404), "PayPal has nothing with that id"],
+      [new McpFailed("timeout"), "did not answer in time"],
+      [new McpRefused("not_allowed"), "only reads orders, disputes and products"],
+      [new HostRefused("host is not PayPal's sandbox MCP server"), "nothing was sent there"],
+    ] as const) {
+      state.paypal = error;
+      await expect(getOrder({ id: ORDER_ID })).rejects.toThrow(sentence);
+    }
+    current.session.close();
+    const logged = lines.join("");
+    expect(logged).toContain('"kind":"paypal_mcp"');
+    expect(logged).toContain('"outcome":"not_found","status":404');
+    expect(logged).toContain('"outcome":"host_refused"');
+  });
+
+  it("count PayPal reads against the same 8-call cap", async () => {
+    const current = turn();
+    const tools = agentTools(current);
+    for (let n = 0; n < MAX_TOOL_CALLS; n += 1) await tool(tools, "get_order")({ id: ORDER_ID });
+    await expect(tool(tools, "list_disputes")({})).rejects.toThrow("limit of 8 tool calls");
+    current.session.close();
+    expect(state.paypalCalls).toHaveLength(MAX_TOOL_CALLS);
   });
 
   it("check the caller's role in the permission table before asking the engine", async () => {
@@ -234,7 +323,7 @@ describe("runAgent", () => {
     expect(first).toMatchObject({ model: "claude-haiku-5-5", max_tokens: 4000, output_config: { effort: "medium" } });
     for (const banned of ["temperature", "top_p", "top_k", "thinking", "tool_choice"]) expect(first, banned).not.toHaveProperty(banned);
     expect((first.system as { cache_control: unknown }[]).at(-1)?.cache_control).toEqual({ type: "ephemeral" });
-    expect((first.tools as { name: string }[]).map((candidate) => candidate.name)).toHaveLength(6);
+    expect((first.tools as { name: string }[]).map((candidate) => candidate.name)).toEqual([...MEND_TOOLS, ...PAYPAL_TOOLS]);
     expect(JSON.stringify(first)).not.toContain("boss@shop.example");
     expect(JSON.stringify(second)).toContain("quietRegulars");
   });
@@ -245,6 +334,22 @@ describe("runAgent", () => {
     expect(answer).toMatchObject({ kind: "replied", reply: "The AI service declined this request.", stopped: "declined", aiCalls: 1 });
     expect(state.engineCalls).toEqual([]);
     expect(state.claude).toHaveLength(1);
+  });
+
+  it("answers what happened with an order through get_order, and Claude never gets PayPal's server, token or a write tool", async () => {
+    state.turns.push({ content: [{ type: "tool_use", id: "toolu_1", name: "create_invoice", input: { currency_code: "USD", primary_recipients: [], items: [] } }], stop: "tool_use" });
+    state.turns.push({ content: [{ type: "tool_use", id: "toolu_2", name: "get_order", input: { id: ORDER_ID } }], stop: "tool_use" });
+    state.turns.push({ content: [{ type: "text", text: "That order is completed: 12.50 USD, captured." }], stop: "end_turn" });
+    const answer = await runAgent(OWNER, `What happened with order ${ORDER_ID}? Also invoice my last buyer.`, [], randomUUID());
+
+    expect(answer).toMatchObject({ kind: "replied", reply: "That order is completed: 12.50 USD, captured.", toolsUsed: ["get_order"], aiCalls: 3 });
+    expect(state.paypalCalls.map((call) => call.name)).toEqual(["get_order"]);
+    expect(JSON.stringify(state.claude[1])).toContain("not found");
+    expect(JSON.stringify(state.claude[2])).toContain("3C679366HH908993F");
+    for (const sent of state.claude) {
+      expect(sent).not.toHaveProperty("mcp_servers");
+      expect(JSON.stringify(sent)).not.toMatch(/mcp_toolset|mcp\.sandbox\.paypal\.com|A21AA|authorization_token/);
+    }
   });
 
   it("turns an approve-and-pay request into request_approval at most, whatever the model writes", async () => {

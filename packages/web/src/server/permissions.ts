@@ -37,6 +37,7 @@ export const ACTIONS = [
   "campaign.notes",
   "campaign.request_approval",
   "agent.chat",
+  "paypal.read",
 ] as const;
 
 export type Action = (typeof ACTIONS)[number];
@@ -66,6 +67,8 @@ const PERMISSIONS: Readonly<Record<Action, readonly PrincipalRole[]>> = Object.f
   // Moves a draft into the approval queue only; approving stays campaign.approve, a person's click (C2).
   "campaign.request_approval": ["demo", "owner"],
   "agent.chat": ["demo", "owner"],
+  // The assistant's four read-only PayPal lookups through PayPal's MCP server, identity stripped (paypal-mcp.ts).
+  "paypal.read": ["demo", "owner"],
 });
 
 /** True only when the table grants action to role. Any other string, prototype names included, is false. */
@@ -147,7 +150,7 @@ export function refuse(
   return response;
 }
 
-const SECRET_SETTINGS = ["MEND_OWNER_PASSWORD", "PAYPAL_CLIENT_SECRET", "RENDER_API_KEY", "MEND_BRIDGE_TOKEN", "DATABASE_URL", "MEND_CSRF_SECRET"];
+const SECRET_SETTINGS = ["MEND_OWNER_PASSWORD", "PAYPAL_CLIENT_SECRET", "RENDER_API_KEY", "MEND_BRIDGE_TOKEN", "MEND_ENGINE_TOKEN", "DATABASE_URL", "MEND_CSRF_SECRET"];
 
 /** text with every secret setting's value and every token-shaped string removed, for a log line. */
 export function scrubbed(text: string): string {

@@ -326,10 +326,9 @@ async function main(): Promise<void> {
     MEND_CSRF_SECRET: randomBytes(32).toString("base64url"),
     MEND_BRIDGE_URL: bridge.url,
     MEND_BRIDGE_TOKEN: bridgeToken,
-    MEND_WORKFLOW_SLUG: "mend-engine",
   };
   await startServer(port, appEnv);
-  line(true, `server: next start on ${base}, engine tasks through the dev bridge, no RENDER_API_KEY set`);
+  line(true, `server: next start on ${base}, engine tasks through the dev bridge`);
 
   const campaigns = async (): Promise<number> => (await db.query<{ n: number }>("select count(*)::int as n from campaigns")).rows[0].n;
 
@@ -458,7 +457,7 @@ async function main(): Promise<void> {
       demoDenied.every((result) => !result.ok && result.status === 403) &&
       ownerAllowed.every((result) => result.ok) &&
       !unknownLive.ok &&
-      ACTIONS.length === 19,
+      ACTIONS.length === 20,
     "permissions: every action not in the table is denied; demo is denied admin.events, admin.reconcile and admin.purge",
   );
 

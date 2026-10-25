@@ -1,7 +1,8 @@
 """The engine's front door: one plain function per job the web console or the scheduler can start.
 
-Render Workflows (main.py) and the local dev bridge (dev_bridge.py) both call these
-functions and nothing else. Every argument arrives as JSON from the web app, so
+The engine service on Render's private network and the local dev bridge both reach
+these functions through task_server.py, and through nothing else; the cron job reaches
+the scheduled ones through jobs.py. Every argument arrives as JSON from the web app, so
 each task checks the shape of what it is given before anything is read, opens its
 own config and database connection, and returns a JSON-safe dict:
 {"ok": True, ...} on success, or {"ok": False, "error": <fixed code>, "ref": <id>}
@@ -125,6 +126,7 @@ _SECRET_ENV_NAMES = (
     "DATABASE_URL",
     "MEND_OWNER_PASSWORD",
     "MEND_BRIDGE_TOKEN",
+    "MEND_ENGINE_TOKEN",
     "RENDER_API_KEY",
 )
 

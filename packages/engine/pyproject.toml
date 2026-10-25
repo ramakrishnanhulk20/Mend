@@ -11,16 +11,19 @@ dependencies = [
     "httpx==0.28.1",
     "psycopg[binary]==3.3.6",
     "paypal-server-sdk==2.4.0",
-    "pgserver==0.1.4",
     "numpy==2.5.4",
     "scipy==1.18.1",
     "openpyxl==3.1.5",
     "tzdata==2026.5",
-    "render==1.3.0",
 ]
 
 [project.optional-dependencies]
+# pgserver runs a local Postgres for development and tests; the deployed engine never needs it.
+dev = [
+    "pgserver==0.1.4",
+]
 test = [
+    "pgserver==0.1.4",
     "pytest==9.1.1",
     "hypothesis==6.170.5",
 ]

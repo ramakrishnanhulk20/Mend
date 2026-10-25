@@ -398,7 +398,6 @@ async function main(): Promise<void> {
     MEND_CSRF_SECRET: csrfSecret,
     MEND_BRIDGE_URL: bridgeUrl,
     MEND_BRIDGE_TOKEN: bridgeToken,
-    MEND_WORKFLOW_SLUG: "mend-engine",
   });
   note(`server: next start on ${base}, engine tasks through the dev bridge on ${bridgeUrl}, live PayPal sandbox`);
 

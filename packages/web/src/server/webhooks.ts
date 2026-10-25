@@ -5,13 +5,16 @@
  * from the request) and the event text exactly as received, spliced into the request
  * as raw text. The text that was verified is the text that is parsed and stored.
  * Nothing here acts on what an event says: a stored event is only a prompt for the
- * engine to re-read the resource from PayPal (C10). Callers get a generic answer with
- * a correlation id; the reason stays in the server log.
+ * engine to re-read the resource from PayPal (C10). Once one is stored, the engine is
+ * asked to process events at once rather than at the next scheduled run; that request
+ * is never waited on and never changes the answer PayPal gets. Callers get a generic
+ * answer with a correlation id; the reason stays in the server log.
  */
 import { randomUUID } from "node:crypto";
 import { z } from "zod";
 import { loadConfig } from "./config";
 import { database } from "./db";
+import { runTask } from "./engine";
 import { writeLog } from "./log";
 import { paypalFetch, type PayPalReply } from "./paypal";
 import { parseStrictJson, StrictJsonError } from "./strict-json";
@@ -225,6 +228,20 @@ function answer(status: number, ref: string, log: Readonly<Record<string, unknow
 }
 
 /**
+ * Ask the engine to run process_events now, without waiting. Never throws: a refusal to
+ * start (missing engine settings) is logged under the delivery's ref, and a run that
+ * fails is logged by the engine client. The mend-jobs cron processes anything this
+ * misses within 5 minutes.
+ */
+function askEngineToProcess(ref: string): void {
+  Promise.resolve()
+    .then(() => runTask("process_events", []))
+    .catch((error: unknown) => {
+      writeLog({ kind: "webhook", ref, outcome: "engine_not_asked", reason: error instanceof Error ? error.message : "unknown" });
+    });
+}
+
+/**
  * The 413 answer for a request whose Content-Length already exceeds the cap, so the
  * route can refuse it before reading the body. Returns null when no such header is set.
  */
@@ -242,7 +259,8 @@ export function refuseDeclaredLength(headers: Headers): DeliveryResult | null {
  * depth, or nests deeper than 64 gets 400; a transmission time more than 5 minutes
  * ahead or more than 3 days old gets 400; PayPal's verdict other than SUCCESS gets 400
  * and nothing is stored. A verified delivery is inserted once, keyed on transmission
- * id (event id is unique too); a replay gets 200 and stores nothing new. A verification
+ * id (event id is unique too), and the engine is then asked to process events without
+ * waiting; a replay gets 200, stores nothing new and asks nothing. A verification
  * error, timeout or database failure gets 503 with nothing stored, so PayPal retries.
  */
 export async function handleDelivery(rawBody: string, headers: Headers): Promise<DeliveryResult> {
@@ -286,7 +304,9 @@ export async function handleDelivery(rawBody: string, headers: Headers): Promise
       const code = (error as { code?: unknown }).code;
       return answer(503, ref, { outcome: "unavailable", reason: "db_error", code: typeof code === "string" ? code : null, ...facts });
     }
-    return answer(200, ref, { outcome: stored, ...facts });
+    const result = answer(200, ref, { outcome: stored, ...facts });
+    if (stored === "stored") askEngineToProcess(ref);
+    return result;
   } catch {
     return answer(503, ref, { outcome: "unavailable", reason: "internal_error" });
   }

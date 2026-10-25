@@ -1,16 +1,20 @@
 /**
  * The web app's only way to reach the engine: start a task run, then read it.
  *
- * In production a run is a Render Workflows task run, started with the Render SDK and
- * read back with getTaskRun; a request never waits on the SDK's own .get(), which can
- * hang. In development (MEND_DEV on) the same tasks run through the engine's dev
- * bridge on this machine, and a bridge run lives only in this process's memory.
+ * A run is one POST /tasks/<name> to the engine's task server, made in the background
+ * so a route can answer before it finishes, and kept in this process's memory until it
+ * is read. In production the server is the private service mend-engine at
+ * MEND_ENGINE_URL, called with MEND_ENGINE_TOKEN; Mend runs one web instance, so every
+ * route reads the same runs. In development (MEND_DEV on) it is the engine's dev bridge
+ * on this machine, at MEND_BRIDGE_URL with MEND_BRIDGE_TOKEN. No Render API key is read
+ * or needed in either mode.
  *
  * Everything the engine answers is checked against the shape the engine promises
  * before any route uses it (C12): {"ok": true, ...} or {"ok": false, "error": <code>,
  * "ref": <uuid>}. Anything else counts as a failed run.
  */
 import { randomUUID } from "node:crypto";
+import { isIP } from "node:net";
 import { z } from "zod";
 import { devMode, isLoopback } from "./auth";
 import { ConfigError } from "./config";
@@ -38,20 +42,18 @@ export type TaskName = (typeof TASK_NAMES)[number];
 export type RunStatus = "running" | "succeeded" | "failed";
 
 export const POLL_MS = 500;
-const RENDER_API = "https://api.render.com";
-const START_TIMEOUT_MS = 15_000;
-const READ_TIMEOUT_MS = 10_000;
-const BRIDGE_TIMEOUT_MS = 120_000;
-const MAX_BRIDGE_ANSWER_BYTES = 1_000_000;
-const MAX_BRIDGE_RUNS = 500;
+const CALL_TIMEOUT_MS = 120_000;
+const MAX_ANSWER_BYTES = 1_000_000;
+const MAX_RUNS = 500;
 const IDEMPOTENCY_WINDOW_MS = 24 * 60 * 60 * 1000;
-const MIN_BRIDGE_TOKEN_CHARS = 32;
+const MIN_TOKEN_CHARS = 32;
 
-const RENDER_RUN_ID = /^trn-[A-Za-z0-9]{1,64}$/;
-const BRIDGE_RUN_ID = /^brn-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
-const WORKFLOW_SLUG = /^[a-z0-9][a-z0-9-]{0,62}$/;
+// One shape for both modes; runs.ts records ids of this shape against their session.
+const RUN_ID = /^brn-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 const IDEMPOTENCY_KEY = /^[A-Za-z0-9_.:-]{1,255}$/;
 const PRINTABLE_NO_SPACE = /^[\x21-\x7e]+$/;
+// A single DNS label, the form of a Render private network name such as mend-engine-a1b2.
+const SINGLE_LABEL = /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/;
 
 const answerSchema = z.union([
   z.looseObject({ ok: z.literal(true) }),
@@ -85,14 +87,6 @@ function checkedArguments(name: string, options: RunOptions): void {
   }
 }
 
-function withTimeout<T>(work: Promise<T>, ms: number, what: string): Promise<T> {
-  let timer: NodeJS.Timeout | undefined;
-  const late = new Promise<never>((_, reject) => {
-    timer = setTimeout(() => reject(new EngineUnavailable(`${what} timed out`)), ms);
-  });
-  return Promise.race([work, late]).finally(() => clearTimeout(timer));
-}
-
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
@@ -102,147 +96,125 @@ function readAnswer(value: unknown): EngineAnswer | null {
   return parsed.success ? parsed.data : null;
 }
 
-function renderSettings(): { readonly slug: string; readonly apiKey: string } {
-  const slug = process.env.MEND_WORKFLOW_SLUG ?? "";
-  const apiKey = process.env.RENDER_API_KEY ?? "";
-  if (!WORKFLOW_SLUG.test(slug)) throw new ConfigError("MEND_WORKFLOW_SLUG must be the workflow's slug");
-  if (!PRINTABLE_NO_SPACE.test(apiKey)) throw new ConfigError("RENDER_API_KEY is not set");
-  return { slug, apiKey };
-}
+/** Where task calls go in this mode, and the token and header they carry. */
+type Target = { readonly mode: "bridge" | "service"; readonly url: URL; readonly token: string; readonly header: string };
 
-async function renderWorkflows(apiKey: string) {
-  const { Render } = await import("@renderinc/sdk");
-  // The base URL and mode are fixed here, so no RENDER_LOCAL_DEV_URL or
-  // RENDER_USE_LOCAL_DEV in the environment can send the API key anywhere else.
-  return new Render({ token: apiKey, baseUrl: RENDER_API, useLocalDev: false }).workflows;
-}
-
-function renderFailure(error: unknown): EngineUnavailable {
-  if (error instanceof EngineUnavailable) return error;
-  const status = typeof (error as { statusCode?: unknown })?.statusCode === "number" ? (error as { statusCode: number }).statusCode : null;
-  const name = error instanceof Error ? error.name : "unknown";
-  return new EngineUnavailable(`Render answered ${status ?? "nothing"} (${name})`);
-}
-
-async function startRenderRun(name: TaskName, args: readonly unknown[], options: RunOptions): Promise<string> {
-  const { slug, apiKey } = renderSettings();
-  let runId: string;
-  try {
-    const workflows = await renderWorkflows(apiKey);
-    const started = await workflows.startTask(`${slug}/${name}`, [...args], {
-      signal: AbortSignal.timeout(START_TIMEOUT_MS),
-      ...(options.idempotencyKey === undefined ? {} : { idempotencyKey: options.idempotencyKey }),
-    });
-    runId = started.taskRunId;
-  } catch (error) {
-    throw renderFailure(error);
-  }
-  if (typeof runId !== "string" || !RENDER_RUN_ID.test(runId)) throw new EngineUnavailable("Render gave a run id of an unexpected shape");
-  return runId;
-}
-
-async function readRenderRun(runId: string): Promise<Run> {
-  const { apiKey } = renderSettings();
-  let details: { status?: unknown; results?: unknown };
-  try {
-    const workflows = await renderWorkflows(apiKey);
-    details = await withTimeout(workflows.getTaskRun(runId), READ_TIMEOUT_MS, "reading the run");
-  } catch (error) {
-    throw renderFailure(error);
-  }
-  // completed is the deprecated name for succeeded; any status not listed is still running.
-  if (details.status === "completed" || details.status === "succeeded") {
-    const answer = Array.isArray(details.results) && details.results.length >= 1 ? readAnswer(details.results[0]) : null;
-    if (answer === null) {
-      writeLog({ kind: "engine", outcome: "malformed_answer", run_id: runId });
-      return { status: "failed" };
-    }
-    return { status: "succeeded", result: answer };
-  }
-  if (details.status === "failed" || details.status === "canceled") return { status: "failed" };
-  return { status: "running" };
-}
-
-type BridgeRun = { readonly startedAt: number; readonly key: string | null; run: Run };
-type BridgeStore = { readonly runs: Map<string, BridgeRun>; readonly keys: Map<string, string> };
+type LocalRun = { readonly startedAt: number; readonly key: string | null; run: Run };
+type RunStore = { readonly runs: Map<string, LocalRun>; readonly keys: Map<string, string> };
 
 // Kept on globalThis because Next.js may load this module once per route bundle: a run
 // started by one route must be readable from GET /api/runs/[runId] in the same process.
-const STORE_KEY = Symbol.for("mend.engine.bridgeRuns");
-const holder = globalThis as typeof globalThis & { [STORE_KEY]?: BridgeStore };
-const store: BridgeStore = (holder[STORE_KEY] ??= { runs: new Map(), keys: new Map() });
-const bridgeRuns = store.runs;
-const bridgeKeys = store.keys;
+const STORE_KEY = Symbol.for("mend.engine.runs");
+const holder = globalThis as typeof globalThis & { [STORE_KEY]?: RunStore };
+const store: RunStore = (holder[STORE_KEY] ??= { runs: new Map(), keys: new Map() });
+const localRuns = store.runs;
+const localKeys = store.keys;
 
-function bridgeSettings(): { readonly url: URL; readonly token: string } {
+function bareOrigin(url: URL): boolean {
+  return url.username === "" && url.password === "" && url.pathname === "/" && url.search === "" && url.hash === "";
+}
+
+function checkedToken(name: string): string {
+  const token = process.env[name] ?? "";
+  if (token.length < MIN_TOKEN_CHARS || !PRINTABLE_NO_SPACE.test(token)) {
+    throw new ConfigError(`${name} must be at least 32 printable characters`);
+  }
+  return token;
+}
+
+function bridgeTarget(): Target {
   let url: URL;
   try {
     url = new URL(process.env.MEND_BRIDGE_URL ?? "");
   } catch {
     throw new ConfigError("MEND_BRIDGE_URL must be the dev bridge's http address on this machine");
   }
-  const bare = url.username === "" && url.password === "" && url.pathname === "/" && url.search === "" && url.hash === "";
   // The token travels with every call, so it is only ever sent to this machine.
-  if (url.protocol !== "http:" || !isLoopback(url.hostname) || !bare) {
+  if (url.protocol !== "http:" || !isLoopback(url.hostname) || !bareOrigin(url)) {
     throw new ConfigError("MEND_BRIDGE_URL must be the dev bridge's http address on this machine");
   }
-  const token = process.env.MEND_BRIDGE_TOKEN ?? "";
-  if (token.length < MIN_BRIDGE_TOKEN_CHARS || !PRINTABLE_NO_SPACE.test(token)) {
-    throw new ConfigError("MEND_BRIDGE_TOKEN must be at least 32 printable characters");
-  }
-  return { url, token };
+  return { mode: "bridge", url, token: checkedToken("MEND_BRIDGE_TOKEN"), header: "x-mend-bridge-token" };
 }
 
-async function callBridge(url: URL, token: string, name: TaskName, args: readonly unknown[]): Promise<EngineAnswer> {
-  const response = await fetch(new URL(`/tasks/${name}`, url), {
+/**
+ * MEND_ENGINE_URL, checked: plain http to a host that is one DNS label (a Render private
+ * network name), an optional port, and nothing else. A one-label name cannot be
+ * resolved on the public internet, so the token never leaves Render's network in clear
+ * text. This refuses https, IP addresses, localhost, dotted names, userinfo and paths.
+ * It does not cover another service inside the same Render workspace taking the name,
+ * which needs access to Ram's Render account.
+ */
+function serviceTarget(): Target {
+  let url: URL;
+  try {
+    url = new URL(process.env.MEND_ENGINE_URL ?? "");
+  } catch {
+    throw new ConfigError("MEND_ENGINE_URL must be the engine's private network address");
+  }
+  const privateName = SINGLE_LABEL.test(url.hostname) && isIP(url.hostname) === 0 && !isLoopback(url.hostname);
+  if (url.protocol !== "http:" || !privateName || !bareOrigin(url)) {
+    throw new ConfigError("MEND_ENGINE_URL must be the engine's private network address");
+  }
+  return { mode: "service", url, token: checkedToken("MEND_ENGINE_TOKEN"), header: "x-mend-engine-token" };
+}
+
+async function callEngine(target: Target, name: TaskName, args: readonly unknown[]): Promise<EngineAnswer> {
+  const response = await fetch(new URL(`/tasks/${name}`, target.url), {
     method: "POST",
-    headers: { "content-type": "application/json", "x-mend-bridge-token": token },
+    headers: { "content-type": "application/json", [target.header]: target.token },
     body: JSON.stringify({ args }),
+    // A redirect would carry the token to wherever it points.
     redirect: "error",
-    signal: AbortSignal.timeout(BRIDGE_TIMEOUT_MS),
+    signal: AbortSignal.timeout(CALL_TIMEOUT_MS),
   });
   const text = await response.text();
-  if (response.status !== 200) throw new EngineUnavailable(`the bridge answered ${response.status}`);
-  if (Buffer.byteLength(text, "utf8") > MAX_BRIDGE_ANSWER_BYTES) throw new EngineUnavailable("the bridge answer is too large");
+  if (response.status !== 200) throw new EngineUnavailable(`the engine answered ${response.status}`);
+  if (Buffer.byteLength(text, "utf8") > MAX_ANSWER_BYTES) throw new EngineUnavailable("the engine answer is too large");
   let parsed: unknown;
   try {
     parsed = JSON.parse(text);
   } catch {
-    throw new EngineUnavailable("the bridge answer is not JSON");
+    throw new EngineUnavailable("the engine answer is not JSON");
   }
   const answer = readAnswer(parsed);
-  if (answer === null) throw new EngineUnavailable("the bridge answer is not an engine answer");
+  if (answer === null) throw new EngineUnavailable("the engine answer is not an engine answer");
   return answer;
 }
 
-function remember(runId: string, entry: BridgeRun): void {
-  bridgeRuns.set(runId, entry);
-  if (entry.key !== null) bridgeKeys.set(entry.key, runId);
-  for (const [oldId, old] of bridgeRuns) {
-    if (bridgeRuns.size <= MAX_BRIDGE_RUNS) break;
-    bridgeRuns.delete(oldId);
-    if (old.key !== null && bridgeKeys.get(old.key) === oldId) bridgeKeys.delete(old.key);
+function remember(runId: string, entry: LocalRun): void {
+  localRuns.set(runId, entry);
+  if (entry.key !== null) localKeys.set(entry.key, runId);
+  for (const [oldId, old] of localRuns) {
+    if (localRuns.size <= MAX_RUNS) break;
+    localRuns.delete(oldId);
+    if (old.key !== null && localKeys.get(old.key) === oldId) localKeys.delete(old.key);
   }
 }
 
-function startBridgeRun(name: TaskName, args: readonly unknown[], options: RunOptions): string {
-  const { url, token } = bridgeSettings();
+function startRun(target: Target, name: TaskName, args: readonly unknown[], options: RunOptions): string {
   const key = options.idempotencyKey ?? null;
   if (key !== null) {
-    const earlier = bridgeKeys.get(key);
-    const entry = earlier === undefined ? undefined : bridgeRuns.get(earlier);
+    const earlier = localKeys.get(key);
+    const entry = earlier === undefined ? undefined : localRuns.get(earlier);
     if (earlier !== undefined && entry !== undefined && Date.now() - entry.startedAt < IDEMPOTENCY_WINDOW_MS) return earlier;
   }
   const runId = `brn-${randomUUID()}`;
-  const entry: BridgeRun = { startedAt: Date.now(), key, run: { status: "running" } };
+  const entry: LocalRun = { startedAt: Date.now(), key, run: { status: "running" } };
   remember(runId, entry);
-  callBridge(url, token, name, args).then(
+  callEngine(target, name, args).then(
     (answer) => {
       entry.run = { status: "succeeded", result: answer };
     },
     (error: unknown) => {
       entry.run = { status: "failed" };
-      writeLog({ kind: "engine", outcome: "bridge_failed", task: name, run_id: runId, reason: error instanceof Error ? error.message : "unknown" });
+      writeLog({
+        kind: "engine",
+        outcome: "engine_call_failed",
+        mode: target.mode,
+        task: name,
+        run_id: runId,
+        reason: error instanceof Error ? error.message : "unknown",
+      });
     },
   );
   return runId;
@@ -250,33 +222,31 @@ function startBridgeRun(name: TaskName, args: readonly unknown[], options: RunOp
 
 /**
  * Start task name with positional args and return the run id at once, without waiting
- * for the run. A repeat with the same idempotencyKey within 24 hours returns the first
- * run's id instead of starting another. Throws EngineUnavailable when the run cannot be
- * started and ConfigError when the engine settings are missing or wrong.
+ * for the run: the engine's task server (MEND_ENGINE_URL) in production, the dev bridge
+ * (MEND_BRIDGE_URL) with MEND_DEV on. A repeat with the same idempotencyKey within 24
+ * hours returns the first run's id instead of starting another. Throws ConfigError,
+ * before anything is sent, when that mode's address or token is missing or wrong. A
+ * call that then fails makes the run "failed".
  */
 export async function runTask(name: TaskName, args: readonly unknown[], options: RunOptions = {}): Promise<string> {
   checkedArguments(name, options);
-  return devMode() ? startBridgeRun(name, args, options) : startRenderRun(name, args, options);
+  return startRun(devMode() ? bridgeTarget() : serviceTarget(), name, args, options);
 }
 
-/** True when runId has the shape of a run id this deployment's engine mode issues. */
+/** True when runId has the shape of a run id this process issues. */
 export function isRunId(runId: string): boolean {
-  return devMode() ? BRIDGE_RUN_ID.test(runId) : RENDER_RUN_ID.test(runId);
+  return RUN_ID.test(runId);
 }
 
 /**
  * The run's state: running, succeeded with the engine's checked answer, or failed.
- * Throws RunNotFound for an id this deployment never issued and EngineUnavailable when
- * the state cannot be read.
+ * Throws RunNotFound for an id this process never issued, or has since forgotten (it
+ * keeps the latest 500, and none across a restart).
  */
 export async function getRun(runId: string): Promise<Run> {
-  if (devMode()) {
-    const entry = BRIDGE_RUN_ID.test(runId) ? bridgeRuns.get(runId) : undefined;
-    if (entry === undefined) throw new RunNotFound();
-    return entry.run;
-  }
-  if (!RENDER_RUN_ID.test(runId)) throw new RunNotFound();
-  return readRenderRun(runId);
+  const entry = RUN_ID.test(runId) ? localRuns.get(runId) : undefined;
+  if (entry === undefined) throw new RunNotFound();
+  return entry.run;
 }
 
 export type Waited =

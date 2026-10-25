@@ -2,13 +2,15 @@
 // schema.sql in a throwaway schema) and a fake PayPal verify endpoint that only says
 // SUCCESS for the exact bytes it signed. Does NOT cover: PayPal's real verdicts, real
 // signatures or delivery timing (the live proof, npm run prove:m1b, does), the HTTP
-// route wrapper, or rate limiting (not built yet).
+// route wrapper, rate limiting (not built yet), or the engine itself: the engine client
+// is replaced by a stand-in that records what it was asked (engine.test.ts covers it).
 import { createHash, randomUUID } from "node:crypto";
 import { readFileSync } from "node:fs";
 import pg from "pg";
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { holdDevDatabase, SCHEMA_PATH, type DevDatabase } from "../../scripts/dev-database";
 import { closeDatabase } from "./db";
+import { runTask } from "./engine";
 import {
   handleDelivery,
   MAX_BODY_BYTES,
@@ -24,6 +26,10 @@ const TOKEN = "A21AAfakeTokenForWebhookTests";
 const VERIFY_PATH = "/v1/notifications/verify-webhook-signature";
 const CERT_URL = "https://api.sandbox.paypal.com/v1/notifications/certs/CERT-360caa42-fca2a594-a5cafa77";
 const GENERIC_BODY = /^(ok|refused|too large|try again later) \(ref [0-9a-f-]{36}\)$/;
+const RUN_ID = "brn-6f1c1d3e-2b9a-4f0e-9a51-3c1d2e4f5a6b";
+
+vi.mock("./engine", () => ({ runTask: vi.fn() }));
+const asked = vi.mocked(runTask);
 
 type Mode = "honest" | "failure" | "server_error" | "timeout" | "garbage";
 
@@ -115,6 +121,15 @@ function lastLog(): Record<string, unknown> {
 }
 
 beforeAll(async () => {
+  // dev_url runs the engine's full settings check before it starts Postgres, so every
+  // setting it reads is set here; a fresh clone has no .env file to fall back on.
+  vi.stubEnv("PAYPAL_ENV", "sandbox");
+  vi.stubEnv("PAYPAL_CLIENT_ID", "fake-client-id");
+  vi.stubEnv("PAYPAL_CLIENT_SECRET", SECRET);
+  vi.stubEnv("MEND_DEV", "1");
+  vi.stubEnv("MEND_PAYOUT_ITEM_CAP_MINOR", "1000");
+  vi.stubEnv("MEND_CAMPAIGN_CAP_MINOR", "10000");
+  vi.stubEnv("MEND_DAILY_CAP_MINOR", "20000");
   dev = await holdDevDatabase();
   admin = new pg.Client({ connectionString: dev.url });
   await admin.connect();
@@ -125,9 +140,6 @@ beforeAll(async () => {
 
   const url = new URL(dev.url);
   url.searchParams.set("options", `-c search_path=${schema}`);
-  vi.stubEnv("PAYPAL_ENV", "sandbox");
-  vi.stubEnv("PAYPAL_CLIENT_ID", "fake-client-id");
-  vi.stubEnv("PAYPAL_CLIENT_SECRET", SECRET);
   vi.stubEnv("PAYPAL_WEBHOOK_ID", WEBHOOK_ID);
   vi.stubEnv("DATABASE_URL", url.href);
   vi.stubGlobal("fetch", fakePayPal);
@@ -149,6 +161,8 @@ beforeEach(async () => {
   paypal.mode = "honest";
   paypal.verifyRequests = [];
   logLines = [];
+  asked.mockReset();
+  asked.mockResolvedValue(RUN_ID);
   vi.spyOn(process.stdout, "write").mockImplementation(((chunk: string | Uint8Array) => {
     logLines.push(String(chunk));
     return true;
@@ -414,6 +428,48 @@ describe("storage", () => {
     const { rows } = await admin.query("select event_id, resource_id, raw from paypal_events");
     expect(rows).toEqual([{ event_id: "WH-x');drop_table_paypal_events;--", resource_id: null, raw: body }]);
     expect(({} as Record<string, unknown>).polluted).toBeUndefined();
+  });
+});
+
+describe("asking the engine to process events", () => {
+  it("a stored delivery asks the engine once for process_events, and the answer does not wait for it", async () => {
+    asked.mockReturnValue(new Promise<string>(() => {}));
+    const delivery = signedDelivery(payoutItemEvent());
+    expect((await handleDelivery(delivery.body, delivery.headers)).status).toBe(200);
+    await vi.waitFor(() => expect(asked).toHaveBeenCalledTimes(1));
+    expect(asked).toHaveBeenCalledWith("process_events", []);
+  });
+
+  it("a replay, a refusal or a 503 asks nothing", async () => {
+    const delivery = signedDelivery(payoutItemEvent());
+    await handleDelivery(delivery.body, delivery.headers);
+    await vi.waitFor(() => expect(asked).toHaveBeenCalledTimes(1));
+    expect((await handleDelivery(delivery.body, delivery.headers)).status).toBe(200);
+    paypal.mode = "failure";
+    const forged = signedDelivery(payoutItemEvent());
+    expect((await handleDelivery(forged.body, forged.headers)).status).toBe(400);
+    paypal.mode = "server_error";
+    const unverified = signedDelivery(payoutItemEvent());
+    expect((await handleDelivery(unverified.body, unverified.headers)).status).toBe(503);
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    expect(asked).toHaveBeenCalledTimes(1);
+  });
+
+  it.each([
+    ["refuses to start", () => Promise.reject(new Error("MEND_ENGINE_URL must be the engine's private network address"))],
+    ["throws at once", () => {
+      throw new Error("engine client broke");
+    }],
+  ])("an engine client that %s leaves the 200 as it was and is logged under the delivery's ref", async (_label, behaviour) => {
+    asked.mockImplementation(behaviour as typeof runTask);
+    const delivery = signedDelivery(payoutItemEvent());
+    const result = await handleDelivery(delivery.body, delivery.headers);
+    expect(result.status).toBe(200);
+    const ref = /\(ref ([0-9a-f-]{36})\)$/.exec(result.body)?.[1];
+    await vi.waitFor(() => expect(logs().some((entry) => entry.outcome === "engine_not_asked")).toBe(true));
+    expect(logs().find((entry) => entry.outcome === "stored")).toMatchObject({ ref, status: 200 });
+    expect(logs().find((entry) => entry.outcome === "engine_not_asked")).toMatchObject({ kind: "webhook", ref });
+    expect(await rowCount()).toBe(1);
   });
 });
 

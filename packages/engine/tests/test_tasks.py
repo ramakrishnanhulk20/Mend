@@ -1,10 +1,10 @@
 # Not covered here: the web app's own session, permission, CSRF and rate-limit checks
 # (packages/web tests and prove:m7a/m7b), real PayPal answers (prove_m4b and prove_m5),
 # the real model facts (python -m mend_engine.store_facts computes and stores them),
-# Render actually running main.py (no Render call is made), and two demo drafts from
-# one session racing on separate connections (the session lock is exercised only in sequence).
+# the task server that runs these tasks on Render (test_task_server.py), and two demo
+# drafts from one session racing on separate connections (the session lock is
+# exercised only in sequence).
 import hashlib
-import importlib.util
 import json
 import random
 import re
@@ -13,7 +13,6 @@ import threading
 import uuid
 from collections.abc import Iterator
 from datetime import date, datetime, time, timedelta, timezone
-from pathlib import Path
 from urllib.parse import parse_qsl, quote, urlencode, urlsplit, urlunsplit
 
 import httpx
@@ -46,7 +45,6 @@ DEMO_SETTINGS = {
     "holdout_share": "0.50",
     "max_candidates": 20,
 }
-ENGINE_DIR = Path(__file__).resolve().parents[1]
 
 
 class FakePayPal:
@@ -537,24 +535,6 @@ def test_quiet_regulars_refuses_a_limit_outside_1_to_50(conn: psycopg.Connection
 def test_quiet_regulars_needs_a_live_session(conn: psycopg.Connection, paypal: FakePayPal) -> None:
     assert refused(tasks.quiet_regulars({"role": "demo", "session": "a" * 64}, 10), "forbidden")
     assert refused(tasks.quiet_regulars(None, 10), "invalid_actor")
-
-
-def test_main_registers_exactly_the_tasks_with_no_retries_on_anything_that_writes() -> None:
-    spec = importlib.util.spec_from_file_location("mend_render_main", ENGINE_DIR / "main.py")
-    assert spec is not None and spec.loader is not None
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-
-    # The SDK's own registry, the one app.start() hands to Render; start() itself is never called.
-    registry = module.app._registry
-    retries = {name: registry.get_task(name).options.retry.max_retries for name in registry.get_task_names()}
-
-    assert sorted(retries) == sorted(tasks.TASK_NAMES)
-    assert all(registry.get_task(name).options.timeout_seconds == 300 for name in retries)
-    assert {name for name, count in retries.items() if count > 0} == {
-        "view_campaign", "results", "shop_summary", "quiet_regulars", "draft_limits", "note_context",
-    }
-    assert all(count <= 2 for count in retries.values())
 
 
 def first_rows(conn: psycopg.Connection, campaign_id: str) -> tuple[str, str]:

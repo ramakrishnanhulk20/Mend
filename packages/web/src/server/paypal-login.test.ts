@@ -179,6 +179,37 @@ describe("readIdentity", () => {
     expect(JSON.stringify({ ...error, message: error.message })).not.toContain("priya");
   });
 
+  const LIVE_SHAPE = { emails: [{ value: USERINFO.email, primary: true, confirmed: true }], payer_id: "QWERTY1234567", sub: USERINFO.sub, user_id: USERINFO.user_id, verified_account: "true" };
+
+  it("reads the emails list schema=paypalv1.1 sends: the primary address, verified when it is confirmed", async () => {
+    answers = [json(200, LIVE_SHAPE)];
+    const reading = await readIdentity(USER_TOKEN);
+    expect(reading.identity).toStrictEqual({ email: USERINFO.email, email_verified: true, payer_id: "QWERTY1234567" });
+    expect(reading.fields).toEqual(["emails", "payer_id", "sub", "user_id", "verified_account"]);
+  });
+
+  it.each([
+    ["flags written as text", [{ value: USERINFO.email, primary: "true", confirmed: "true" }], true],
+    ["an unconfirmed primary", [{ value: USERINFO.email, primary: true, confirmed: false }], false],
+    ["a lone address with no primary flag", [{ value: USERINFO.email }], false],
+    ["a second, non-primary address", [{ value: "other@personal.example.com", primary: false, confirmed: true }, { value: USERINFO.email, primary: true, confirmed: true }], true],
+  ])("takes the primary address from %s", async (_label, emails, verified) => {
+    answers = [json(200, { ...LIVE_SHAPE, emails })];
+    expect((await readIdentity(USER_TOKEN)).identity).toStrictEqual({ email: USERINFO.email, email_verified: verified, payer_id: "QWERTY1234567" });
+  });
+
+  it.each([
+    ["no addresses", []],
+    ["two addresses and no primary", [{ value: USERINFO.email, confirmed: true }, { value: "other@personal.example.com", confirmed: true }]],
+    ["two primaries", [{ value: USERINFO.email, primary: true }, { value: "other@personal.example.com", primary: true }]],
+    ["a primary with no address", [{ primary: true, confirmed: true }]],
+  ])("refuses an emails list with %s", async (_label, emails) => {
+    answers = [json(200, { ...LIVE_SHAPE, emails })];
+    const error = await failure(readIdentity(USER_TOKEN));
+    expect(error.reason).toBe("userinfo_unusable");
+    expect(JSON.stringify({ ...error, message: error.message })).not.toContain("priya");
+  });
+
   it("refuses an answer that repeats a key, so no second reading of it is possible", async () => {
     answers = [{ status: 200, body: '{"email":"a@personal.example.com","email_verified":true,"email":"b@personal.example.com"}' }];
     expect((await failure(readIdentity(USER_TOKEN))).reason).toBe("userinfo_refused");

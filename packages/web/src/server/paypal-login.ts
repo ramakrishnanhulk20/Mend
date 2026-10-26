@@ -323,12 +323,29 @@ function askUserinfo(path: string, userToken: string): Promise<Reply> {
   return send(sandboxUrl(path), { method: "GET", headers: { Accept: "application/json", Authorization: `Bearer ${userToken}` } });
 }
 
+// schema=paypalv1.1 answers "emails": [{value, primary, confirmed}] in place of OpenID's
+// email and email_verified (first seen live on 26 Oct 2026), and PayPal's older schemas
+// write such flags as true or "true". The primary address is the one used; with no
+// primary, only a lone address is.
+function flag(value: unknown): boolean {
+  return value === true || value === "true";
+}
+
+function emailOf(body: Record<string, unknown>): { readonly email: unknown; readonly verified: unknown } {
+  const list = own(body, "emails");
+  if (!Array.isArray(list)) return { email: own(body, "email"), verified: own(body, "email_verified") };
+  const entries = list.filter(isRecord);
+  const primary = entries.filter((entry) => flag(own(entry, "primary")));
+  const chosen = primary.length === 1 ? primary[0] : primary.length === 0 && entries.length === 1 ? entries[0] : null;
+  return chosen === null ? { email: undefined, verified: undefined } : { email: own(chosen, "value"), verified: flag(own(chosen, "confirmed")) };
+}
+
 /**
  * Ask PayPal who signed in, with the customer's own token as the Bearer.
  *
  * GET /v1/identity/oauth2/userinfo?schema=paypalv1.1, and only when that answers 404,
  * GET /v1/identity/openidconnect/userinfo?schema=openid. Returns a new object holding
- * exactly email, email_verified and payer_id, where payer_id is null unless PayPal sent
+ * exactly email, email_verified and payer_id (from emailOf), where payer_id is null unless PayPal sent
  * 13 capital letters or digits; every other field is dropped here. Throws LoginError:
  * token_unusable before anything is sent for a token with spaces or control
  * characters; paypal_unreachable; reply_too_large; userinfo_refused for any status but
@@ -345,8 +362,7 @@ export async function readIdentity(userToken: string): Promise<IdentityReading> 
     reply = await askUserinfo(USERINFO_FALLBACK_PATH, userToken);
   }
   if (reply.status !== 200 || !isRecord(reply.body)) throw new LoginError("userinfo_refused", reply, source);
-  const email = own(reply.body, "email");
-  const verified = own(reply.body, "email_verified");
+  const { email, verified } = emailOf(reply.body);
   if (typeof email !== "string" || email.length > MAX_EMAIL_CHARS || !EMAIL.test(email) || typeof verified !== "boolean") {
     throw new LoginError("userinfo_unusable", reply, source);
   }

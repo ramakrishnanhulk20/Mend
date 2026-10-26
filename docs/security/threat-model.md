@@ -294,3 +294,26 @@ Three things changed in what runs. The engine is now a Render private service (m
 
 **No Render API key on any service.** A Render API key is account-wide: on a service it could create paid services. The private engine replaced Workflows for this reason, so no service needs one. Only the deploy script on the operator's machine holds it.
 *Proof:* `node scripts/deploy/render.mjs prove`, check "render key" (no service holds the key, under that name or any other) and check "private" (mend-engine has no public URL and its name does not resolve on public DNS).
+
+## Amendments 26 Oct 2026, after the backend gate review
+
+The review found gaps in section C itself. Each rule below is upheld in code and proven by a test that failed before the fix.
+
+**C3, an unclear send stays unclear.** After a timeout, no answer or a 5xx on any attempt for a sender_batch_id, and on every reconcile resend, only a created answer or PayPal's duplicate sender_batch_id answer settles the campaign. Any other answer leaves it submission_unknown. With no unclear attempt, only 400 and 422 may void it; 401, 403 and 429 never do. Reconcile never resends a sender_batch_id first claimed 29 or more days ago, because PayPal forgets the id after 30. A campaign unsettled for more than an hour gets one needs_attention audit row.
+*Where:* `paypal/payouts.py` submit_batch and _read_answer, `campaigns/submission.py` send_claimed, `campaigns/reconcile.py` _resend, _first_claim_too_old and _flag_needs_attention.
+
+**C28, consent is checked at every send.** Right before every POST (the first send, each retry, each resend), after the PayPal token is in hand, every receiver in the frozen snapshot must still be a verified member. If one has left: with no unclear attempt the campaign is voided ("a member left"); after one, nothing is sent again and PayPal's own batch event settles it.
+*Where:* `campaigns/submission.py` _receivers_still_members, passed to `payouts.submit_batch` as may_send.
+
+**C20, shares and the balance floor.** No single session or address may take a whole shared pool: a demo session may send 2 campaigns a day and consider at most 20 customers; one address may open 4 demo sessions an hour and 10 a day, make 80 demo Claude calls a day, approve 10 demo campaigns an hour and simulate 10 times an hour. Demo rewards still UNCLAIMED after 10 minutes are cancelled by the cron job, so the demo pool refills. Unauthenticated traffic is held to 120 webhook requests a minute per address and 600 overall, and to 60 PayPal verify calls a minute, because PayPal's rate limits are shared with Payouts. Before every send and resend the engine reads the shop's PayPal balance and sends nothing when the batch, its fees and a floor (MEND_BALANCE_FLOOR_MINOR, USD 250 by default) do not fit; a failed read counts as too low. Simulate now pays with PayPal's test card, so no floor is kept for it.
+*Where:* `tasks.py` _check_demo_submits and draft_campaign, `jobs.py` cancel_demo_unclaimed, `packages/web/src/server/ratelimit.ts` LIMITS, `webhooks.ts` receiveDelivery and askPayPal, `paypal/balances.py` check_room.
+
+**C22, the services cannot change the database.** mend-web, mend-engine and mend-jobs connect as mend_app, which may read and write rows but owns nothing, cannot create, alter or drop anything, cannot disable a trigger, and may only SELECT and INSERT on audit_log. Only the migrate step, run from Ram's machine through render.mjs, uses the owner role.
+*Where:* `db/migrate.py` grant_app_role, `scripts/deploy/render.mjs` (prove check "database role").
+
+**C23, the website writes to the audit log too.** Sign-ins, wrong passwords, demo sessions and sign-outs are recorded in the same transaction as the session change; every agent tool run and PayPal MCP lookup, the first refusal in each rate-limit window and each kind of rejected webhook are recorded best-effort. Details hold only ids, roles, outcomes, bucket names and short HMAC tags of addresses and sessions, never an email, token or note.
+*Where:* `packages/web/src/server/audit.ts` appendAudit, `ratelimit.ts` takeHit, `agent.ts` guardedTool, `webhooks.ts`.
+
+**C13 and C27, small tightenings.** Notes are refused when removing spaces, dots, dashes, brackets, commas, colons, apostrophes, slashes and underscores leaves 7 or more digits in a row, in both the engine and the website rule. Raw webhook bodies are purged at 47 hours and purge runs first in each cron run, so nothing outlives 48.
+
+**Known and accepted.** A webhook flood spread over many addresses still costs Postgres one small transaction per request (Render Starter has no edge limit). PayPal's balance report can lag by a few hours; the floor and the daily caps bound what that lag can let through. A 200-item owner batch sends more than 60 webhooks a minute; the rest arrive through PayPal's retries or the 5-minute cron.

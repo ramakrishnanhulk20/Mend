@@ -182,6 +182,13 @@ describe("fitPlan", () => {
     expect(fitPlan(GOAL, null, { holdoutShare: "0.3" }, OWNER_LIMITS, "owner").settings).toBeNull();
     expect(fitPlan(GOAL, read({ budget_usd: 0 }), {}, OWNER_LIMITS, "owner").settings).toBeNull();
   });
+
+  it("fits a demo visitor's plan to at most 20 customers considered, as the engine requires", () => {
+    const fitted = fitPlan(GOAL, read({ max_candidates: 250 }), {}, DEMO_LIMITS, "demo");
+    expect(fitted.settings).toMatchObject({ maxCandidates: 20 });
+    expect(fitted.changes).toContain("Customers considered changed from 250 to 20; a campaign considers 2 to 20.");
+    expect(fitPlan(GOAL, read({}), { maxCandidates: 20 }, DEMO_LIMITS, "demo").settings).toMatchObject({ maxCandidates: 20 });
+  });
 });
 
 describe("cleanGoal", () => {
@@ -193,7 +200,7 @@ describe("cleanGoal", () => {
 describe("readGoal", () => {
   it("sends only the goal text, with effort low and no sampling settings, and returns the numbers", async () => {
     state.claudeAnswers.push(claudeJson({ budget_usd: 50, unclear: false, reason: "" }));
-    const session = new ClaudeSession({ role: "owner", sessionId: "e".repeat(64), expiresAt: new Date() }, randomUUID(), 5_000);
+    const session = new ClaudeSession({ role: "owner", sessionId: "e".repeat(64), expiresAt: new Date() }, randomUUID(), 5_000, "198.51.100.1");
     const outcome = await readGoal(session, GOAL);
     session.close();
     expect(outcome).toEqual({ status: "read", goal: { budget_usd: 50, unclear: false, reason: "" } });
@@ -210,12 +217,12 @@ describe("readGoal", () => {
   it("reports a refusal as declined and an unreadable answer as unreadable, without retrying", async () => {
     const owner = { role: "owner" as const, sessionId: "e".repeat(64), expiresAt: new Date() };
     state.claudeAnswers.push(claudeJson({ budget_usd: 50, unclear: false, reason: "" }, "refusal"));
-    const declined = new ClaudeSession(owner, randomUUID(), 5_000);
+    const declined = new ClaudeSession(owner, randomUUID(), 5_000, "198.51.100.1");
     expect((await readGoal(declined, GOAL)).status).toBe("declined");
     state.claudeAnswers.push(() =>
       Response.json({ id: "m", type: "message", role: "assistant", model: MODEL, content: [{ type: "text", text: "not json" }], stop_reason: "end_turn", stop_sequence: null, usage: { input_tokens: 1, output_tokens: 1 } }),
     );
-    const garbled = new ClaudeSession(owner, randomUUID(), 5_000);
+    const garbled = new ClaudeSession(owner, randomUUID(), 5_000, "198.51.100.1");
     expect((await readGoal(garbled, GOAL)).status).toBe("unreadable");
     expect(state.claude).toHaveLength(2);
     declined.close();
@@ -235,7 +242,7 @@ describe("POST /api/campaigns/plan", () => {
     expect(state.hits).toEqual(["draft", "claude_owner"]);
   });
 
-  it("clamps a demo visitor's $50 to 1000 cents and says so", async () => {
+  it("clamps a demo visitor's $50 to 1000 cents and says so, counting the Claude call on the session, its client address and every demo", async () => {
     state.claudeAnswers.push(claudeJson({ budget_usd: 50, unclear: false, reason: "" }));
     const response = await plan(signIn("demo"), { goalText: GOAL });
     const body = (await response.json()) as { plan: { settings: Record<string, unknown>; changes: string[] } };
@@ -243,6 +250,7 @@ describe("POST /api/campaigns/plan", () => {
     expect(body.plan.settings).toMatchObject({ budgetMinor: 1000, perRecipientMinor: 200, maxCandidates: 10 });
     expect(body.plan.changes).toContain("Budget lowered from $50.00 to $10.00, the most one campaign may spend on this account.");
     expect((state.engineCalls.find((call) => call.task === "draft_campaign")?.args[0] as { budget_minor: number }).budget_minor).toBe(1000);
+    expect(state.hits).toEqual(["draft", "claude_demo_session", "claude_demo_address", "claude_demo_all"]);
   });
 
   it("plans from the form with no key, and asks plainly for a budget when the form has none", async () => {

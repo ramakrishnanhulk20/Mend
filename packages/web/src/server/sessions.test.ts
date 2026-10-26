@@ -1,5 +1,5 @@
 // Covers the session store against a real Postgres schema (the engine's schema.sql in a
-// throwaway schema). Does NOT cover: cookies, sign-in and rotation (auth.test.ts), who
+// throwaway schema), including writes made on a caller's transaction. Does NOT cover: cookies, sign-in and rotation (auth.test.ts), who
 // may do what (permissions.test.ts), or the routes themselves (npm run prove:m7a).
 import { spawn } from "node:child_process";
 import { once } from "node:events";
@@ -162,5 +162,22 @@ describe("endSession", () => {
     await endSession(session.token);
     expect(await readSession(session.token)).toBeNull();
     expect(await storedRow(sessionIdFor(session.token))).toBeUndefined();
+  });
+});
+
+describe("on a caller's transaction", () => {
+  it("creates and ends sessions on the client given, so a rollback undoes both", async () => {
+    const kept = await createSession("demo");
+    const client = await database().connect();
+    try {
+      await client.query("begin");
+      const made = await createSession("owner", client);
+      await endSession(kept.token, client);
+      await client.query("rollback");
+      expect(await storedRow(made.sessionId)).toBeUndefined();
+    } finally {
+      client.release();
+    }
+    expect(await readSession(kept.token)).toMatchObject({ role: "demo" });
   });
 });

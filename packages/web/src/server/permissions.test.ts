@@ -218,4 +218,9 @@ describe("answers", () => {
     const text = scrubbed(`pw owner-password-for-permission-tests s1.${"a".repeat(43)} c1.${"b".repeat(43)} ${"f".repeat(64)}`);
     expect(text).toBe("pw [removed] [token] [token] [hex64]");
   });
+
+  it("log text is scrubbed of the Anthropic key and the PayPal client id, from the one shared secret list", () => {
+    vi.stubEnv("ANTHROPIC_API_KEY", "fake-claude-key-for-permission-tests-0123456789");
+    expect(scrubbed("key fake-claude-key-for-permission-tests-0123456789 client fake-client-id")).toBe("key [removed] client [removed]");
+  });
 });

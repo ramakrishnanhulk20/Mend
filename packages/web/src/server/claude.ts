@@ -7,9 +7,10 @@
  * One middleware runs on every HTTP attempt the SDK makes, tool-runner rounds and
  * retries included. In order, it refuses any host but api.anthropic.com; refuses a
  * request body holding an email address or the value of a server secret, so personal
- * data and keys never reach the model provider; takes one hit on the caller's daily
- * Claude caps in Postgres and refuses once they are used up; and after the answer logs
- * its token counts and stop reason, never its content.
+ * data and keys never reach the model provider; takes one hit on each of the caller's
+ * daily Claude caps in Postgres (a demo visitor's session, its client address and every
+ * demo together; the owner's one count) and refuses once one is used up; and after the
+ * answer logs its token counts and stop reason, never its content.
  *
  * Covers: a bug elsewhere putting an email or a secret into a prompt, a loop spending
  * the key's credit, a base URL changed by the environment. Does not cover personal data
@@ -19,8 +20,9 @@
  */
 import Anthropic, { type Middleware } from "@anthropic-ai/sdk";
 import { writeLog } from "./log";
-import { reply, type SignedIn } from "./permissions";
+import { MIN_SECRET_CHARS, reply, type SignedIn } from "./permissions";
 import { GLOBAL, LIMITS, takeHit, type Limit } from "./ratelimit";
+import { SECRET_SETTINGS } from "./secrets";
 
 export const MODEL = "claude-haiku-5-5";
 export const CALL_TIMEOUT_MS = 60_000;
@@ -29,17 +31,6 @@ const API_HOST = "api.anthropic.com";
 const API_KEY_SHAPE = /^[\x21-\x7e]{20,512}$/;
 const LABEL = /^R[1-9][0-9]{0,3}$/;
 const STOP_REASON = /^[a-z_]{1,32}$/;
-const MIN_SECRET_CHARS = 8;
-const SECRET_SETTINGS = [
-  "ANTHROPIC_API_KEY",
-  "PAYPAL_CLIENT_SECRET",
-  "MEND_OWNER_PASSWORD",
-  "MEND_CSRF_SECRET",
-  "MEND_BRIDGE_TOKEN",
-  "MEND_ENGINE_TOKEN",
-  "RENDER_API_KEY",
-  "DATABASE_URL",
-];
 
 // The one email rule: redaction before a prompt is built and the refusal in the
 // middleware use this same pattern, so what one lets through the other agrees with.
@@ -124,9 +115,10 @@ export function plainText(text: string, maxChars: number): string {
 }
 
 /**
- * The Claude calls made for one request: whose caps pay for them, how many were made,
- * the tokens they used, why they stopped if they did, and the deadline that aborts
- * them all. close() when the request is done.
+ * The Claude calls made for one request: whose caps pay for them (the principal, and
+ * for a demo visitor the client address the request came from, as clientAddress gives
+ * it), how many were made, the tokens they used, why they stopped if they did, and the
+ * deadline that aborts them all. close() when the request is done.
  */
 export class ClaudeSession {
   calls = 0;
@@ -142,6 +134,7 @@ export class ClaudeSession {
     readonly principal: SignedIn,
     readonly ref: string,
     deadlineMs: number,
+    readonly address: string,
   ) {
     this.#timer = setTimeout(() => {
       this.stop("timed_out");
@@ -162,13 +155,18 @@ export class ClaudeSession {
   }
 }
 
-// Demo calls count against the session and against every demo session together; the
-// owner's against one shared owner count. Each limit is a rolling 24 hours.
-async function spendOneCall(principal: SignedIn): Promise<string | null> {
+// Demo calls count against the session, against its client address so one address
+// cannot spend every demo's share by opening sessions, and against every demo session
+// together; the owner's against one shared owner count. Each limit is a rolling 24
+// hours. The address is counted before the global cap, so one address stopped there
+// never fills the count every other visitor needs.
+async function spendOneCall(session: ClaudeSession): Promise<string | null> {
+  const { principal } = session;
   const caps: readonly (readonly [Limit, string])[] =
     principal.role === "demo"
       ? [
           [LIMITS.claudeDemoSession, principal.sessionId],
+          [LIMITS.claudeDemoAddress, session.address],
           [LIMITS.claudeDemoAll, GLOBAL],
         ]
       : [[LIMITS.claudeOwner, GLOBAL]];
@@ -207,7 +205,7 @@ function guard(session: ClaudeSession, purpose: Purpose, label: string | null): 
     if (typeof request.body !== "string") throw refusal("outbound_refused", "body_shape");
     const problem = outboundProblem(request.body);
     if (problem !== null) throw refusal("outbound_refused", problem);
-    const spent = await spendOneCall(session.principal);
+    const spent = await spendOneCall(session);
     if (spent !== null) throw refusal("limit_reached", spent);
     session.calls += 1;
 

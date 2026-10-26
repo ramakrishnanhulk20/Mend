@@ -1,12 +1,15 @@
 // Covers the M7b console routes as handlers: CSRF on every POST, the permission table
 // on every route (demo refused on the admin jobs), input checks, the 409 on approval
 // conflicts, the public summary's cache, runs answering only the session that started
-// them, and pulling back unclaimed rewards with the payout states in results. Sessions
-// live in a throwaway Postgres schema; the engine is a fake dev bridge on 127.0.0.1.
+// them, pulling back unclaimed rewards with the payout states in results, sign-in,
+// demo sessions and sign-out on the audit record in the same transaction as the session
+// write, and each client address's share of demo sessions, demo approvals and simulates.
+// Sessions live in a throwaway Postgres schema; the engine is a fake dev bridge on 127.0.0.1.
 // Does NOT cover: the real engine or PayPal (npm run prove:m7b drives the M7b routes
 // against both; which campaigns a cancel may touch is the engine's own tests), Next.js
 // routing itself, or Render's run API.
 import { spawn } from "node:child_process";
+import { createHash, randomBytes } from "node:crypto";
 import { once } from "node:events";
 import { readFileSync } from "node:fs";
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
@@ -15,11 +18,14 @@ import path from "node:path";
 import pg from "pg";
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { ENGINE_DIR, SCHEMA_PATH, type DevDatabase } from "../../../scripts/dev-database";
-import { csrfTokenForSession } from "../../server/csrf";
+import { csrfTokenFor, csrfTokenForSession } from "../../server/csrf";
 import { closeDatabase } from "../../server/db";
-import { createSession, type IssuedSession } from "../../server/sessions";
+import { addressTag, sessionTag } from "../../server/ratelimit";
+import { createSession, sessionIdFor, type IssuedSession } from "../../server/sessions";
 
 // Route modules import through the "@/" alias, which this vitest config does not map.
+vi.mock("@/server/audit", async () => await import("../../server/audit"));
+vi.mock("@/server/auth", async () => await import("../../server/auth"));
 vi.mock("@/server/csrf", async () => await import("../../server/csrf"));
 vi.mock("@/server/engine", async () => await import("../../server/engine"));
 vi.mock("@/server/log", async () => await import("../../server/log"));
@@ -57,6 +63,7 @@ async function holdDatabaseServer(): Promise<DevDatabase> {
 
 const BASE = "http://127.0.0.1:3000";
 const TOKEN = "bridge-token-for-route-tests-0123456789";
+const OWNER_PASSWORD = "owner-password-for-route-tests-42";
 const CAMPAIGN = "0b6c2f8e-6a4e-4c1b-9d2a-7e5f1a3b9c4d";
 const ENGINE_REF = "6f1c1d3e-2b9a-4f0e-9a51-3c1d2e4f5a6b";
 const HASH = "e".repeat(64);
@@ -156,6 +163,7 @@ beforeAll(async () => {
   vi.stubEnv("MEND_CSRF_SECRET", "csrf-secret-for-route-tests-0123456789");
   vi.stubEnv("MEND_BRIDGE_URL", `http://127.0.0.1:${(server.address() as AddressInfo).port}`);
   vi.stubEnv("MEND_BRIDGE_TOKEN", TOKEN);
+  vi.stubEnv("MEND_OWNER_PASSWORD", OWNER_PASSWORD);
 });
 
 afterAll(async () => {
@@ -177,7 +185,14 @@ beforeEach(() => {
   return () => vi.restoreAllMocks();
 });
 
-type Options = { session?: IssuedSession | null; csrf?: string | null; origin?: string | null; body?: unknown; prefer?: string };
+type Options = {
+  session?: Pick<IssuedSession, "token" | "sessionId"> | null;
+  csrf?: string | null;
+  origin?: string | null;
+  body?: unknown;
+  prefer?: string;
+  address?: string;
+};
 
 function request(method: "GET" | "POST", url: string, options: Options = {}): Request {
   const headers: Record<string, string> = {};
@@ -190,7 +205,56 @@ function request(method: "GET" | "POST", url: string, options: Options = {}): Re
   }
   if (options.body !== undefined) headers["content-type"] = "application/json";
   if (options.prefer !== undefined) headers.prefer = options.prefer;
+  if (options.address !== undefined) headers["x-forwarded-for"] = options.address;
   return new Request(`${BASE}${url}`, { method, headers, body: options.body === undefined ? undefined : JSON.stringify(options.body) });
+}
+
+// A browser not yet signed in: its anonymous id cookie and the CSRF token bound to it.
+function anonymous(url: string, address: string, body?: unknown): Request {
+  const id = `a1.${randomBytes(32).toString("base64url")}`;
+  const headers: Record<string, string> = {
+    origin: BASE,
+    cookie: `mend_csrf=${id}`,
+    "x-mend-csrf": csrfTokenFor({ kind: "anonymous", id: createHash("sha256").update(id).digest("hex") }),
+    "x-forwarded-for": address,
+  };
+  if (body !== undefined) headers["content-type"] = "application/json";
+  return new Request(`${BASE}${url}`, { method: "POST", headers, body: body === undefined ? undefined : JSON.stringify(body) });
+}
+
+function issuedToken(response: Response): string {
+  const token = /mend_session=([^;]+)/.exec(response.headers.get("set-cookie") ?? "")?.[1];
+  if (token === undefined) throw new Error("no session cookie was issued");
+  return token;
+}
+
+async function sessionExists(token: string): Promise<boolean> {
+  const { rows } = await admin.query("select 1 from sessions where session_id = $1", [sessionIdFor(token)]);
+  return rows.length === 1;
+}
+
+async function sessionCount(): Promise<number> {
+  const { rows } = await admin.query<{ n: number }>("select count(*)::int as n from sessions");
+  return rows[0].n;
+}
+
+async function lastAuditId(): Promise<number> {
+  const { rows } = await admin.query<{ id: number }>("select coalesce(max(id), 0)::int as id from audit_log");
+  return rows[0].id;
+}
+
+async function auditSince(id: number): Promise<{ actor: string; action: string; detail: unknown }[]> {
+  const { rows } = await admin.query("select actor, action, detail from audit_log where id > $1 order by id", [id]);
+  return rows;
+}
+
+async function withAuditLogMissing<T>(work: () => Promise<T>): Promise<T> {
+  await admin.query("alter table audit_log rename to audit_log_away");
+  try {
+    return await work();
+  } finally {
+    await admin.query("alter table audit_log_away rename to audit_log");
+  }
 }
 
 const params = <T>(value: T) => ({ params: Promise.resolve(value) });
@@ -499,5 +563,98 @@ describe("pulling back unclaimed rewards, and the payout states in results", () 
     expect(response.status).toBe(500);
     expect(JSON.parse(text)).toEqual({ error: "internal", message: "Something went wrong.", ref: expect.any(String) });
     expect(text).not.toMatch(/maya|script/);
+  });
+});
+
+describe("signing in and out, on the audit record", () => {
+  it("records an owner sign-in, a wrong password, a demo session and a sign-out, with address and session tags and never a session id", async () => {
+    const owner = await import("./session/owner/route");
+    const demo = await import("./session/demo/route");
+    const logout = await import("./session/logout/route");
+    const before = await lastAuditId();
+    const wrong = await owner.POST(anonymous("/api/session/owner", "198.51.100.20", { password: "not-the-owner-password-at-all" }));
+    expect(wrong.status).toBe(401);
+    const right = await owner.POST(anonymous("/api/session/owner", "198.51.100.20", { password: OWNER_PASSWORD }));
+    expect(right.status).toBe(200);
+    const ownerToken = issuedToken(right);
+    const started = await demo.POST(anonymous("/api/session/demo", "198.51.100.21"));
+    expect(started.status).toBe(200);
+    const demoToken = issuedToken(started);
+    const out = await logout.POST(request("POST", "/api/session/logout", { session: { token: demoToken, sessionId: sessionIdFor(demoToken) }, address: "198.51.100.21" }));
+    expect(out.status).toBe(200);
+    expect(await sessionExists(demoToken)).toBe(false);
+
+    const ref = expect.stringMatching(/^[0-9a-f-]{36}$/);
+    const rows = await auditSince(before);
+    expect(rows).toEqual([
+      { actor: "web", action: "owner_sign_in", detail: { role: "owner", outcome: "refused", reason: "wrong_password", address_tag: addressTag("198.51.100.20"), ref } },
+      {
+        actor: "web",
+        action: "owner_sign_in",
+        detail: { role: "owner", outcome: "signed_in", session_tag: sessionTag(sessionIdFor(ownerToken)), address_tag: addressTag("198.51.100.20"), ref },
+      },
+      { actor: "web", action: "demo_session_started", detail: { role: "demo", session_tag: sessionTag(sessionIdFor(demoToken)), address_tag: addressTag("198.51.100.21"), ref } },
+      { actor: "web", action: "sign_out", detail: { role: "demo", session_tag: sessionTag(sessionIdFor(demoToken)), address_tag: addressTag("198.51.100.21"), ref } },
+    ]);
+    for (const secret of [sessionIdFor(ownerToken), sessionIdFor(demoToken), ownerToken, demoToken, OWNER_PASSWORD]) expect(JSON.stringify(rows)).not.toContain(secret);
+  });
+
+  it("fails a demo session or a sign-out whose audit row cannot be written, leaving every session as it was", async () => {
+    const demo = await import("./session/demo/route");
+    const owner = await import("./session/owner/route");
+    const logout = await import("./session/logout/route");
+    const kept = await createSession("owner");
+    const sessionsBefore = await sessionCount();
+    const [started, signedIn, out] = await withAuditLogMissing(async () => [
+      await demo.POST(anonymous("/api/session/demo", "198.51.100.22")),
+      await owner.POST(anonymous("/api/session/owner", "198.51.100.22", { password: OWNER_PASSWORD })),
+      await logout.POST(request("POST", "/api/session/logout", { session: kept, address: "198.51.100.22" })),
+    ]);
+    for (const response of [started, signedIn, out]) {
+      expect(response.status).toBe(500);
+      expect(response.headers.get("set-cookie")).toBeNull();
+    }
+    expect(await sessionCount()).toBe(sessionsBefore);
+    expect(await sessionExists(kept.token)).toBe(true);
+  });
+});
+
+describe("each client address's share", () => {
+  it("lets one address start 4 demo sessions an hour and 10 a day, while another address still can", async () => {
+    const { POST } = await import("./session/demo/route");
+    for (let n = 0; n < 4; n += 1) expect((await POST(anonymous("/api/session/demo", "198.51.100.30"))).status).toBe(200);
+    const refused = await POST(anonymous("/api/session/demo", "198.51.100.30"));
+    expect(refused.status).toBe(429);
+    expect(await json(refused)).toMatchObject({ error: "rate_limited" });
+    expect((await POST(anonymous("/api/session/demo", "198.51.100.31"))).status).toBe(200);
+    await admin.query("insert into rate_limit_hits (bucket, subject, at) select 'demo_session_day', '198.51.100.32', now() - interval '3 hours' from generate_series(1, 10)");
+    expect((await POST(anonymous("/api/session/demo", "198.51.100.32"))).status).toBe(429);
+  });
+
+  it("holds one address to 10 demo approvals an hour across its sessions, and leaves the owner's approvals alone", async () => {
+    const { POST } = await import("./campaigns/[id]/approve/route");
+    const before = await lastAuditId();
+    const visits = [await createSession("demo"), await createSession("demo")];
+    const approve = (session: IssuedSession, address: string) => POST(request("POST", "/x", { session, address, body: { presentedHash: HASH } }), params({ id: CAMPAIGN }));
+    for (let n = 0; n < 10; n += 1) expect((await approve(visits[n % 2], "198.51.100.40")).status).toBe(200);
+    expect((await approve(visits[0], "198.51.100.40")).status).toBe(429);
+    expect((await approve(visits[1], "198.51.100.41")).status).toBe(200);
+    expect((await approve(await createSession("owner"), "198.51.100.40")).status).toBe(200);
+    expect(await auditSince(before)).toEqual([
+      { actor: "web", action: "rate_limit_hit", detail: { bucket: "demo_approvals_address", per: "address", address_tag: addressTag("198.51.100.40") } },
+    ]);
+  });
+
+  it("holds one address to 10 simulates an hour across its sessions", async () => {
+    const { POST } = await import("./campaigns/[id]/simulate/route");
+    const before = await lastAuditId();
+    const visits = [await createSession("demo"), await createSession("demo")];
+    const simulate = (session: IssuedSession, address: string) => POST(request("POST", "/x", { session, address, body: { ref: "R2" } }), params({ id: CAMPAIGN }));
+    for (let n = 0; n < 10; n += 1) expect((await simulate(visits[n % 2], "198.51.100.42")).status).toBe(201);
+    expect((await simulate(visits[0], "198.51.100.42")).status).toBe(429);
+    expect((await simulate(visits[1], "198.51.100.43")).status).toBe(201);
+    expect(await auditSince(before)).toEqual([
+      { actor: "web", action: "rate_limit_hit", detail: { bucket: "simulate_address", per: "address", address_tag: addressTag("198.51.100.42") } },
+    ]);
   });
 });

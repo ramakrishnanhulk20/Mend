@@ -6,6 +6,7 @@ import { readJsonBody, stateChangeProblem } from "@/server/csrf";
 import { EngineUnavailable } from "@/server/engine";
 import { writeLog } from "@/server/log";
 import { authorize, failed, refuse, reply, signedIn } from "@/server/permissions";
+import { clientAddress } from "@/server/ratelimit";
 
 export const runtime = "nodejs";
 
@@ -33,8 +34,9 @@ const ANSWER = z.strictObject({
  * Ask the assistant (C2, C11, C12, C14, C20). Body: message, plus up to 10 earlier
  * messages of this browser's own chat as history. Same origin and CSRF token
  * required; every Claude call, each tool-runner round included, counts against the
- * daily caps. The assistant answers through Mend's guarded tools only and can never
- * approve, pay or refund. Answers 200 with a plain-text reply, the tools it used and
+ * daily caps, and a demo visitor's against its client address too. The assistant
+ * answers through Mend's guarded tools only and can never approve, pay or refund.
+ * Answers 200 with a plain-text reply, the tools it used and
  * the Claude calls it made; 503 saying plainly that a key is needed when none is set;
  * 429 with a clear message once the daily limit is used up; or a refusal.
  */
@@ -55,7 +57,7 @@ export async function POST(request: Request): Promise<Response> {
     if (!body.success) return refuse(ROUTE, ref, 400, "invalid_input", { reason: "schema" });
     if (!hasClaudeKey()) return aiRefusal(ROUTE, ref, 503, "no_key");
 
-    const answer = await runAgent(principal, body.data.message, body.data.history ?? [], ref);
+    const answer = await runAgent(principal, body.data.message, body.data.history ?? [], ref, clientAddress(request.headers));
     if (answer.kind === "failed") {
       return aiRefusal(ROUTE, ref, failureStatus(answer.failure), answer.failure, { tools: answer.toolsUsed.join(","), ai_calls: answer.aiCalls });
     }

@@ -3,7 +3,7 @@ import { z } from "zod";
 import { readJsonBody, stateChangeProblem } from "@/server/csrf";
 import { EngineUnavailable } from "@/server/engine";
 import { authorize, failed, refuse, signedIn } from "@/server/permissions";
-import { GLOBAL, LIMITS, takeHit } from "@/server/ratelimit";
+import { clientAddress, GLOBAL, LIMITS, takeHit } from "@/server/ratelimit";
 import { engineResponse } from "@/server/runs";
 
 export const runtime = "nodejs";
@@ -19,9 +19,9 @@ const BODY = z.strictObject({ ref: z.string().regex(/^R[1-9][0-9]{0,3}$/) });
  * One sandbox return purchase by member {"ref"} of this session's sent campaign (C21):
  * the engine buys from this shop only, with PayPal's public sandbox test card, for a
  * fixed amount, at most 10 per campaign, and labels it simulated by the order id it
- * stored. Same origin and CSRF token required; 10 per session and 100 across every
- * visitor per hour (C20). Answers 201 with PayPal's order id and status, or 202 with a
- * run id this session alone can poll when PayPal is slow.
+ * stored. Same origin and CSRF token required; 10 per session, 10 per client address
+ * and 100 across every visitor per hour (C20). Answers 201 with PayPal's order id and
+ * status, or 202 with a run id this session alone can poll when PayPal is slow.
  */
 export async function POST(request: Request, context: { params: Promise<{ id: string }> }): Promise<Response> {
   const ref = randomUUID();
@@ -33,6 +33,7 @@ export async function POST(request: Request, context: { params: Promise<{ id: st
     if (!access.ok || principal === null) return refuse(ROUTE, ref, access.ok ? 403 : access.status, "not_allowed");
     for (const [limit, subject] of [
       [LIMITS.simulate, principal.sessionId],
+      [LIMITS.simulateAddress, clientAddress(request.headers)],
       [LIMITS.simulates, GLOBAL],
     ] as const) {
       const hit = await takeHit(limit, subject);

@@ -24,6 +24,8 @@ export const HOLDOUT_MAX = 50;
 export const HOLDOUT_DEFAULT = 50;
 export const MIN_CANDIDATES = 2;
 export const MAX_CANDIDATES = 250;
+// The engine refuses a demo draft over this (over_cap), so the plan is fitted to it first.
+export const MAX_CANDIDATES_FOR: Readonly<Record<SignedIn["role"], number>> = { owner: MAX_CANDIDATES, demo: 20 };
 // Fewer for demo: each rewarded customer costs one Claude call for their note, and a
 // demo session has 40 calls a day.
 export const DEFAULT_CANDIDATES: Readonly<Record<SignedIn["role"], number>> = { owner: 40, demo: 10 };
@@ -184,9 +186,10 @@ export function fitPlan(goalText: string, goal: GoalReading | null, form: PlanFo
 
   let candidates = form.maxCandidates ?? goal?.max_candidates ?? DEFAULT_CANDIDATES[role];
   if (!Number.isInteger(candidates)) candidates = DEFAULT_CANDIDATES[role];
-  if (candidates < MIN_CANDIDATES || candidates > MAX_CANDIDATES) {
-    const fitted = Math.min(Math.max(candidates, MIN_CANDIDATES), MAX_CANDIDATES);
-    changes.push(`Customers considered changed from ${candidates} to ${fitted}; a campaign considers ${MIN_CANDIDATES} to ${MAX_CANDIDATES}.`);
+  const most = MAX_CANDIDATES_FOR[role];
+  if (candidates < MIN_CANDIDATES || candidates > most) {
+    const fitted = Math.min(Math.max(candidates, MIN_CANDIDATES), most);
+    changes.push(`Customers considered changed from ${candidates} to ${fitted}; a campaign considers ${MIN_CANDIDATES} to ${most}.`);
     candidates = fitted;
   }
 

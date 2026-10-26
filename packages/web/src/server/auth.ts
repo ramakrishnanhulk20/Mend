@@ -14,6 +14,7 @@
  */
 import { createHash, timingSafeEqual } from "node:crypto";
 import { isIP } from "node:net";
+import type { PoolClient } from "pg";
 import { ConfigError } from "./config";
 import { createSession, endSession, readSession, SESSION_ABSOLUTE_MS, type IssuedSession, type Role } from "./sessions";
 
@@ -139,16 +140,22 @@ export async function currentPrincipal(request: Request): Promise<Principal> {
 
 /**
  * End whatever session the browser holds, start a new one for role, and return it
- * with the Set-Cookie value that hands the browser its new token.
+ * with the Set-Cookie value that hands the browser its new token. Given a client, both
+ * writes run on it, so the caller's transaction commits or undoes them together with
+ * its own writes.
  */
-export async function startSession(request: Request, role: Role): Promise<{ readonly session: IssuedSession; readonly cookie: string }> {
-  await endSession(readCookie(request, sessionCookieName()));
-  const session = await createSession(role);
+export async function startSession(
+  request: Request,
+  role: Role,
+  client?: PoolClient,
+): Promise<{ readonly session: IssuedSession; readonly cookie: string }> {
+  await endSession(readCookie(request, sessionCookieName()), client);
+  const session = await createSession(role, client);
   return { session, cookie: cookieHeader(sessionCookieName(), session.token, SESSION_ABSOLUTE_MS / 1000) };
 }
 
-/** End the browser's session and return the Set-Cookie value that clears it. */
-export async function endCurrentSession(request: Request): Promise<string> {
-  await endSession(readCookie(request, sessionCookieName()));
+/** End the browser's session, on client when one is given, and return the Set-Cookie value that clears it. */
+export async function endCurrentSession(request: Request, client?: PoolClient): Promise<string> {
+  await endSession(readCookie(request, sessionCookieName()), client);
   return cookieHeader(sessionCookieName(), "", 0);
 }

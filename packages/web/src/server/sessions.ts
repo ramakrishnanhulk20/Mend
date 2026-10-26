@@ -8,6 +8,7 @@
  * read checks both limits in the same statement that records the use.
  */
 import { createHash, randomBytes } from "node:crypto";
+import type { Pool, PoolClient } from "pg";
 import { database } from "./db";
 
 export type Role = "owner" | "demo";
@@ -41,15 +42,21 @@ function asRole(value: unknown): Role | null {
   return ROLES.find((role) => role === value) ?? null;
 }
 
+// The caller's client when it passes one, so the write joins its transaction; the shared pool otherwise.
+function on(client: PoolClient | undefined): Pick<Pool, "query"> {
+  return client ?? database();
+}
+
 /**
  * Create a session for role and return it with its token. Sessions past either limit
  * are deleted in the same call, so the table holds only live ones plus at most a
- * day of stragglers.
+ * day of stragglers. Given a client, both writes run on it, inside whatever
+ * transaction it holds.
  */
-export async function createSession(role: Role): Promise<IssuedSession> {
+export async function createSession(role: Role, client?: PoolClient): Promise<IssuedSession> {
   const token = `s1.${randomBytes(32).toString("base64url")}`;
   const sessionId = sessionIdFor(token);
-  const pool = database();
+  const pool = on(client);
   await pool.query(
     "delete from sessions where expires_at <= now() or last_seen_at <= now() - make_interval(secs => $1)",
     [SESSION_IDLE_MS / 1000],
@@ -82,8 +89,8 @@ export async function readSession(token: string | null): Promise<Session | null>
   return Object.freeze({ sessionId, role, expiresAt: rows[0].expires_at });
 }
 
-/** Delete the session for token, if any. A token of the wrong shape is ignored. */
-export async function endSession(token: string | null): Promise<void> {
+/** Delete the session for token, if any, on client when one is given. A token of the wrong shape is ignored. */
+export async function endSession(token: string | null, client?: PoolClient): Promise<void> {
   if (token === null || !isSessionToken(token)) return;
-  await database().query("delete from sessions where session_id = $1", [sessionIdFor(token)]);
+  await on(client).query("delete from sessions where session_id = $1", [sessionIdFor(token)]);
 }

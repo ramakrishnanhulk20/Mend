@@ -7,23 +7,39 @@
  * Nothing here acts on what an event says: a stored event is only a prompt for the
  * engine to re-read the resource from PayPal (C10). Once one is stored, the engine is
  * asked to process events at once rather than at the next scheduled run; that request
- * is never waited on and never changes the answer PayPal gets. Callers get a generic
- * answer with a correlation id; the reason stays in the server log.
+ * is never waited on and never changes the answer PayPal gets. A transmission id that
+ * is already stored is answered 200 without asking PayPal again and without a write.
+ * Callers get a generic answer with a correlation id; the reason stays in the server
+ * log, with the sender's address tag (ratelimit.ts addressTag). The first rejection
+ * for each reason from each address in a minute is also written to the audit log
+ * (C23), best-effort, so a flood leaves one row per reason rather than one per request.
+ *
+ * Anyone can post to the webhook, so what a flood can spend is capped (C20): requests
+ * are counted per client address and across everyone before a byte of the body is
+ * read, the body is read only up to the size cap, and calls to PayPal's verify API,
+ * whose rate limits Payouts shares, are capped across the app. Does not cover a flood
+ * spread over many addresses under the global count: that delays real deliveries
+ * (PayPal retries anything not answered 2xx, and the jobs cron re-reads PayPal), but
+ * cannot spend more than the verify cap.
  */
 import { randomUUID } from "node:crypto";
 import { z } from "zod";
+import { appendAudit } from "./audit";
 import { loadConfig } from "./config";
 import { database } from "./db";
 import { runTask } from "./engine";
 import { writeLog } from "./log";
 import { paypalFetch, type PayPalReply } from "./paypal";
+import { addressTag, clientAddress, firstInWindow, GLOBAL, LIMITS, takeHit, type Limit } from "./ratelimit";
 import { parseStrictJson, StrictJsonError } from "./strict-json";
 
 export const MAX_BODY_BYTES = 262_144;
 export const MAX_CLOCK_AHEAD_MS = 5 * 60 * 1000;
 export const MAX_AGE_MS = 3 * 24 * 60 * 60 * 1000;
-export const PURGE_AFTER_HOURS = 48;
+// An hour inside C27's 48, so a row is still gone in time when a purge run is late or fails.
+export const PURGE_AFTER_HOURS = 47;
 const VERIFY_PATH = "/v1/notifications/verify-webhook-signature";
+const REJECTION_WINDOW_MS = 60 * 1000;
 
 const PRINTABLE_NO_SPACE = /^[\x21-\x7e]+$/;
 
@@ -49,7 +65,8 @@ const eventSchema = z.object({
 
 type WebhookEvent = { readonly id: string; readonly eventType: string; readonly resourceId: string | null };
 
-export type DeliveryResult = { readonly status: number; readonly body: string };
+/** What to answer: the status, the generic body, and for a 429 how many seconds until a retry can pass. */
+export type DeliveryResult = { readonly status: number; readonly body: string; readonly retryAfterSeconds?: number };
 
 /** PayPal gave no usable verdict (timeout, network, non-200 or malformed answer). */
 export class VerificationUnavailable extends Error {
@@ -59,6 +76,14 @@ export class VerificationUnavailable extends Error {
     super(`webhook verification unavailable: ${reason}`);
     this.name = "VerificationUnavailable";
     this.debugId = debugId;
+  }
+}
+
+/** The app's PayPal verify calls for this minute are used up; PayPal was not asked. */
+export class VerifyLimitReached extends Error {
+  constructor(readonly retryAfterSeconds: number) {
+    super("webhook verify limit reached");
+    this.name = "VerifyLimitReached";
   }
 }
 
@@ -168,7 +193,10 @@ function postbackBody(delivery: DeliveryHeaders, webhookId: string, rawBody: str
   return `${head.slice(0, -1)},"webhook_event":${rawBody}}`;
 }
 
+// Every verify call in the app passes through here, so the count below covers them all.
 async function askPayPal(delivery: DeliveryHeaders, rawBody: string): Promise<"verified" | "rejected"> {
+  const hit = await takeHit(LIMITS.paypalVerify, GLOBAL);
+  if (!hit.allowed) throw new VerifyLimitReached(hit.retryAfterSeconds);
   let reply: PayPalReply;
   try {
     reply = await paypalFetch(VERIFY_PATH, {
@@ -193,7 +221,9 @@ async function askPayPal(delivery: DeliveryHeaders, rawBody: string): Promise<"v
  * Returns "rejected" without calling PayPal when a PAYPAL-* header is missing or
  * malformed, the body is over 262,144 bytes, or the body is not a single JSON event
  * object with no repeated keys. Otherwise returns "verified" only when PayPal answers
- * SUCCESS. Throws VerificationUnavailable when PayPal gives no usable answer.
+ * SUCCESS. Throws VerifyLimitReached, without calling PayPal, once the app has made 60
+ * verify calls in the last minute, and VerificationUnavailable when PayPal gives no
+ * usable answer.
  */
 export async function verifyDelivery(rawBody: string, headers: Headers): Promise<"verified" | "rejected"> {
   const delivery = readDeliveryHeaders(headers);
@@ -203,8 +233,13 @@ export async function verifyDelivery(rawBody: string, headers: Headers): Promise
   return askPayPal(delivery, rawBody);
 }
 
+async function alreadyStored(transmissionId: string): Promise<boolean> {
+  const { rows } = await database().query("select 1 from paypal_events where transmission_id = $1", [transmissionId]);
+  return rows.length > 0;
+}
+
 async function storeEvent(transmissionId: string, event: WebhookEvent, rawBody: string): Promise<"stored" | "duplicate"> {
-  // One now() for both columns, so purge_after is exactly 48 hours after received_at.
+  // One now() for both columns, so purge_after is exactly 47 hours after received_at.
   // No conflict target: a repeated transmission id and a re-sent event id are both duplicates.
   const result = await database().query(
     `insert into paypal_events (transmission_id, event_id, event_type, resource_id, received_at, purge_after, raw)
@@ -219,12 +254,45 @@ const ANSWERS: Readonly<Record<number, string>> = {
   200: "ok",
   400: "refused",
   413: "too large",
+  429: "too many requests",
   503: "try again later",
 };
 
-function answer(status: number, ref: string, log: Readonly<Record<string, unknown>>): DeliveryResult {
-  writeLog({ kind: "webhook", ref, status, ...log });
-  return { status, body: `${ANSWERS[status]} (ref ${ref})` };
+/** Who sent a request: the address its limits count against, and that address's tag for logs (null when MEND_CSRF_SECRET is unusable). */
+type Sender = { readonly address: string; readonly tag: string | null };
+
+function senderOf(headers: Headers): Sender {
+  const address = clientAddress(headers);
+  try {
+    return { address, tag: addressTag(address) };
+  } catch {
+    // A missing secret already refuses every console route; here it must not change PayPal's answer.
+    return { address, tag: null };
+  }
+}
+
+// Best-effort: once per reason per address a minute, and a failure leaves one log line.
+async function recordRejection(sender: Sender, reason: string, status: number): Promise<void> {
+  try {
+    if (!(await firstInWindow(`webhook_rejected:${reason}`, sender.address, REJECTION_WINDOW_MS))) return;
+  } catch (error) {
+    const code = (error as { code?: unknown }).code;
+    writeLog({ kind: "audit", outcome: "not_written", action: "webhook_rejected", reason: "db_error", code: typeof code === "string" ? code : null });
+    return;
+  }
+  if (sender.tag === null) {
+    writeLog({ kind: "audit", outcome: "not_written", action: "webhook_rejected", reason: "no_tag" });
+    return;
+  }
+  await appendAudit("webhook_rejected", { reason, status, address_tag: sender.tag });
+}
+
+// Rate-limit refusals are left to takeHit, which records the first in each window itself.
+async function answer(status: number, ref: string, sender: Sender, log: Readonly<Record<string, unknown>>, retryAfterSeconds?: number): Promise<DeliveryResult> {
+  writeLog({ kind: "webhook", ref, status, address_tag: sender.tag, ...log });
+  if (log.outcome === "refused" && log.reason !== "rate_limited" && typeof log.reason === "string") await recordRejection(sender, log.reason, status);
+  const body = `${ANSWERS[status]} (ref ${ref})`;
+  return retryAfterSeconds === undefined ? { status, body } : { status, body, retryAfterSeconds };
 }
 
 /**
@@ -245,10 +313,79 @@ function askEngineToProcess(ref: string): void {
  * The 413 answer for a request whose Content-Length already exceeds the cap, so the
  * route can refuse it before reading the body. Returns null when no such header is set.
  */
-export function refuseDeclaredLength(headers: Headers): DeliveryResult | null {
+export async function refuseDeclaredLength(headers: Headers): Promise<DeliveryResult | null> {
   const declared = headers.get("content-length");
   if (declared === null || !/^\d+$/.test(declared) || Number(declared) <= MAX_BODY_BYTES) return null;
-  return answer(413, randomUUID(), { outcome: "refused", reason: "declared_oversize" });
+  return answer(413, randomUUID(), senderOf(headers), { outcome: "refused", reason: "declared_oversize" });
+}
+
+/**
+ * The 429 answer, with the wait until a retry can pass, once this client address has
+ * sent 120 requests in the last minute or everyone together 600; otherwise null. A
+ * count that cannot be read gets 503, so PayPal retries rather than being let through.
+ */
+async function refuseOverLimit(sender: Sender): Promise<DeliveryResult | null> {
+  const ref = randomUUID();
+  const counts: readonly (readonly [Limit, string])[] = [
+    [LIMITS.webhookAddress, sender.address],
+    [LIMITS.webhookAll, GLOBAL],
+  ];
+  try {
+    for (const [limit, subject] of counts) {
+      const hit = await takeHit(limit, subject);
+      if (!hit.allowed) return answer(429, ref, sender, { outcome: "refused", reason: "rate_limited", bucket: limit.bucket }, hit.retryAfterSeconds);
+    }
+  } catch (error) {
+    const code = (error as { code?: unknown }).code;
+    return answer(503, ref, sender, { outcome: "unavailable", reason: "limit_unavailable", code: typeof code === "string" ? code : null });
+  }
+  return null;
+}
+
+/**
+ * The body as text, or null once it passes the cap. Reading stops at the first chunk
+ * past the cap, so a body with no Content-Length, or a false one, costs at most the cap
+ * plus one chunk. Decoded the way request.text() decodes, so the text verified is the
+ * text it would have been before.
+ */
+async function readCappedBody(request: Request): Promise<string | null> {
+  if (request.body === null) return "";
+  const reader = request.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let size = 0;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    size += value.byteLength;
+    if (size > MAX_BODY_BYTES) {
+      await reader.cancel();
+      return null;
+    }
+    chunks.push(value);
+  }
+  return new TextDecoder().decode(Buffer.concat(chunks));
+}
+
+/**
+ * Handle one webhook request and say what to answer. Before any of the body is read:
+ * 429 with a wait once this client address has sent 120 requests in the last minute or
+ * everyone together 600, then 413 for a declared Content-Length over the cap. The body
+ * is then read as a stream: 413 the moment it passes 262,144 bytes, length declared or
+ * not, with nothing more read, and 400 if the sender breaks off. The text read goes
+ * through handleDelivery.
+ */
+export async function receiveDelivery(request: Request): Promise<DeliveryResult> {
+  const sender = senderOf(request.headers);
+  const refused = (await refuseOverLimit(sender)) ?? (await refuseDeclaredLength(request.headers));
+  if (refused !== null) return refused;
+  let rawBody: string | null;
+  try {
+    rawBody = await readCappedBody(request);
+  } catch {
+    return answer(400, randomUUID(), sender, { outcome: "refused", reason: "body_unreadable" });
+  }
+  if (rawBody === null) return answer(413, randomUUID(), sender, { outcome: "refused", reason: "oversize_stream" });
+  return handleDelivery(rawBody, request.headers);
 }
 
 /**
@@ -257,57 +394,77 @@ export function refuseDeclaredLength(headers: Headers): DeliveryResult | null {
  * In this order: a body over 262,144 bytes gets 413; a missing or malformed PAYPAL-*
  * header gets 400; text that is not one JSON event object, has a repeated key at any
  * depth, or nests deeper than 64 gets 400; a transmission time more than 5 minutes
- * ahead or more than 3 days old gets 400; PayPal's verdict other than SUCCESS gets 400
- * and nothing is stored. A verified delivery is inserted once, keyed on transmission
- * id (event id is unique too), and the engine is then asked to process events without
+ * ahead or more than 3 days old gets 400; a transmission id already stored gets 200
+ * with no PayPal call and no write; once the app has made 60 verify calls in the last
+ * minute, 429 without asking PayPal; PayPal's verdict other than SUCCESS gets 400 and
+ * nothing is stored. A verified delivery is inserted once, keyed on transmission id
+ * (event id is unique too), and the engine is then asked to process events without
  * waiting; a replay gets 200, stores nothing new and asks nothing. A verification
  * error, timeout or database failure gets 503 with nothing stored, so PayPal retries.
+ *
+ * The stored-id check trusts the header without verifying the body, so a forged body
+ * under a stored id also gets 200; it is neither stored nor acted on, so nothing is lost.
  */
 export async function handleDelivery(rawBody: string, headers: Headers): Promise<DeliveryResult> {
   const ref = randomUUID();
+  const sender = senderOf(headers);
   try {
     if (bodyBytes(rawBody) > MAX_BODY_BYTES) {
-      return answer(413, ref, { outcome: "refused", reason: "oversize" });
+      return await answer(413, ref, sender, { outcome: "refused", reason: "oversize" });
     }
     const delivery = readDeliveryHeaders(headers);
     if (delivery === null) {
-      return answer(400, ref, { outcome: "refused", reason: "missing_header" });
+      return await answer(400, ref, sender, { outcome: "refused", reason: "missing_header" });
     }
     const seen = { transmission_id: delivery.transmission_id };
     const reading = readEvent(rawBody);
     if ("problem" in reading) {
-      return answer(400, ref, { outcome: "refused", reason: reading.problem, ...seen });
+      return await answer(400, ref, sender, { outcome: "refused", reason: reading.problem, ...seen });
     }
     const late = timeProblem(delivery.transmission_time, Date.now());
     if (late !== null) {
-      return answer(400, ref, { outcome: "refused", reason: late, ...seen });
+      return await answer(400, ref, sender, { outcome: "refused", reason: late, ...seen });
+    }
+
+    let stored: boolean;
+    try {
+      stored = await alreadyStored(delivery.transmission_id);
+    } catch (error) {
+      const code = (error as { code?: unknown }).code;
+      return await answer(503, ref, sender, { outcome: "unavailable", reason: "db_error", code: typeof code === "string" ? code : null, ...seen });
+    }
+    if (stored) {
+      return await answer(200, ref, sender, { outcome: "duplicate", reason: "transmission_stored", ...seen });
     }
 
     let verdict: "verified" | "rejected";
     try {
       verdict = await askPayPal(delivery, rawBody);
     } catch (error) {
+      if (error instanceof VerifyLimitReached) {
+        return await answer(429, ref, sender, { outcome: "refused", reason: "rate_limited", bucket: LIMITS.paypalVerify.bucket, ...seen }, error.retryAfterSeconds);
+      }
       const debugId = error instanceof VerificationUnavailable ? error.debugId : null;
       const reason = error instanceof Error ? error.message : "verification failed";
-      return answer(503, ref, { outcome: "unavailable", reason: "verify_error", detail: reason, debug_id: debugId, ...seen });
+      return await answer(503, ref, sender, { outcome: "unavailable", reason: "verify_error", detail: reason, debug_id: debugId, ...seen });
     }
     if (verdict !== "verified") {
-      return answer(400, ref, { outcome: "refused", reason: "verify_failure", ...seen });
+      return await answer(400, ref, sender, { outcome: "refused", reason: "verify_failure", ...seen });
     }
 
     const event = reading.event;
     const facts = { ...seen, event_id: event.id, event_type: event.eventType, delivery };
-    let stored: "stored" | "duplicate";
+    let outcome: "stored" | "duplicate";
     try {
-      stored = await storeEvent(delivery.transmission_id, event, rawBody);
+      outcome = await storeEvent(delivery.transmission_id, event, rawBody);
     } catch (error) {
       const code = (error as { code?: unknown }).code;
-      return answer(503, ref, { outcome: "unavailable", reason: "db_error", code: typeof code === "string" ? code : null, ...facts });
+      return await answer(503, ref, sender, { outcome: "unavailable", reason: "db_error", code: typeof code === "string" ? code : null, ...facts });
     }
-    const result = answer(200, ref, { outcome: stored, ...facts });
-    if (stored === "stored") askEngineToProcess(ref);
+    const result = await answer(200, ref, sender, { outcome, ...facts });
+    if (outcome === "stored") askEngineToProcess(ref);
     return result;
   } catch {
-    return answer(503, ref, { outcome: "unavailable", reason: "internal_error" });
+    return answer(503, ref, sender, { outcome: "unavailable", reason: "internal_error" });
   }
 }

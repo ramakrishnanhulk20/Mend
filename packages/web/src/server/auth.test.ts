@@ -1,6 +1,6 @@
 // Covers the deployment settings the browser side depends on, cookie names, reading and
 // writing, the owner password check, and sign-in rotation against a real Postgres
-// schema. Does NOT cover: the routes (npm run prove:m7a), rate limits on sign-in
+// schema, on its own or on a caller's transaction. Does NOT cover: the routes (npm run prove:m7a), rate limits on sign-in
 // (ratelimit.test.ts), or timing measurements of the password check (the constant-time
 // property comes from crypto.timingSafeEqual on equal-length digests, not from a test).
 import { spawn } from "node:child_process";
@@ -26,7 +26,7 @@ import {
   startSession,
 } from "./auth";
 import { ConfigError } from "./config";
-import { closeDatabase } from "./db";
+import { closeDatabase, database } from "./db";
 import { createSession, readSession } from "./sessions";
 
 // dev_url applies the schema to the shared public schema, and two of those running at
@@ -246,6 +246,25 @@ describe("sessions over HTTP", () => {
     expect(cookie).toBe(`__Host-mend_session=${session.token}; Path=/; Max-Age=86400; HttpOnly; SameSite=Lax; Secure`);
     expect(await readSession(before.token)).toBeNull();
     expect(await readSession(session.token)).toMatchObject({ role: "owner" });
+  });
+
+  it("signing in and out on a caller's transaction changes nothing until that transaction commits", async () => {
+    const before = await createSession("demo");
+    const browser = withCookie(`${SECURE_SESSION_COOKIE}=${before.token}`);
+    const client = await database().connect();
+    try {
+      await client.query("begin");
+      const { session } = await startSession(browser, "owner", client);
+      await client.query("rollback");
+      expect(await readSession(session.token)).toBeNull();
+      expect(await readSession(before.token)).toMatchObject({ role: "demo" });
+      await client.query("begin");
+      await endCurrentSession(browser, client);
+      await client.query("commit");
+    } finally {
+      client.release();
+    }
+    expect(await readSession(before.token)).toBeNull();
   });
 
   it("signing out deletes the session and clears the cookie", async () => {

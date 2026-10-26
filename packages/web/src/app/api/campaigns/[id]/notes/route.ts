@@ -6,7 +6,7 @@ import { EngineUnavailable, statusForEngineError } from "@/server/engine";
 import { writeLog } from "@/server/log";
 import { writeNotes } from "@/server/notes";
 import { authorize, failed, refuse, reply, signedIn } from "@/server/permissions";
-import { LIMITS, takeHit } from "@/server/ratelimit";
+import { clientAddress, LIMITS, takeHit } from "@/server/ratelimit";
 
 export const runtime = "nodejs";
 
@@ -53,7 +53,7 @@ export async function POST(request: Request, context: { params: Promise<{ id: st
     const { id } = await context.params;
     if (!CAMPAIGN_ID.test(id)) return refuse(ROUTE, ref, 404, "not_found", { reason: "malformed_id" });
 
-    const session = hasClaudeKey() ? new ClaudeSession(principal, ref, DEADLINE_MS) : null;
+    const session = hasClaudeKey() ? new ClaudeSession(principal, ref, DEADLINE_MS, clientAddress(request.headers)) : null;
     try {
       const result = await writeNotes(principal, id, session);
       if (result.kind === "not_draft") return refuse(ROUTE, ref, 422, "not_editable");

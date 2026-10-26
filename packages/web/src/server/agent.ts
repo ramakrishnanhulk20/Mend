@@ -7,8 +7,10 @@
  * nothing from another visitor's campaigns, which the engine scopes per session. None
  * of them moves money or approves: request_approval only puts a draft in the owner's
  * approval queue, and approval stays a person's click on the campaign page (C2). A
- * turn stops at 8 tool calls, 10 model rounds and 60 seconds. The reply comes back as
- * plain text with images, HTML and email addresses removed.
+ * turn stops at 8 tool calls, 10 model rounds and 60 seconds. Every tool run, PayPal's
+ * lookups included, leaves a best-effort audit row with the tool's name and whether it
+ * ran or was refused (C23). The reply comes back as plain text with images, HTML and
+ * email addresses removed.
  *
  * paypalReadTools() adds PayPal's four read-only lookups. Mend's server calls PayPal's
  * MCP server for them (paypal-mcp.ts); the model never connects to PayPal, never sees
@@ -17,6 +19,7 @@
 import type Anthropic from "@anthropic-ai/sdk";
 import { betaZodTool } from "@anthropic-ai/sdk/helpers/beta/zod";
 import { z } from "zod";
+import { appendAudit } from "./audit";
 import { cachedSystem, ClaudeSession, claudeClient, FAILURE_MESSAGES, failureOf, MODEL, plainText, withoutEmails, type Failure } from "./claude";
 import { askEngine, cleanGoal, planCampaign, type Asked } from "./goal";
 import { writeLog } from "./log";
@@ -99,26 +102,32 @@ function guardedTool<S extends z.ZodType>(
     run: async (input) => {
       turn.used.push(spec.name);
       turn.calls += 1;
-      const log = (outcome: string) => writeLog({ kind: "agent_tool", ref: turn.ref, role: turn.principal.role, tool: spec.name, outcome });
+      // One log line and one audit row per run; the audit row holds the outcome as "ran"
+      // or "refused" and, for a refusal, why, as one of the fixed codes below.
+      const record = async (outcome: "answered" | "over_cap" | "not_allowed" | "refused" | "failed", extra: Readonly<Record<string, unknown>> = {}) => {
+        writeLog({ kind: "agent_tool", ref: turn.ref, role: turn.principal.role, tool: spec.name, outcome, ...extra });
+        const ran = outcome === "answered";
+        await appendAudit("agent_tool", { tool: spec.name, outcome: ran ? "ran" : "refused", reason: ran ? null : outcome, role: turn.principal.role, ref: turn.ref });
+      };
       if (turn.calls > MAX_TOOL_CALLS) {
         turn.capped = true;
-        log("over_cap");
+        await record("over_cap");
         throw new ToolRefusal(`The limit of ${MAX_TOOL_CALLS} tool calls for one message is reached. Answer with what you already have.`);
       }
       if (!isAllowed(spec.action, turn.principal.role)) {
-        log("not_allowed");
+        await record("not_allowed");
         throw new ToolRefusal("This account is not allowed to do that.");
       }
       try {
         const result = await spec.run(input);
-        log("answered");
+        await record("answered");
         return JSON.stringify(result);
       } catch (error) {
         if (error instanceof ToolRefusal) {
-          log("refused");
+          await record("refused");
           throw error;
         }
-        writeLog({ kind: "agent_tool", ref: turn.ref, tool: spec.name, outcome: "failed", exception: error instanceof Error ? error.name : "unknown", detail: error instanceof Error ? scrubbed(error.message) : "" });
+        await record("failed", { exception: error instanceof Error ? error.name : "unknown", detail: error instanceof Error ? scrubbed(error.message) : "" });
         throw new ToolRefusal("That did not work because of a problem inside Mend. Try again later.");
       }
     },
@@ -382,11 +391,13 @@ function conversation(message: string, history: readonly HistoryEntry[]): Anthro
 
 /**
  * One answer from the assistant to the owner's message, with up to 10 earlier
- * messages of this browser's own chat for context. Never throws for a Claude problem:
- * a failure comes back as its code. A refusal is reported, never retried.
+ * messages of this browser's own chat for context. address is the client address the
+ * request came from (clientAddress), which a demo visitor's Claude calls also count
+ * against. Never throws for a Claude problem: a failure comes back as its code. A
+ * refusal is reported, never retried.
  */
-export async function runAgent(principal: SignedIn, message: string, history: readonly HistoryEntry[], ref: string): Promise<AgentAnswer> {
-  const session = new ClaudeSession(principal, ref, AGENT_WALL_MS);
+export async function runAgent(principal: SignedIn, message: string, history: readonly HistoryEntry[], ref: string, address: string): Promise<AgentAnswer> {
+  const session = new ClaudeSession(principal, ref, AGENT_WALL_MS, address);
   const turn: Turn = { principal, session, ref, startedAt: Date.now(), used: [], calls: 0, capped: false };
   try {
     const runner = claudeClient(session, "agent").beta.messages.toolRunner(

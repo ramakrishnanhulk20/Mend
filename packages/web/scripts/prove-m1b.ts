@@ -450,7 +450,7 @@ async function main(): Promise<void> {
     "select extract(epoch from purge_after - received_at)::int as seconds from paypal_events where transmission_id = $1",
     [stored.transmission_id],
   );
-  line(purge.rows[0]?.seconds === 48 * 3600, "purge: purge_after is 48 hours after received_at");
+  line(purge.rows[0]?.seconds === 47 * 3600, "purge: purge_after is 47 hours after received_at");
 
   const table = await db.query<{ everything: string }>(
     "select coalesce(string_agg(concat_ws(' ', transmission_id, event_id, event_type, resource_id, raw), ' '), '') as everything from paypal_events",

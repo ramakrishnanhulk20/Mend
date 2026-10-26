@@ -16,6 +16,7 @@ import { z } from "zod";
 import { currentPrincipal, type Principal } from "./auth";
 import { csrfSecret } from "./csrf";
 import { writeLog } from "./log";
+import { SECRET_SETTINGS } from "./secrets";
 
 export const ACTIONS = [
   "session.start",
@@ -154,14 +155,19 @@ export function refuse(
   return response;
 }
 
-const SECRET_SETTINGS = ["MEND_OWNER_PASSWORD", "PAYPAL_CLIENT_SECRET", "RENDER_API_KEY", "MEND_BRIDGE_TOKEN", "MEND_ENGINE_TOKEN", "DATABASE_URL", "MEND_CSRF_SECRET"];
+/**
+ * The shortest secret value the checks look for: scrubbed() here, claude.ts
+ * outboundProblem() and the audit detail rule all use this one number. A shorter value
+ * would match ordinary text too often to be worth removing.
+ */
+export const MIN_SECRET_CHARS = 6;
 
 /** text with every secret setting's value and every token-shaped string removed, for a log line. */
 export function scrubbed(text: string): string {
   let clean = text;
   for (const name of SECRET_SETTINGS) {
     const value = process.env[name];
-    if (value !== undefined && value.length >= 6) clean = clean.split(value).join("[removed]");
+    if (value !== undefined && value.length >= MIN_SECRET_CHARS) clean = clean.split(value).join("[removed]");
   }
   return clean
     .replace(/\b(?:s1|c1|c2|a1)\.[A-Za-z0-9_-]{20,}/g, "[token]")

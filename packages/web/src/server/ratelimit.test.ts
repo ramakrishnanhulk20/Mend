@@ -1,9 +1,11 @@
-// Covers which address a request is counted against and the counting itself, against a
-// real Postgres schema, including concurrent requests. Does NOT cover: Render's proxy
-// really appending the client address (unverified until deployed), the limits wired
-// into each route (npm run prove:m7a sends 11 sign-ins), or attackers spread across
-// many addresses (a named non-goal).
+// Covers which address a request is counted against, its short tag, the counting itself
+// against a real Postgres schema, including concurrent requests, and the one audit row
+// each window's first refusal leaves. Does NOT cover: Render's proxy really appending
+// the client address (unverified until deployed; the tag in the webhook log line is how
+// to check it), the limits wired into each route (console-routes.test.ts, npm run
+// prove:m7a), or attackers spread across many addresses (a named non-goal).
 import { spawn } from "node:child_process";
+import { createHmac } from "node:crypto";
 import { once } from "node:events";
 import { readFileSync } from "node:fs";
 import path from "node:path";
@@ -11,7 +13,7 @@ import pg from "pg";
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { ENGINE_DIR, SCHEMA_PATH, type DevDatabase } from "../../scripts/dev-database";
 import { closeDatabase } from "./db";
-import { clientAddress, GLOBAL, LIMITS, takeHit, UNKNOWN_ADDRESS, type Limit } from "./ratelimit";
+import { addressTag, clientAddress, GLOBAL, LIMITS, sessionTag, takeHit, UNKNOWN_ADDRESS, type Limit } from "./ratelimit";
 
 // dev_url applies the schema to the shared public schema, and two of those running at
 // once can deadlock (schema.sql takes its lock after its first table locks), so this
@@ -45,6 +47,9 @@ async function holdDatabaseServer(): Promise<DevDatabase> {
   };
 }
 
+const SECRET = "csrf-secret-for-ratelimit-tests-0123456789";
+const HOUR_MS = 60 * 60 * 1000;
+const DAY_MS = 24 * HOUR_MS;
 let dev: DevDatabase;
 let admin: pg.Client;
 const schema = `web_ratelimit_${process.pid}_${Date.now()}`;
@@ -56,6 +61,21 @@ function forwarded(value: string | null): Headers {
 async function hits(bucket: string, subject: string): Promise<number> {
   const { rows } = await admin.query<{ n: number }>("select count(*)::int as n from rate_limit_hits where bucket = $1 and subject = $2", [bucket, subject]);
   return rows[0].n;
+}
+
+async function lastAuditId(): Promise<number> {
+  const { rows } = await admin.query<{ id: number }>("select coalesce(max(id), 0)::int as id from audit_log");
+  return rows[0].id;
+}
+
+async function auditSince(id: number): Promise<{ actor: string; action: string; detail: unknown }[]> {
+  const { rows } = await admin.query("select actor, action, detail from audit_log where id > $1 order by id", [id]);
+  return rows;
+}
+
+async function refusedAfterFilling(limit: Limit, subject: string): Promise<boolean> {
+  for (let n = 0; n < limit.max; n += 1) await takeHit(limit, subject);
+  return !(await takeHit(limit, subject)).allowed;
 }
 
 beforeAll(async () => {
@@ -73,6 +93,7 @@ beforeAll(async () => {
   vi.stubEnv("PAYPAL_CLIENT_SECRET", "fake-client-secret");
   vi.stubEnv("PAYPAL_WEBHOOK_ID", "TESTWEBHOOK1");
   vi.stubEnv("DATABASE_URL", url.href);
+  vi.stubEnv("MEND_CSRF_SECRET", SECRET);
 });
 
 afterAll(async () => {
@@ -113,6 +134,15 @@ describe("clientAddress", () => {
   });
 });
 
+describe("addressTag", () => {
+  it("is the first 12 hex characters of HMAC-SHA256(MEND_CSRF_SECRET, address), one per address", () => {
+    expect(addressTag("198.51.100.7")).toBe(createHmac("sha256", SECRET).update("198.51.100.7").digest("hex").slice(0, 12));
+    expect(addressTag("198.51.100.7")).toMatch(/^[0-9a-f]{12}$/);
+    expect(addressTag("198.51.100.8")).not.toBe(addressTag("198.51.100.7"));
+    expect(sessionTag("d".repeat(64))).toMatch(/^[0-9a-f]{12}$/);
+  });
+});
+
 describe("takeHit", () => {
   it("lets ten sign-ins through in 15 minutes and refuses the eleventh with a wait", async () => {
     const results = [];
@@ -137,7 +167,7 @@ describe("takeHit", () => {
   });
 
   it("cannot be raced: 25 requests at once let exactly the limit through", async () => {
-    const limit: Limit = { bucket: "race", max: 10, windowMs: 60_000 };
+    const limit: Limit = { bucket: "race", max: 10, windowMs: 60_000, per: "address" };
     const results = await Promise.all(Array.from({ length: 25 }, () => takeHit(limit, "198.51.100.9")));
     expect(results.filter((result) => result.allowed)).toHaveLength(10);
     expect(await hits("race", "198.51.100.9")).toBe(10);
@@ -173,7 +203,7 @@ describe("takeHit", () => {
     expect((await takeHit(LIMITS.joinStart, "198.51.100.8")).allowed).toBe(true);
     await admin.query("update rate_limit_hits set at = at - interval '61 seconds'");
     expect((await takeHit(LIMITS.joinStart, "198.51.100.7")).allowed).toBe(true);
-    expect(LIMITS.joinCallback).toEqual({ bucket: "join_callback", max: 20, windowMs: 60_000 });
+    expect(LIMITS.joinCallback).toEqual({ bucket: "join_callback", max: 20, windowMs: 60_000, per: "address" });
   });
 
   it("lets 60 consent reads through per address in a minute and refuses the 61st", async () => {
@@ -195,9 +225,68 @@ describe("takeHit", () => {
     expect((await takeHit(LIMITS.cancelUnclaimed, "another-session")).allowed).toBe(true);
   });
 
+  it("gives each client address its own share of the demo: 4 demo sessions an hour and 10 a day, 80 demo Claude calls a day, 10 demo approvals and 10 simulates an hour", () => {
+    expect(LIMITS.demoSession).toEqual({ bucket: "demo_session", max: 4, windowMs: HOUR_MS, per: "address" });
+    expect(LIMITS.demoSessionDay).toEqual({ bucket: "demo_session_day", max: 10, windowMs: DAY_MS, per: "address" });
+    expect(LIMITS.claudeDemoAddress).toEqual({ bucket: "claude_demo_address", max: 80, windowMs: DAY_MS, per: "address" });
+    expect(LIMITS.demoApprovalsAddress).toEqual({ bucket: "demo_approvals_address", max: 10, windowMs: HOUR_MS, per: "address" });
+    expect(LIMITS.simulateAddress).toEqual({ bucket: "simulate_address", max: 10, windowMs: HOUR_MS, per: "address" });
+  });
+
   it("sweeps out rows older than every window", async () => {
     await admin.query("insert into rate_limit_hits (bucket, subject, at) values ('draft', 'old', now() - interval '25 hours')");
-    await takeHit(LIMITS.draft, "a-session");
+    // The sweep lock is database-wide and other test files run at the same time, so a
+    // call that finds it taken skips the sweep, as it should; a later call sweeps.
+    for (let call = 0; call < 20 && (await hits("draft", "old")) > 0; call += 1) await takeHit(LIMITS.draft, `a-session-${call}`);
     expect(await hits("draft", "old")).toBe(0);
+  });
+});
+
+describe("limit hits on the audit record", () => {
+  it("records only the first refusal in each window for each bucket and address, with the address tag", async () => {
+    const before = await lastAuditId();
+    expect(await refusedAfterFilling(LIMITS.signIn, "198.51.100.7")).toBe(true);
+    for (let n = 0; n < 3; n += 1) expect((await takeHit(LIMITS.signIn, "198.51.100.7")).allowed).toBe(false);
+    expect(await refusedAfterFilling(LIMITS.signIn, "198.51.100.8")).toBe(true);
+    const first = { actor: "web", action: "rate_limit_hit", detail: { bucket: "sign_in", per: "address", address_tag: addressTag("198.51.100.7") } };
+    const other = { actor: "web", action: "rate_limit_hit", detail: { bucket: "sign_in", per: "address", address_tag: addressTag("198.51.100.8") } };
+    expect(await auditSince(before)).toEqual([first, other]);
+
+    await admin.query("update rate_limit_hits set at = at - interval '15 minutes 1 second'");
+    expect(await refusedAfterFilling(LIMITS.signIn, "198.51.100.7")).toBe(true);
+    expect(await auditSince(before)).toEqual([first, other, first]);
+  });
+
+  it("records a session's refusal by its tag, never its id, and a global one by its bucket alone", async () => {
+    const before = await lastAuditId();
+    const sessionId = "d".repeat(64);
+    await admin.query("insert into rate_limit_hits (bucket, subject) select 'claude_demo_session', $1 from generate_series(1, 40)", [sessionId]);
+    expect((await takeHit(LIMITS.claudeDemoSession, sessionId)).allowed).toBe(false);
+    await admin.query("insert into rate_limit_hits (bucket, subject) select 'demo_approvals_all', 'all' from generate_series(1, 100)");
+    expect((await takeHit(LIMITS.demoApprovals, GLOBAL)).allowed).toBe(false);
+    const rows = await auditSince(before);
+    expect(rows).toEqual([
+      { actor: "web", action: "rate_limit_hit", detail: { bucket: "claude_demo_session", per: "session", session_tag: sessionTag(sessionId) } },
+      { actor: "web", action: "rate_limit_hit", detail: { bucket: "demo_approvals_all", per: "all" } },
+    ]);
+    expect(JSON.stringify(rows)).not.toContain(sessionId);
+  });
+
+  it("refuses the same way when the audit row cannot be written, and logs one line saying so", async () => {
+    const lines: string[] = [];
+    vi.spyOn(process.stdout, "write").mockImplementation(((chunk: string) => {
+      lines.push(String(chunk));
+      return true;
+    }) as typeof process.stdout.write);
+    await admin.query("alter table audit_log rename to audit_log_away");
+    try {
+      expect(await refusedAfterFilling(LIMITS.signIn, "198.51.100.9")).toBe(true);
+    } finally {
+      await admin.query("alter table audit_log_away rename to audit_log");
+      vi.restoreAllMocks();
+    }
+    expect(lines.map((line) => JSON.parse(line) as Record<string, unknown>)).toEqual([
+      expect.objectContaining({ kind: "audit", outcome: "not_written", action: "rate_limit_hit", reason: "db_error" }),
+    ]);
   });
 });

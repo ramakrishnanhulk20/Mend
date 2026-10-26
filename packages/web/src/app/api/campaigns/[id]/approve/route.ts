@@ -3,7 +3,7 @@ import { z } from "zod";
 import { readJsonBody, stateChangeProblem } from "@/server/csrf";
 import { EngineUnavailable } from "@/server/engine";
 import { authorize, failed, refuse, signedIn } from "@/server/permissions";
-import { GLOBAL, LIMITS, takeHit } from "@/server/ratelimit";
+import { clientAddress, GLOBAL, LIMITS, takeHit } from "@/server/ratelimit";
 import { engineResponse } from "@/server/runs";
 
 export const runtime = "nodejs";
@@ -19,10 +19,12 @@ const BODY = z.strictObject({ presentedHash: z.string().regex(/^[0-9a-f]{64}$/) 
  * Approve this session's campaign exactly as it was shown, with {"presentedHash"}: the
  * reviewHash the campaign view gave (C2). The engine rebuilds the snapshot and
  * approves only if its hash matches, under the caller's caps (C4). Same origin and
- * CSRF token required; 20 approvals per session per hour, and demo approvals share
- * 100 an hour across every visitor (C20). Answers 409 with hash_mismatch when the
- * campaign changed since it was shown, and with recipient_not_member or voided when a
- * recipient left; 202 with a run id this session alone can poll when the engine is slow.
+ * CSRF token required; 20 approvals per session per hour, and demo approvals are held
+ * to 10 an hour per client address and 100 an hour across every visitor (C20), so one
+ * address opening many sessions cannot use up the rest. Answers 409 with hash_mismatch
+ * when the campaign changed since it was shown, and with recipient_not_member or voided
+ * when a recipient left; 202 with a run id this session alone can poll when the engine
+ * is slow.
  */
 export async function POST(request: Request, context: { params: Promise<{ id: string }> }): Promise<Response> {
   const ref = randomUUID();
@@ -34,7 +36,12 @@ export async function POST(request: Request, context: { params: Promise<{ id: st
     if (!access.ok || principal === null) return refuse(ROUTE, ref, access.ok ? 403 : access.status, "not_allowed");
     for (const [limit, subject] of [
       [LIMITS.approve, principal.sessionId],
-      ...(principal.role === "demo" ? ([[LIMITS.demoApprovals, GLOBAL]] as const) : []),
+      ...(principal.role === "demo"
+        ? ([
+            [LIMITS.demoApprovalsAddress, clientAddress(request.headers)],
+            [LIMITS.demoApprovals, GLOBAL],
+          ] as const)
+        : []),
     ] as const) {
       const hit = await takeHit(limit, subject);
       if (!hit.allowed) return refuse(ROUTE, ref, 429, "rate_limited", { bucket: limit.bucket }, { "retry-after": String(hit.retryAfterSeconds) });

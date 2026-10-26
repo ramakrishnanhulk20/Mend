@@ -34,6 +34,12 @@ const NOTE_CHARACTERS = /^[A-Za-z0-9 .,!?'"():;&-]+$/;
 // A word, a dot and two or more letters with no space between: "evil.example", "x.co".
 const DOMAIN_LIKE = /[A-Za-z0-9-]\.[A-Za-z]{2,}/;
 const LONG_DIGITS = /[0-9]{7,}/;
+// Phone numbers are written with these between the digit groups, so they are taken out
+// before digits are counted: "(415) 555-0199" and "415,555,0199" count as 4155550199.
+// Covers spaces, dots, dashes, brackets, commas, colons, apostrophes, slashes and
+// underscores, the same set the engine's rule takes out; does not cover digits split by
+// other punctuation or spelled in words.
+const NUMBER_SEPARATORS = /[\s.\-()[\]{},:'/_]/g;
 const SANDBOX_CODE = /^\s*(?:POSPYO|ERRPYO|POSPOI|ERRPOI)/i;
 const LETTER_RUN = /[a-z]+/g;
 const PAYMENT_BRANDS: Readonly<Record<string, string>> = { paypal: "PayPal", venmo: "Venmo" };
@@ -55,6 +61,11 @@ function namedBrand(lowered: string): string | null {
   return null;
 }
 
+/** True when text holds 7 or more digits in a row once the separators phone numbers are written with are taken out. */
+export function hasLongDigitRun(text: string): boolean {
+  return LONG_DIGITS.test(text.replace(NUMBER_SEPARATORS, ""));
+}
+
 /** Why text may not be sent as a customer's note, or null when it may. Every note this passes also passes the engine's note_problem. */
 export function noteProblem(text: string): string | null {
   if (text.trim() === "") return "is empty";
@@ -62,7 +73,7 @@ export function noteProblem(text: string): string | null {
   if (!NOTE_CHARACTERS.test(text)) return "uses a character other than letters, digits and plain punctuation";
   const lowered = text.toLowerCase();
   if (lowered.includes("http") || lowered.includes("www.") || DOMAIN_LIKE.test(text)) return "looks like a link";
-  if (LONG_DIGITS.test(text)) return "has a run of 7 or more digits";
+  if (hasLongDigitRun(text)) return "has a run of 7 or more digits";
   if (SANDBOX_CODE.test(text)) return "starts with a PayPal sandbox test code";
   const brand = namedBrand(lowered);
   return brand === null ? null : `names ${brand}`;

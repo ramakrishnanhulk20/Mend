@@ -58,7 +58,7 @@ vi.mock("@/server/notes", async () => await import("./notes"));
 vi.mock("@/server/permissions", async () => await import("./permissions"));
 vi.mock("@/server/ratelimit", async () => await import("./ratelimit"));
 
-const { customerData, noteProblem, tidyNote, writeNotes } = await import("./notes");
+const { customerData, hasLongDigitRun, noteProblem, tidyNote, writeNotes } = await import("./notes");
 const { ClaudeSession, MODEL } = await import("./claude");
 const { csrfTokenForSession } = await import("./csrf");
 const { POST } = await import("../app/api/campaigns/[id]/notes/route");
@@ -74,6 +74,7 @@ const ROWS = [
   { ref: "R5", role: "holdout", rank: 5, amount_minor: null, note: null },
 ];
 const OWNER = { role: "owner" as const, sessionId: "e".repeat(64), expiresAt: new Date(Date.now() + 60_000) };
+const ADDRESS = "198.51.100.1";
 
 function view(status = "draft"): Record<string, unknown> {
   return {
@@ -169,6 +170,30 @@ describe("noteProblem", () => {
     }
   });
 
+  it("refuses a phone number written with spaces, dots, dashes or brackets, and allows short numbers apart", () => {
+    for (const phone of ["Call 415 555 0199", "(415) 555-0199", "Ring 415.555.0199 soon"]) {
+      expect(noteProblem(phone), phone).toBe("has a run of 7 or more digits");
+    }
+    expect(noteProblem("Order 12 of 2026")).toBeNull();
+  });
+
+  it("counts digits through commas, colons and apostrophes too, as the engine's rule does", () => {
+    for (const phone of ["Call 415,555,0199", "Ring 415:555:0199 soon", "Try 415'555'0199"]) {
+      expect(noteProblem(phone), phone).toBe("has a run of 7 or more digits");
+    }
+    expect(noteProblem("Thanks for 12, 30 and 45 visits")).toBeNull();
+  });
+
+  it("counts digits through slashes", () => {
+    expect(hasLongDigitRun("415/555/0199")).toBe(true);
+    expect(hasLongDigitRun("12/30")).toBe(false);
+  });
+
+  it("counts digits through underscores", () => {
+    expect(hasLongDigitRun("415_555_0199")).toBe(true);
+    expect(hasLongDigitRun("12_30")).toBe(false);
+  });
+
   it("tidies typographic quotes, dashes and wrapping quotes into plain ASCII", () => {
     expect(tidyNote("\u201cWe\u2019ve missed you \u2014 come back soon\u2026\u201d")).toBe("We've missed you, come back soon...");
   });
@@ -181,7 +206,7 @@ describe("noteProblem", () => {
 
 describe("writeNotes", () => {
   it("writes one note per rewarded customer from that customer's own items, and never touches a held-back row", async () => {
-    const session = new ClaudeSession(OWNER, randomUUID(), 10_000);
+    const session = new ClaudeSession(OWNER, randomUUID(), 10_000, ADDRESS);
     const result = await writeNotes(OWNER, CAMPAIGN, session);
     session.close();
 
@@ -206,7 +231,7 @@ describe("writeNotes", () => {
     state.reply = (content) => (content.includes("red teapot") ? "A thank-you from PayPal for the red teapot." : "Thank you, we have missed you.");
     state.engine.set_note = (args) =>
       args[1] === "R3" && args[2] !== null ? { ok: false, error: "note_rejected", ref: randomUUID() } : { ok: true, campaign_id: CAMPAIGN, ref: args[1], template: args[2] === null };
-    const session = new ClaudeSession(OWNER, randomUUID(), 10_000);
+    const session = new ClaudeSession(OWNER, randomUUID(), 10_000, ADDRESS);
     const result = await writeNotes(OWNER, CAMPAIGN, session);
     session.close();
 
@@ -225,7 +250,7 @@ describe("writeNotes", () => {
       args[1] === "R3"
         ? { ok: false, error: "recipient_not_member", ref: randomUUID() }
         : { ok: true, shop_name: "Wolf and Wren Gifts", recent_items: ITEMS[args[1] as string], days_since_last_order: 120 };
-    const session = new ClaudeSession(OWNER, randomUUID(), 10_000);
+    const session = new ClaudeSession(OWNER, randomUUID(), 10_000, ADDRESS);
     const result = await writeNotes(OWNER, CAMPAIGN, session);
     session.close();
     expect(result).toMatchObject({ written: 2, template: 0, skipped: 1 });
@@ -237,7 +262,7 @@ describe("writeNotes", () => {
     expect(engineCalls("note_context")).toEqual([]);
 
     state.refuse = ["claude_owner"];
-    const session = new ClaudeSession(OWNER, randomUUID(), 10_000);
+    const session = new ClaudeSession(OWNER, randomUUID(), 10_000, ADDRESS);
     const result = await writeNotes(OWNER, CAMPAIGN, session);
     session.close();
     expect(result).toMatchObject({ written: 0, template: 3, stopped: "limit_reached" });
@@ -246,7 +271,7 @@ describe("writeNotes", () => {
   });
 
   it("starts no Claude call once the caller's time to start notes has passed, and leaves the template", async () => {
-    const session = new ClaudeSession(OWNER, randomUUID(), 10_000);
+    const session = new ClaudeSession(OWNER, randomUUID(), 10_000, ADDRESS);
     const result = await writeNotes(OWNER, CAMPAIGN, session, Date.now() - 1);
     session.close();
     expect(result).toMatchObject({ written: 0, template: 3, stopped: null });
@@ -284,6 +309,14 @@ describe("POST /api/campaigns/[id]/notes", () => {
     vi.stubEnv("ANTHROPIC_API_KEY", "");
     const keyless = await notes(demo, CAMPAIGN);
     expect(await keyless.json()).toMatchObject({ ai: "no_key", template: 3, notice: expect.stringContaining("needs an Anthropic API key") });
+  });
+
+  it("counts a demo visitor's note calls against its client address, and keeps the template once that share is used up", async () => {
+    state.refuse = ["claude_demo_address"];
+    const response = await notes(signIn("demo"), CAMPAIGN);
+    expect(response.status).toBe(200);
+    expect(await response.json()).toMatchObject({ written: 0, template: 3, stopped: "limit_reached", aiCalls: 0 });
+    expect(state.claude).toEqual([]);
   });
 
   it("refuses without a CSRF token, for a malformed id, and once the campaign is not a draft", async () => {

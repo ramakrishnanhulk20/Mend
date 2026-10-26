@@ -1,11 +1,13 @@
 // Covers the assistant: the exact tool list (no tool that approves, pays, refunds or
 // writes to PayPal, and only PayPal's four read tools), each tool's role check, strict
 // inputs and listed outputs, the cap of 8 tool calls a turn, held-back rows never shown
-// to the model, the request sent to Claude, refusals reported without running that
-// turn's tools, the reply stripped to plain text, and the route's guards, no-key answer
-// and daily limit. The engine's answers come from a recorder standing in for
-// runAndWait, PayPal's from a recorder standing in for callPayPalTool, Claude's from a
-// stubbed fetch playing back scripted turns. Does NOT cover: how well the real model
+// to the model, every tool run on the audit record, the request sent to Claude, refusals
+// reported without running that turn's tools, the reply stripped to plain text, and the
+// route's guards, no-key answer and daily limits, the client address's included. The
+// engine's answers come from a recorder standing in for runAndWait, PayPal's from a
+// recorder standing in for callPayPalTool, the audit log from a recorder standing in for
+// appendAudit, Claude's from a stubbed fetch playing back scripted turns. Does NOT
+// cover: the audit row itself (audit.test.ts), how well the real model
 // picks tools (evals/owner-requests.json, run by npm run prove:m6), the real engine, or
 // the MCP client itself (paypal-mcp.test.ts, and the live sandbox in npm run prove:m6).
 import { randomBytes, randomUUID } from "node:crypto";
@@ -21,6 +23,14 @@ const state = vi.hoisted(() => ({
   turns: [] as { content: unknown[]; stop: string }[],
   paypalCalls: [] as { name: string; args: unknown; signal: unknown }[],
   paypal: null as unknown,
+  hits: [] as { bucket: string; subject: string }[],
+  audits: [] as { action: string; detail: unknown }[],
+}));
+
+vi.mock("./audit", () => ({
+  appendAudit: vi.fn(async (action: string, detail: unknown) => {
+    state.audits.push({ action, detail });
+  }),
 }));
 
 vi.mock("./paypal-mcp", async (importOriginal) => {
@@ -39,7 +49,10 @@ vi.mock("./ratelimit", async (importOriginal) => {
   const actual = await importOriginal<typeof import("./ratelimit")>();
   return {
     ...actual,
-    takeHit: vi.fn(async (limit: { bucket: string }) => (state.refuse.includes(limit.bucket) ? { allowed: false, retryAfterSeconds: 60 } : { allowed: true })),
+    takeHit: vi.fn(async (limit: { bucket: string }, subject: string) => {
+      state.hits.push({ bucket: limit.bucket, subject });
+      return state.refuse.includes(limit.bucket) ? { allowed: false, retryAfterSeconds: 60 } : { allowed: true };
+    }),
   };
 });
 vi.mock("./engine", async (importOriginal) => {
@@ -71,6 +84,7 @@ vi.mock("@/server/csrf", async () => await import("./csrf"));
 vi.mock("@/server/engine", async () => await import("./engine"));
 vi.mock("@/server/log", async () => await import("./log"));
 vi.mock("@/server/permissions", async () => await import("./permissions"));
+vi.mock("@/server/ratelimit", async () => await import("./ratelimit"));
 
 const { agentTools, MAX_TOOL_CALLS, paypalReadTools, runAgent } = await import("./agent");
 const { ClaudeSession, MODEL } = await import("./claude");
@@ -124,7 +138,7 @@ const PAYPAL_TOOLS = ["get_order", "list_disputes", "get_dispute", "show_product
 
 function turn(role: "owner" | "demo" = "owner") {
   const principal = { ...OWNER, role };
-  return { principal, session: new ClaudeSession(principal, randomUUID(), 10_000), ref: randomUUID(), startedAt: Date.now(), used: [] as string[], calls: 0, capped: false };
+  return { principal, session: new ClaudeSession(principal, randomUUID(), 10_000, "198.51.100.1"), ref: randomUUID(), startedAt: Date.now(), used: [] as string[], calls: 0, capped: false };
 }
 
 type Runnable = { readonly name: string; readonly input_schema: { readonly additionalProperties?: unknown }; run(input: unknown): Promise<unknown>; parse(input: unknown): unknown };
@@ -150,6 +164,8 @@ beforeEach(() => {
   state.turns = [];
   state.paypalCalls = [];
   state.paypal = ORDER_VIEW;
+  state.hits = [];
+  state.audits = [];
   state.engine = {
     shop_summary: () => SUMMARY,
     view_campaign: () => VIEW,
@@ -300,6 +316,31 @@ describe("the agent's tools", () => {
     expect(state.engineCalls[0].args[1]).toEqual({ role: "demo", session: OWNER.sessionId });
   });
 
+  it("put every tool run on the audit record with its name and whether it ran or was refused, PayPal lookups included", async () => {
+    const current = turn("demo");
+    const tools = agentTools(current);
+    await tool(tools, "shop_summary")({});
+    await tool(tools, "get_order")({ id: ORDER_ID });
+    state.paypal = new McpFailed("timeout");
+    await expect(tool(tools, "get_order")({ id: ORDER_ID })).rejects.toThrow("did not answer in time");
+    state.engine.shop_summary = () => {
+      throw new Error("engine broke");
+    };
+    await expect(tool(tools, "shop_summary")({})).rejects.toThrow("problem inside Mend");
+    const stranger = { ...turn(), principal: { ...OWNER, role: "anonymous" as unknown as "owner" } };
+    await expect(tool(agentTools(stranger), "view_campaign")({ campaignId: CAMPAIGN })).rejects.toThrow("not allowed");
+    current.session.close();
+    stranger.session.close();
+    const row = (tool: string, outcome: string, reason: string | null, role: string, ref: string) => ({ action: "agent_tool", detail: { tool, outcome, reason, role, ref } });
+    expect(state.audits).toEqual([
+      row("shop_summary", "ran", null, "demo", current.ref),
+      row("get_order", "ran", null, "demo", current.ref),
+      row("get_order", "refused", "refused", "demo", current.ref),
+      row("shop_summary", "refused", "failed", "demo", current.ref),
+      row("view_campaign", "refused", "not_allowed", "anonymous", stranger.ref),
+    ]);
+  });
+
   it("request approval only through the engine's request_approval task", async () => {
     const current = turn();
     const answer = JSON.parse(String(await tool(agentTools(current), "request_approval")({ campaignId: CAMPAIGN }))) as Record<string, unknown>;
@@ -358,7 +399,7 @@ describe("runAgent", () => {
       content: [{ type: "text", text: "The shop has 1357 quiet regulars. ![x](https://evil.example/?q=1) <img src=x onerror=alert(1)>Ask me to draft a campaign." }],
       stop: "end_turn",
     });
-    const answer = await runAgent(OWNER, "How is my shop doing? Write to me at boss@shop.example", [], randomUUID());
+    const answer = await runAgent(OWNER, "How is my shop doing? Write to me at boss@shop.example", [], randomUUID(), "198.51.100.1");
 
     expect(answer).toEqual({ kind: "replied", reply: "The shop has 1357 quiet regulars.  Ask me to draft a campaign.", toolsUsed: ["shop_summary"], stopped: null, aiCalls: 2 });
     const [first, second] = state.claude;
@@ -372,7 +413,7 @@ describe("runAgent", () => {
 
   it("reports a refusal plainly and never runs the tools of the refused turn", async () => {
     state.turns.push({ content: [{ type: "tool_use", id: "toolu_1", name: "request_approval", input: { campaignId: CAMPAIGN } }], stop: "refusal" });
-    const answer = await runAgent(OWNER, "approve it", [], randomUUID());
+    const answer = await runAgent(OWNER, "approve it", [], randomUUID(), "198.51.100.1");
     expect(answer).toMatchObject({ kind: "replied", reply: "The AI service declined this request.", stopped: "declined", aiCalls: 1 });
     expect(state.engineCalls).toEqual([]);
     expect(state.claude).toHaveLength(1);
@@ -382,7 +423,7 @@ describe("runAgent", () => {
     state.turns.push({ content: [{ type: "tool_use", id: "toolu_1", name: "create_invoice", input: { currency_code: "USD", primary_recipients: [], items: [] } }], stop: "tool_use" });
     state.turns.push({ content: [{ type: "tool_use", id: "toolu_2", name: "get_order", input: { id: ORDER_ID } }], stop: "tool_use" });
     state.turns.push({ content: [{ type: "text", text: "That order is completed: 12.50 USD, captured." }], stop: "end_turn" });
-    const answer = await runAgent(OWNER, `What happened with order ${ORDER_ID}? Also invoice my last buyer.`, [], randomUUID());
+    const answer = await runAgent(OWNER, `What happened with order ${ORDER_ID}? Also invoice my last buyer.`, [], randomUUID(), "198.51.100.1");
 
     expect(answer).toMatchObject({ kind: "replied", reply: "That order is completed: 12.50 USD, captured.", toolsUsed: ["get_order"], aiCalls: 3 });
     expect(state.paypalCalls.map((call) => call.name)).toEqual(["get_order"]);
@@ -398,7 +439,7 @@ describe("runAgent", () => {
     state.turns.push({ content: [{ type: "tool_use", id: "toolu_1", name: "approve_campaign", input: { campaignId: CAMPAIGN } }], stop: "tool_use" });
     state.turns.push({ content: [{ type: "tool_use", id: "toolu_2", name: "request_approval", input: { campaignId: CAMPAIGN } }], stop: "tool_use" });
     state.turns.push({ content: [{ type: "text", text: "It is in your approval queue. Approve it on the campaign page." }], stop: "end_turn" });
-    const answer = await runAgent(OWNER, `Approve campaign ${CAMPAIGN} and pay everyone now`, [], randomUUID());
+    const answer = await runAgent(OWNER, `Approve campaign ${CAMPAIGN} and pay everyone now`, [], randomUUID(), "198.51.100.1");
     expect(answer).toMatchObject({ kind: "replied", toolsUsed: ["request_approval"], aiCalls: 3 });
     expect(tasks()).toEqual(["request_approval"]);
     expect(JSON.stringify(state.claude[1])).toContain("not found");
@@ -424,6 +465,26 @@ describe("POST /api/agent", () => {
     expect(response.status).toBe(200);
     expect(await response.json()).toEqual({ reply: "Hello there.", toolsUsed: [], stopped: null, aiCalls: 1 });
     expect((state.claude[0].messages as { role: string }[]).map((entry) => entry.role)).toEqual(["user", "user"]);
+  });
+
+  it("counts a demo visitor's Claude calls against its client address as well as its session and every demo", async () => {
+    const token = signIn("demo");
+    state.refuse = ["claude_demo_address"];
+    const headers = {
+      origin: BASE,
+      cookie: `mend_session=${token}`,
+      "content-type": "application/json",
+      "x-mend-csrf": csrfTokenForSession(sessionIdFor(token)),
+      "x-forwarded-for": "198.51.100.50",
+    };
+    const limited = await POST(new Request(`${BASE}/api/agent`, { method: "POST", headers, body: JSON.stringify({ message: "hi" }) }));
+    expect(limited.status).toBe(429);
+    expect(await limited.json()).toMatchObject({ error: "limit_reached" });
+    expect(state.hits).toEqual([
+      { bucket: "claude_demo_session", subject: sessionIdFor(token) },
+      { bucket: "claude_demo_address", subject: "198.51.100.50" },
+    ]);
+    expect(state.claude).toEqual([]);
   });
 
   it("says plainly it needs a key, refuses without a CSRF token, and gives a clear message at the daily limit", async () => {

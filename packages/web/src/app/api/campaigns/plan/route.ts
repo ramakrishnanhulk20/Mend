@@ -6,7 +6,7 @@ import { EngineUnavailable, statusForEngineError } from "@/server/engine";
 import { cleanGoal, planCampaign, type PlanSummary } from "@/server/goal";
 import { writeLog } from "@/server/log";
 import { authorize, failed, refuse, reply, signedIn } from "@/server/permissions";
-import { LIMITS, takeHit } from "@/server/ratelimit";
+import { clientAddress, LIMITS, takeHit } from "@/server/ratelimit";
 import { recordRun } from "@/server/runs";
 
 export const runtime = "nodejs";
@@ -96,7 +96,7 @@ export async function POST(request: Request): Promise<Response> {
       maxCandidates: body.data.maxCandidates,
     };
 
-    const session = hasClaudeKey() ? new ClaudeSession(principal, ref, DEADLINE_MS) : null;
+    const session = hasClaudeKey() ? new ClaudeSession(principal, ref, DEADLINE_MS, clientAddress(request.headers)) : null;
     try {
       const planned = await planCampaign(principal, goalText, form, session);
       const aiCalls = session?.calls ?? 0;

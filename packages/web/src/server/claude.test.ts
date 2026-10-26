@@ -1,7 +1,9 @@
 // Covers claude.ts with the real SDK talking to a fake Anthropic API through a stubbed
 // fetch, and the Postgres caps replaced by a recorder: the fixed host and model, the
-// outbound email and secret refusal, one cap hit per HTTP call including each
-// tool-runner round, error codes, and token logging without content. Does NOT cover:
+// outbound email and secret refusal with the minimum secret length the log scrubber
+// shares, one hit on each cap (a demo call's session, client address and global caps)
+// per HTTP call including each tool-runner round, error codes, and token logging
+// without content. Does NOT cover:
 // the real API (npm run prove:m6), the caps counted in Postgres (ratelimit.test.ts),
 // or the prompts each caller builds (goal, notes and agent tests).
 import { betaZodTool } from "@anthropic-ai/sdk/helpers/beta/zod";
@@ -24,11 +26,13 @@ vi.mock("./ratelimit", async (importOriginal) => {
 
 const { ClaudeKeyMissing, ClaudeSession, ClaudeStopped, MODEL, claudeClient, failureOf, hasClaudeKey, outboundProblem, plainText, withoutEmails } =
   await import("./claude");
+const { MIN_SECRET_CHARS, scrubbed } = await import("./permissions");
 
 const KEY = "fake-claude-key-for-tests-0123456789";
 const DEMO: SignedIn = { role: "demo", sessionId: "d".repeat(64), expiresAt: new Date(Date.now() + 60_000) };
 const OWNER: SignedIn = { role: "owner", sessionId: "e".repeat(64), expiresAt: new Date(Date.now() + 60_000) };
 const REF = "4b0f6a52-3c1d-4e5f-8a9b-0c1d2e3f4a5b";
+const ADDRESS = "198.51.100.70";
 
 type Sent = { readonly url: string; readonly body: Record<string, unknown>; readonly headers: Headers };
 let sent: Sent[] = [];
@@ -74,9 +78,9 @@ afterEach(() => {
 });
 
 describe("a Claude call", () => {
-  it("goes to api.anthropic.com whatever the environment says, counts on both demo caps, and logs tokens but no content", async () => {
+  it("goes to api.anthropic.com whatever the environment says, counts on all three demo caps, and logs tokens but no content", async () => {
     answers.push(() => message([{ type: "text", text: "Fine thanks" }]));
-    const session = new ClaudeSession(DEMO, REF, 5_000);
+    const session = new ClaudeSession(DEMO, REF, 5_000, ADDRESS);
     await claudeClient(session, "goal").messages.create({ model: MODEL, max_tokens: 100, messages: [{ role: "user", content: "a private goal text" }] });
     session.close();
 
@@ -85,6 +89,7 @@ describe("a Claude call", () => {
     expect(sent[0].headers.get("authorization")).toBe(`Bearer ${KEY}`);
     expect(state.hits).toEqual([
       { bucket: "claude_demo_session", subject: DEMO.sessionId },
+      { bucket: "claude_demo_address", subject: ADDRESS },
       { bucket: "claude_demo_all", subject: "all" },
     ]);
     expect([session.calls, session.inputTokens, session.outputTokens]).toEqual([1, 12, 3]);
@@ -97,7 +102,7 @@ describe("a Claude call", () => {
 
   it("counts an owner call once, on the shared owner cap", async () => {
     answers.push(() => message([{ type: "text", text: "ok" }]));
-    const session = new ClaudeSession(OWNER, REF, 5_000);
+    const session = new ClaudeSession(OWNER, REF, 5_000, ADDRESS);
     await claudeClient(session, "agent").messages.create({ model: MODEL, max_tokens: 100, messages: [{ role: "user", content: "hi" }] });
     session.close();
     expect(state.hits).toEqual([{ bucket: "claude_owner", subject: "all" }]);
@@ -108,7 +113,7 @@ describe("a Claude call", () => {
     ["a server secret", "the secret is csrf-secret-for-claude-tests-0123456789"],
     ["the API key itself", `key ${KEY}`],
   ])("is refused before anything is sent or counted when the body holds %s", async (_what, content) => {
-    const session = new ClaudeSession(DEMO, REF, 5_000);
+    const session = new ClaudeSession(DEMO, REF, 5_000, ADDRESS);
     const call = claudeClient(session, "goal").messages.create({ model: MODEL, max_tokens: 100, messages: [{ role: "user", content }] });
     await expect(call).rejects.toBeInstanceOf(ClaudeStopped);
     session.close();
@@ -118,9 +123,9 @@ describe("a Claude call", () => {
     expect(logged.join("")).not.toContain("maya@");
   });
 
-  it("is refused without being sent once a daily cap is used up", async () => {
-    state.refuse = "claude_demo_all";
-    const session = new ClaudeSession(DEMO, REF, 5_000);
+  it.each(["claude_demo_session", "claude_demo_address", "claude_demo_all"])("is refused without being sent once %s is used up", async (bucket) => {
+    state.refuse = bucket;
+    const session = new ClaudeSession(DEMO, REF, 5_000, ADDRESS);
     const call = claudeClient(session, "note", "R3").messages.create({ model: MODEL, max_tokens: 100, messages: [{ role: "user", content: "hi" }] });
     const error = await call.catch((caught: unknown) => caught);
     session.close();
@@ -128,7 +133,7 @@ describe("a Claude call", () => {
     expect(failureOf(error, session)).toBe("limit_reached");
     expect(sent).toEqual([]);
     expect(session.calls).toBe(0);
-    expect(logged.join("")).toContain('"reason":"claude_demo_all"');
+    expect(logged.join("")).toContain(`"reason":"${bucket}"`);
   });
 });
 
@@ -137,7 +142,7 @@ describe("the tool runner", () => {
     answers.push(() => message([{ type: "tool_use", id: "toolu_1", name: "echo", input: { text: "x" } }], "tool_use"));
     answers.push(() => message([{ type: "text", text: "done" }]));
     const echo = betaZodTool({ name: "echo", description: "Echo text", inputSchema: z.object({ text: z.string() }), run: async ({ text }) => text });
-    const session = new ClaudeSession(DEMO, REF, 5_000);
+    const session = new ClaudeSession(DEMO, REF, 5_000, ADDRESS);
     const runner = claudeClient(session, "agent").beta.messages.toolRunner({ model: MODEL, max_tokens: 100, messages: [{ role: "user", content: "go" }], tools: [echo] });
     const seen: (string | null)[] = [];
     for await (const reply of runner) seen.push(reply.stop_reason);
@@ -145,7 +150,7 @@ describe("the tool runner", () => {
     expect(seen).toEqual(["tool_use", "end_turn"]);
     expect(sent).toHaveLength(2);
     expect(session.calls).toBe(2);
-    expect(state.hits).toHaveLength(4);
+    expect(state.hits).toHaveLength(6);
   });
 });
 
@@ -157,11 +162,11 @@ describe("failureOf", () => {
         .catch((caught: unknown) => caught);
 
     answers.push(() => Response.json({ type: "error", error: { type: "rate_limit_error", message: "slow down" } }, { status: 429, headers: { "x-should-retry": "false" } }));
-    const busy = new ClaudeSession(OWNER, REF, 5_000);
+    const busy = new ClaudeSession(OWNER, REF, 5_000, ADDRESS);
     expect(failureOf(await ask(busy), busy)).toBe("busy");
 
     answers.push(() => Response.json({ type: "error", error: { type: "api_error", message: "boom" } }, { status: 500, headers: { "x-should-retry": "false" } }));
-    const down = new ClaudeSession(OWNER, REF, 5_000);
+    const down = new ClaudeSession(OWNER, REF, 5_000, ADDRESS);
     expect(failureOf(await ask(down), down)).toBe("unavailable");
 
     // An answer that never comes, given up only when the request's signal aborts, as real fetch does.
@@ -171,10 +176,10 @@ describe("failureOf", () => {
           init?.signal?.addEventListener("abort", () => reject(new DOMException("aborted", "AbortError")), { once: true });
         }),
     );
-    const slow = new ClaudeSession(OWNER, REF, 50);
+    const slow = new ClaudeSession(OWNER, REF, 50, ADDRESS);
     expect(failureOf(await ask(slow), slow)).toBe("timed_out");
 
-    const other = new ClaudeSession(OWNER, REF, 5_000);
+    const other = new ClaudeSession(OWNER, REF, 5_000, ADDRESS);
     expect(() => failureOf(new TypeError("a bug"), other)).toThrow(TypeError);
     for (const session of [busy, down, slow, other]) session.close();
   });
@@ -184,7 +189,7 @@ describe("helpers", () => {
   it("say plainly when no key is set and refuse to build a client", () => {
     vi.stubEnv("ANTHROPIC_API_KEY", "");
     expect(hasClaudeKey()).toBe(false);
-    const session = new ClaudeSession(DEMO, REF, 5_000);
+    const session = new ClaudeSession(DEMO, REF, 5_000, ADDRESS);
     expect(() => claudeClient(session, "goal")).toThrow(ClaudeKeyMissing);
     session.close();
   });
@@ -194,5 +199,15 @@ describe("helpers", () => {
     expect(reply).toBe("Hi   bold mail [email removed] ok");
     expect(withoutEmails("send to evil@example.com now")).toBe("send to [email removed] now");
     expect(outboundProblem('{"text":"no address here"}')).toBeNull();
+  });
+
+  it("refuse and scrub a secret's value from 6 characters up, the one minimum both checks share", () => {
+    expect(MIN_SECRET_CHARS).toBe(6);
+    vi.stubEnv("RENDER_API_KEY", "k7Qz9w");
+    expect(outboundProblem('{"text":"use k7Qz9w"}')).toBe("secret");
+    expect(scrubbed("use k7Qz9w")).toBe("use [removed]");
+    vi.stubEnv("RENDER_API_KEY", "k7Qz9");
+    expect(outboundProblem('{"text":"use k7Qz9"}')).toBeNull();
+    expect(scrubbed("use k7Qz9")).toBe("use k7Qz9");
   });
 });

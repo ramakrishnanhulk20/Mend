@@ -40,6 +40,8 @@ const WORKSPACE_NAME = "My Workspace";
 const REPO_URL = "https://github.com/ramakrishnanhulk20/Mend";
 const BRANCH = "main";
 const REGION = "virginia";
+// The limited login role every service connects as; mend_engine.db.migrate creates it (C22).
+const APP_DB_ROLE = "mend_app";
 
 // Render renamed its plans without changing prices (render.com/docs/compute-plans), and the
 // API may report either name. The first name in each list is the one this script asks for.
@@ -537,8 +539,8 @@ function certifiPath() {
  * it writes. The database URL travels in the child's environment only. The rest of the
  * engine's settings come from the repo's .env, as for any local engine command.
  */
-function runEngineCommand(module, externalUrl, timeoutMs) {
-  const env = { ...process.env, DATABASE_URL: externalUrl, PGSSLMODE: "verify-full", PGSSLROOTCERT: certifiPath(), PYTHONUNBUFFERED: "1" };
+function runEngineCommand(module, externalUrl, timeoutMs, extraEnv = {}) {
+  const env = { ...process.env, ...extraEnv, DATABASE_URL: externalUrl, PGSSLMODE: "verify-full", PGSSLROOTCERT: certifiPath(), PYTHONUNBUFFERED: "1" };
   return new Promise((resolve, reject) => {
     const child = spawn(ENGINE_PYTHON, ["-m", module], { cwd: ENGINE_DIR, env, windowsHide: true });
     const lines = [];
@@ -573,20 +575,40 @@ async function publicTables(externalUrl) {
   return databaseRows(externalUrl, "select table_name from information_schema.tables where table_schema = 'public' order by 1").map((row) => row.table_name);
 }
 
-/** `up --migrate`: the engine's migrate command, then its seed command. Records what changed. */
-async function migrateAndSeed(externalUrl, changes) {
-  const before = await publicTables(externalUrl);
-  const migrated = await runEngineCommand("mend_engine.db.migrate", externalUrl, MIGRATE_TIMEOUT_MS);
+function appLoginWorks(appExternalUrl) {
+  try {
+    databaseRows(appExternalUrl, "select 1 as ok");
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * `up --migrate`: the engine's migrate command as mend-db's owner (the only step that is),
+ * then its seed command as mend_app. The password goes to migrate only when mend_app
+ * cannot already log in with it, so a repeat run leaves the role as it is. Records what changed.
+ */
+async function migrateAndSeed(connection, app, appPassword, changes) {
+  const before = await publicTables(connection.external);
+  const extra = appLoginWorks(app.external) ? {} : { MEND_APP_DB_PASSWORD: appPassword };
+  const migrated = await runEngineCommand("mend_engine.db.migrate", connection.external, MIGRATE_TIMEOUT_MS, extra);
   if (migrated.code !== 0) throw new DeployError(`python -m mend_engine.db.migrate exited ${migrated.code}`);
   const sha = migrated.lines.map((text) => /^schema sha256 ([0-9a-f]{64})$/.exec(text)?.[1]).find(Boolean) ?? null;
-  const created = (await publicTables(externalUrl)).filter((name) => !before.includes(name));
+  const role = migrated.lines.map((text) => /^app role mend_app: (created|password set|kept)$/.exec(text)?.[1]).find(Boolean) ?? null;
+  if (role === null) throw new DeployError("migrate did not report the mend_app role");
+  if (role !== "kept") {
+    changes.push(`app role ${APP_DB_ROLE} ${role}`);
+    say(`action: migrate ${role === "created" ? `created the ${APP_DB_ROLE} role` : `set the ${APP_DB_ROLE} role's password`}`);
+  }
+  const created = (await publicTables(connection.external)).filter((name) => !before.includes(name));
   if (created.length > 0) {
     changes.push(`created tables ${created.join(", ")}`);
     say(`action: migrate created ${created.length} tables on mend-db: ${created.join(", ")}`);
   } else {
     say("schema: migrate created no new tables");
   }
-  const seeded = await runEngineCommand("mend_engine.seed_demo", externalUrl, SEED_TIMEOUT_MS);
+  const seeded = await runEngineCommand("mend_engine.seed_demo", app.external, SEED_TIMEOUT_MS);
   if (seeded.code !== 0 || !seeded.lines.includes("SEED RESULT: PASS")) throw new DeployError(`python -m mend_engine.seed_demo exited ${seeded.code}`);
   const wrote = seeded.lines.filter(
     (text) => /^(orders: imported|refunds: imported|facts: stored|receiver: .*linked to one quiet regular|receiver: moved to rank 1)/.test(text) || /^members: .*\(([1-9][0-9]*) new\)/.test(text),
@@ -706,6 +728,7 @@ async function waitForExternalConnection(externalUrl) {
   }
 }
 
+/** mend-db's owner connection strings. Only the migrate command and this script's own checks use them; no service does. */
 async function connectionInfo(dbId) {
   const info = await renderOk("GET", `/postgres/${dbId}/connection-info`);
   for (const value of Object.values(info ?? {})) addSecret(value);
@@ -716,22 +739,63 @@ async function connectionInfo(dbId) {
   return { internal: info.internalConnectionString, external: info.externalConnectionString };
 }
 
-function engineSettings(connection) {
-  const env = { PAYPAL_ENV: "sandbox", PAYPAL_CLIENT_ID: settings.PAYPAL_CLIENT_ID, PAYPAL_CLIENT_SECRET: settings.PAYPAL_CLIENT_SECRET, DATABASE_URL: connection.internal };
+function databaseUser(text) {
+  try {
+    return decodeURIComponent(new URL(text).username);
+  } catch {
+    return "";
+  }
+}
+
+function databasePassword(text) {
+  try {
+    return decodeURIComponent(new URL(text).password);
+  } catch {
+    return "";
+  }
+}
+
+// The same host and database, compared after the same URL parser read both.
+function sameDatabase(a, b) {
+  try {
+    const left = new URL(a);
+    const right = new URL(b);
+    return left.host === right.host && left.pathname === right.pathname;
+  } catch {
+    return false;
+  }
+}
+
+/** The same database as connection, reached as the services' limited role (C22). */
+function appConnection(connection, password) {
+  const as = (text) => {
+    const url = new URL(text);
+    url.username = APP_DB_ROLE;
+    url.password = password;
+    return url.href;
+  };
+  const app = { internal: as(connection.internal), external: as(connection.external) };
+  addSecret(app.internal);
+  addSecret(app.external);
+  return app;
+}
+
+function engineSettings(app) {
+  const env = { PAYPAL_ENV: "sandbox", PAYPAL_CLIENT_ID: settings.PAYPAL_CLIENT_ID, PAYPAL_CLIENT_SECRET: settings.PAYPAL_CLIENT_SECRET, DATABASE_URL: app.internal };
   for (const key of CAP_KEYS) env[key] = settings[key];
   return env;
 }
 
 /** Every env var a service should carry. Values come from .env, Render or this run's generated secrets, never from this file. */
 function desiredEnv(spec, values) {
-  const { connection, engineToken, csrfSecret, engineUrl, webhookId, origin } = values;
+  const { app, engineToken, csrfSecret, engineUrl, webhookId, origin } = values;
   if (spec.key === "web") {
     const env = {
       ...spec.buildEnv,
       PAYPAL_ENV: "sandbox",
       PAYPAL_CLIENT_ID: settings.PAYPAL_CLIENT_ID,
       PAYPAL_CLIENT_SECRET: settings.PAYPAL_CLIENT_SECRET,
-      DATABASE_URL: connection.internal,
+      DATABASE_URL: app.internal,
       MEND_OWNER_PASSWORD: settings.MEND_OWNER_PASSWORD,
       MEND_CSRF_SECRET: csrfSecret,
       ANTHROPIC_API_KEY: settings.ANTHROPIC_API_KEY,
@@ -743,8 +807,8 @@ function desiredEnv(spec, values) {
     if (webhookId) env.PAYPAL_WEBHOOK_ID = webhookId;
     return env;
   }
-  if (spec.key === "engine") return { ...spec.buildEnv, ...engineSettings(connection), MEND_ENGINE_TOKEN: engineToken };
-  return { ...spec.buildEnv, ...engineSettings(connection) };
+  if (spec.key === "engine") return { ...spec.buildEnv, ...engineSettings(app), MEND_ENGINE_TOKEN: engineToken };
+  return { ...spec.buildEnv, ...engineSettings(app) };
 }
 
 function normalRepo(text) {
@@ -986,21 +1050,34 @@ function usable(value) {
 }
 
 /**
- * The two secrets this script generates, reused from Render when they are already there:
+ * The secrets this script generates, reused from Render when they are already there:
  * MEND_CSRF_SECRET from mend-web; MEND_ENGINE_TOKEN only when mend-web and mend-engine hold
- * the same usable value, otherwise a new one for both. Never printed or stored locally.
+ * the same usable value, otherwise a new one for both; MEND_APP_DB_PASSWORD from the
+ * mend_app password inside the services' DATABASE_URL, the only place it is kept. A new
+ * role password is made only with --migrate, because only migrate can set it on mend-db.
+ * Never printed or stored locally.
  */
-async function generatedSecrets(webId, engineId) {
+async function generatedSecrets(webId, engineId, jobsId) {
   const web = webId === null ? {} : await serviceEnv(webId);
   const engine = engineId === null ? {} : await serviceEnv(engineId);
+  const jobs = jobsId === null ? {} : await serviceEnv(jobsId);
   const csrfSecret = usable(web.MEND_CSRF_SECRET) ? web.MEND_CSRF_SECRET : newSecret();
   const shared = usable(web.MEND_ENGINE_TOKEN) && web.MEND_ENGINE_TOKEN === engine.MEND_ENGINE_TOKEN;
   const engineToken = shared ? web.MEND_ENGINE_TOKEN : newSecret();
-  addSecret(csrfSecret);
-  addSecret(engineToken);
+  const kept = [engine, web, jobs]
+    .map((env) => env.DATABASE_URL)
+    .filter((text) => typeof text === "string" && databaseUser(text) === APP_DB_ROLE)
+    .map(databasePassword)
+    .find(usable);
+  if (kept === undefined && !options.migrate) {
+    throw new DeployError(`the services do not use the ${APP_DB_ROLE} role yet; run \`up --migrate\` once so migrate can create it`);
+  }
+  const appPassword = kept ?? newSecret();
+  for (const value of [csrfSecret, engineToken, appPassword]) addSecret(value);
   if (!usable(web.MEND_CSRF_SECRET)) say("secret: generated a new MEND_CSRF_SECRET (48 random bytes) for mend-web");
   if (!shared) say("secret: generated a new MEND_ENGINE_TOKEN (48 random bytes) for mend-web and mend-engine");
-  return { csrfSecret, engineToken };
+  if (kept === undefined) say(`secret: generated a new MEND_APP_DB_PASSWORD (48 random bytes) for the ${APP_DB_ROLE} role`);
+  return { csrfSecret, engineToken, appPassword };
 }
 
 // Saved before a redeploy starts and cleared once it is live, so a run that dies in between
@@ -1041,6 +1118,7 @@ function stateFor(workspace, db, services, origin, engineUrl, webhook, schemaSha
       postgres: db.version,
       diskSizeGB: db.diskSizeGB,
       schemaSha256,
+      servicesConnectAs: APP_DB_ROLE,
       dashboardUrl: db.dashboardUrl,
     },
     services: {
@@ -1066,17 +1144,20 @@ async function up() {
   const db = await ensureExternalAccess(found, changes);
   const connection = await connectionInfo(db.id);
   await waitForExternalConnection(connection.external);
-  let schemaSha256 = previous.database?.schemaSha256 ?? null;
-  if (options.migrate) {
-    schemaSha256 = (await migrateAndSeed(connection.external, changes)) ?? schemaSha256;
-  } else {
-    say("database: left as it is (pass --migrate to apply schema.sql and seed the demo shop)");
-  }
 
   const existingWeb = await findService(workspace.id, SERVICES.web);
   const existingEngine = await findService(workspace.id, SERVICES.engine);
-  const { csrfSecret, engineToken } = await generatedSecrets(existingWeb?.id ?? null, existingEngine?.id ?? null);
-  const values = { connection, engineToken, csrfSecret, engineUrl: null, webhookId: null, origin: null };
+  const existingJobs = await findService(workspace.id, SERVICES.jobs);
+  const { csrfSecret, engineToken, appPassword } = await generatedSecrets(existingWeb?.id ?? null, existingEngine?.id ?? null, existingJobs?.id ?? null);
+  const app = appConnection(connection, appPassword);
+  const values = { app, engineToken, csrfSecret, engineUrl: null, webhookId: null, origin: null };
+
+  let schemaSha256 = previous.database?.schemaSha256 ?? null;
+  if (options.migrate) {
+    schemaSha256 = (await migrateAndSeed(connection, app, appPassword, changes)) ?? schemaSha256;
+  } else {
+    say("database: left as it is (pass --migrate to apply schema.sql and the mend_app role, and seed the demo shop)");
+  }
 
   const engine = await ensureService(workspace.id, SERVICES.engine, desiredEnv(SERVICES.engine, values), changes);
   await ensureLive(SERVICES.engine, engine.service.id, engine.deployId, changes);
@@ -1115,6 +1196,8 @@ const LOG_WAIT_MS = 2 * 60 * 1000;
 // A delivery counts as handled by mend-engine when its outcome follows its arrival this
 // closely: the cron job runs every 5 minutes, so it could not have been the cron.
 const PROMPT_PROCESSING_MS = 90 * 1000;
+const CANCEL_WAIT_MS = 3 * 60 * 1000;
+const RESULTS_POLL_MS = 15_000;
 // Shapes of a PayPal access token and an Anthropic key, so a token or key a service fetched
 // or holds is caught even when this script never saw that exact value.
 // The character class keeps the pre-commit secret check from reading this pattern as a key.
@@ -1238,6 +1321,72 @@ async function otherPaidResources(ownerId, ours) {
   return paid;
 }
 
+// What one campaign adds to the demo pool under the engine's own rule (campaigns.spend: an
+// item PayPal sent back stops counting), so other visitors' campaigns cannot move the number.
+const CAMPAIGN_COUNTED_SCRIPT = `
+import os, sys, certifi, psycopg
+from mend_engine.campaigns.spend import ITEM_CAME_BACK_SQL, MONEY_BACK_STATUSES
+with psycopg.connect(os.environ["MEND_D1_DATABASE_URL"], sslmode="verify-full", sslrootcert=certifi.where(), connect_timeout=15, autocommit=True) as conn:
+    row = conn.execute(
+        "select coalesce(sum((item ->> 'amount_minor')::bigint), 0) from approved_snapshots s "
+        "cross join lateral jsonb_array_elements(s.canonical_json::jsonb -> 'items') item "
+        "where s.campaign_id = %s::uuid and not " + ITEM_CAME_BACK_SQL,
+        (sys.argv[1], list(MONEY_BACK_STATUSES)),
+    ).fetchone()
+    print(row[0])
+`;
+
+// Each attempt runs in a transaction that is always rolled back, so even a privilege that
+// were wrongly granted could not change mend-db during the proof.
+const ROLE_PROBE_SCRIPT = `
+import json, os, certifi, psycopg
+attempts = [
+    ("disable_trigger", "alter table audit_log disable trigger audit_log_append_only"),
+    ("update_audit_log", "update audit_log set actor = actor where false"),
+    ("create_table", "create table mend_role_probe (id integer)"),
+    ("select", "select count(*) from audit_log"),
+]
+out = {}
+with psycopg.connect(os.environ["MEND_D1_DATABASE_URL"], sslmode="verify-full", sslrootcert=certifi.where(), connect_timeout=15, autocommit=True) as conn:
+    out["user"] = conn.execute("select current_user").fetchone()[0]
+    for name, statement in attempts:
+        try:
+            with conn.transaction(force_rollback=True):
+                conn.execute(statement)
+            out[name] = "ok"
+        except psycopg.Error as error:
+            out[name] = error.sqlstate or type(error).__name__
+print(json.dumps(out))
+`;
+const INSUFFICIENT_PRIVILEGE = "42501";
+const CAMPAIGN_UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+
+function engineScript(script, args, externalUrl, what) {
+  const result = spawnSync(ENGINE_PYTHON, ["-c", script, ...args], {
+    cwd: ENGINE_DIR,
+    env: { ...process.env, MEND_D1_DATABASE_URL: externalUrl },
+    encoding: "utf8",
+    timeout: 90_000,
+    windowsHide: true,
+  });
+  const last = result.stdout.trim().split(/\r?\n/).pop() ?? "";
+  if (result.status !== 0 || last === "") {
+    throw new ProofFailed(`could not read ${what} (exit ${result.status}: ${result.stderr.trim().split(/\r?\n/).pop() ?? ""})`);
+  }
+  return last;
+}
+
+function campaignCountedMinor(externalUrl, campaignId) {
+  if (!CAMPAIGN_UUID.test(campaignId)) throw new ProofFailed("a campaign id of an unexpected shape");
+  const value = engineScript(CAMPAIGN_COUNTED_SCRIPT, [campaignId], externalUrl, "the campaign's demo pool count");
+  if (!/^[0-9]+$/.test(value)) throw new ProofFailed("the campaign's demo pool count is not a whole number");
+  return Number(value);
+}
+
+function roleProbe(externalUrl) {
+  return JSON.parse(engineScript(ROLE_PROBE_SCRIPT, [], externalUrl, "what mend_app may do"));
+}
+
 /** One visitor's browser: a cookie jar, the CSRF token its pages hold, and the same-origin header a browser sends. */
 class Browser {
   constructor(origin) {
@@ -1330,9 +1479,15 @@ async function prove() {
   const engineUrl = engineAddress(services.engine);
   const webhookUrl = webhookUrlFor(origin);
   const connection = await connectionInfo(db.id);
-  const rows = (sql, params = []) => databaseRows(connection.external, sql, params);
   const envs = {};
   for (const key of Object.keys(SERVICES)) envs[key] = await serviceEnv(services[key].id);
+  // The proof reads mend-db with the services' own credentials, over the external host.
+  const appPassword = databasePassword(envs.engine.DATABASE_URL ?? "");
+  if (databaseUser(envs.engine.DATABASE_URL ?? "") !== APP_DB_ROLE || !usable(appPassword)) {
+    throw new DeployError(`mend-engine does not connect as ${APP_DB_ROLE}; run \`up --migrate\` first`);
+  }
+  const app = appConnection(connection, appPassword);
+  const rows = (sql, params = []) => databaseRows(app.external, sql, params);
 
   await check("health", async () => {
     const url = new URL(SERVICES.web.healthCheckPath, origin);
@@ -1369,7 +1524,10 @@ async function prove() {
       const forbidden = spec.forbidden.filter((key) => key in env);
       if (forbidden.length > 0) problems.push(`${spec.name} carries ${forbidden.join(", ")}`);
       if (env.PAYPAL_ENV !== "sandbox") problems.push(`${spec.name} PAYPAL_ENV is not sandbox`);
-      if (env.DATABASE_URL !== connection.internal) problems.push(`${spec.name} DATABASE_URL is not mend-db's internal address`);
+      if (databaseUser(env.DATABASE_URL) === databaseUser(connection.internal)) problems.push(`${spec.name} DATABASE_URL uses mend-db's owner role`);
+      if (env.DATABASE_URL !== app.internal || !sameDatabase(env.DATABASE_URL, connection.internal)) {
+        problems.push(`${spec.name} DATABASE_URL is not mend-db's internal address as ${APP_DB_ROLE}`);
+      }
     }
     if (envs.web.MEND_ENGINE_TOKEN !== envs.engine.MEND_ENGINE_TOKEN) problems.push("mend-web and mend-engine hold different engine tokens");
     if (envs.web.MEND_ENGINE_URL !== engineUrl) problems.push("MEND_ENGINE_URL is not mend-engine's reported address");
@@ -1378,13 +1536,22 @@ async function prove() {
     if (hooks.length !== 1 || hooks[0].id !== envs.web.PAYPAL_WEBHOOK_ID) problems.push("PAYPAL_WEBHOOK_ID is not the one PayPal webhook for the live URL");
     line(
       problems.length === 0,
-      `env: all three services hold exactly what they need, PAYPAL_ENV sandbox everywhere, one engine token shared by mend-web and mend-engine only${problems.length ? ` (${problems.join("; ")})` : ""}`,
+      `env: all three services hold exactly what they need, PAYPAL_ENV sandbox everywhere, one engine token shared by mend-web and mend-engine only, every DATABASE_URL as ${APP_DB_ROLE} and none as mend-db's owner${problems.length ? ` (${problems.join("; ")})` : ""}`,
     );
   });
 
   await check("render key", async () => {
     const holders = Object.values(SERVICES).filter((spec) => "RENDER_API_KEY" in envs[spec.key] || Object.values(envs[spec.key]).includes(settings.RENDER_API_KEY));
     line(holders.length === 0, `render key: no service holds RENDER_API_KEY, under that name or any other${holders.length ? ` (found on ${holders.map((spec) => spec.name).join(", ")})` : ""}`);
+  });
+
+  await check("database role", async () => {
+    const tried = roleProbe(app.external);
+    const refused = (name) => tried[name] === INSUFFICIENT_PRIVILEGE;
+    line(
+      tried.user === APP_DB_ROLE && refused("disable_trigger") && refused("update_audit_log") && refused("create_table") && tried.select === "ok",
+      `database role: connected as ${tried.user} with the services' credentials, ALTER TABLE audit_log DISABLE TRIGGER, UPDATE audit_log and CREATE TABLE are refused (SQLSTATE ${tried.disable_trigger}, ${tried.update_audit_log}, ${tried.create_table}) and a SELECT works (${tried.select})`,
+    );
   });
 
   await check("private", async () => {
@@ -1521,6 +1688,53 @@ async function prove() {
       `delivery: PayPal's ${event.event_type} for batch ${journey.batchId} reached mend-web, was verified and stored once; mend-engine ran process_events ${Math.round((event.processed_ms - event.received_ms) / 1000)} s after it arrived (outcome ${event.outcome}); the test receiver's item ${item.payout_item_id} is SUCCESS ${seconds} s after submit`,
     );
     return { event, headers: stored.delivery, item };
+  });
+
+  const pool = { before: null, after: null };
+  await check("cancel", async () => {
+    if (journey === null || delivered === null) throw new ProofFailed("skipped, no campaign reached the receiver");
+    const cancelUrl = `/api/campaigns/${journey.campaignId}/cancel-unclaimed`;
+    const resultsUrl = `/api/campaigns/${journey.campaignId}/results`;
+    const others = DEMO_PLAN.rewarded - 1;
+    const othersMinor = others * DEMO_PLAN.perRecipientMinor;
+    const first = await journey.browser.settle(await journey.browser.send("GET", resultsUrl));
+    const shown = first.body.payouts ?? {};
+    const counted = Object.values(shown.byStatus ?? {}).reduce((sum, n) => sum + n, 0);
+    const firstOk =
+      first.status === 200 &&
+      shown.items === DEMO_PLAN.rewarded &&
+      shown.claimedMinor === DEMO_PLAN.perRecipientMinor &&
+      shown.unclaimedMinor + shown.pendingMinor === othersMinor &&
+      counted === DEMO_PLAN.rewarded;
+    if (!firstOk) throw new ProofFailed(`results before the cancel showed ${JSON.stringify(shown)} (answer ${first.status})`);
+    // The @shop.example receivers are not PayPal accounts, so PayPal marks their items UNCLAIMED, usually within a minute.
+    const waiting = await waitFor(`PayPal reporting the ${others} other items UNCLAIMED`, CANCEL_WAIT_MS, RESULTS_POLL_MS, async () => {
+      const polled = await journey.browser.settle(await journey.browser.send("GET", resultsUrl));
+      return polled.body.payouts?.byStatus?.UNCLAIMED === others ? polled.body.payouts : null;
+    });
+    pool.before = campaignCountedMinor(app.external, journey.campaignId);
+    const cancelled = await journey.browser.settle(await journey.browser.send("POST", cancelUrl));
+    pool.after = campaignCountedMinor(app.external, journey.campaignId);
+    const after = (await journey.browser.settle(await journey.browser.send("GET", resultsUrl))).body.payouts ?? {};
+    line(
+      cancelled.status === 200 &&
+        cancelled.body.cancelled === others &&
+        cancelled.body.returnedMinor === othersMinor &&
+        cancelled.body.stillUnclaimed === 0 &&
+        cancelled.body.notCancellable === 0 &&
+        after.returnedMinor === othersMinor &&
+        after.unclaimedMinor === 0 &&
+        after.claimedMinor === DEMO_PLAN.perRecipientMinor,
+      `cancel: results showed ${shown.items} items, ${shown.claimedMinor} cents claimed by the test receiver and ${othersMinor} unclaimed or pending; once PayPal held ${waiting.byStatus.UNCLAIMED} UNCLAIMED, the demo visitor's cancel-unclaimed answered cancelled ${String(cancelled.body.cancelled)}, returnedMinor ${String(cancelled.body.returnedMinor)}, stillUnclaimed ${String(cancelled.body.stillUnclaimed)}, notCancellable ${String(cancelled.body.notCancellable)}; results now show returnedMinor ${String(after.returnedMinor)}, unclaimedMinor ${String(after.unclaimedMinor)}, claimedMinor ${String(after.claimedMinor)}`,
+    );
+  });
+
+  await check("demo pool", async () => {
+    if (pool.before === null || pool.after === null) throw new ProofFailed("skipped, the cancel did not run");
+    line(
+      pool.after === DEMO_PLAN.perRecipientMinor,
+      `demo pool: under the engine's own rule this campaign counted ${pool.before} cents toward the demo pool before the cancel and ${pool.after} after, only the ${DEMO_PLAN.perRecipientMinor} that left`,
+    );
   });
 
   await check("forgery", async () => {

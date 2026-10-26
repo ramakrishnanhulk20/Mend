@@ -9,11 +9,11 @@
 
 Run from the repo root:
 - `node scripts/deploy/render.mjs status` reads only and prints what exists.
-- `node scripts/deploy/render.mjs up --migrate` finds or creates everything, runs the engine's migrate and seed commands against mend-db, sets every env var and redeploys only what changed. Plain `up` does the same but never touches mend-db. A second run changes nothing.
-- `node scripts/deploy/render.mjs prove` runs the live proof: a demo visitor plans, notes, approves and submits a campaign (at most 1.00 USD of sandbox money); the webhook, mend-engine and the results are checked; plus a simulated return, the AI agent, the jobs and a secrets sweep. It ends `D2 RESULT: PASS` or `FAIL`.
+- `node scripts/deploy/render.mjs up --migrate` finds or creates everything, runs the engine's migrate (as mend-db's owner) and seed (as `mend_app`) commands against mend-db, sets every env var and redeploys only what changed. Plain `up` does the same but never touches mend-db. A second run changes nothing.
+- `node scripts/deploy/render.mjs prove` runs the live proof: a demo visitor plans, notes, approves and submits a campaign (at most 10.00 USD of sandbox money); the webhook, mend-engine and the results are checked; the 4 unclaimed rewards are cancelled back to the shop and the campaign must then count only its 200 claimed cents toward the demo pool; `mend_app` is refused a trigger change, an audit-log update and a new table; plus a simulated return, the AI agent, the jobs and a secrets sweep. It ends `D2 RESULT: PASS` or `FAIL`.
 
-`.env` keys it reads: `RENDER_API_KEY`, `PAYPAL_CLIENT_ID`, `PAYPAL_CLIENT_SECRET`, `PAYPAL_ENV` (must be `sandbox`), the three `MEND_*_CAP_MINOR` caps, `MEND_OWNER_PASSWORD`, `ANTHROPIC_API_KEY` and `MEND_TEST_RECEIVER`. No service is given `RENDER_API_KEY`. `MEND_CSRF_SECRET` and `MEND_ENGINE_TOKEN` are generated once and live only in Render.
+`.env` keys it reads: `RENDER_API_KEY`, `PAYPAL_CLIENT_ID`, `PAYPAL_CLIENT_SECRET`, `PAYPAL_ENV` (must be `sandbox`), the three `MEND_*_CAP_MINOR` caps, `MEND_OWNER_PASSWORD`, `ANTHROPIC_API_KEY` and `MEND_TEST_RECEIVER`. No service is given `RENDER_API_KEY`. `MEND_CSRF_SECRET`, `MEND_ENGINE_TOKEN` and `MEND_APP_DB_PASSWORD` are generated once and live only in Render.
 
-Migrate, seed and the proof reach mend-db from this machine through the engine's virtual environment (`packages/engine/.venv`) over TLS, so `up` allows this machine's public IPv4 address, and only that address, on the database.
+Every service connects as `mend_app`, a login role migrate creates that may read and write rows but only add to `audit_log`, and can never change the schema or a trigger; mend-db's owner URL is never set on a service. Migrate, seed and the proof reach mend-db from this machine through the engine's virtual environment (`packages/engine/.venv`) over TLS, so `up` allows this machine's public IPv4 address, and only that address, on the database.
 
 `render-state.json` holds ids and addresses, never secrets. Request bodies follow Render's OpenAPI file, https://api-docs.render.com/openapi/render-public-api-1.json, and https://render.com/docs/private-network.

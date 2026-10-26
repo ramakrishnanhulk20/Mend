@@ -29,6 +29,9 @@ create table if not exists audit_log (
     detail jsonb not null
 );
 
+-- Reconcile looks its earlier audit rows up by action.
+create index if not exists audit_log_action_at on audit_log (action, at);
+
 -- The demo shop's own order records, imported from UCI Online Retail II (M2).
 -- Identities are synthetic (C25); descriptions are source text kept as data (C11).
 create table if not exists shop_customers (

@@ -307,6 +307,48 @@ describe("the agent's tools", () => {
     expect(answer.status).toBe("awaiting_approval");
     expect(tasks()).toEqual(["request_approval"]);
   });
+
+  it("report the payout states with the results: claimed, unclaimed, returned and when unclaimed money returns", async () => {
+    const arm = { members: 10, real_returns: 0, real_rate: 0, simulated_returns: 1 };
+    state.engine.results = () => ({
+      ok: true,
+      campaign_id: CAMPAIGN,
+      status: "submitted",
+      rewarded: arm,
+      holdout: arm,
+      spend_minor: 30,
+      fees_minor: 25,
+      window_starts_at: "2026-10-24T05:00:00+00:00",
+      window_ends_at: "2026-11-23T05:00:00+00:00",
+      window_open: true,
+      p_value: 0.5,
+      verdict: "too early to tell",
+      payouts: {
+        items: 3,
+        by_status: { SUCCESS: 1, UNCLAIMED: 1, RETURNED: 1 },
+        claimed_minor: 10,
+        unclaimed_minor: 10,
+        returned_minor: 10,
+        failed_minor: 0,
+        pending_minor: 0,
+        unclaimed_return_by: "2026-11-23T05:00:00+00:00",
+      },
+    });
+    const current = turn("demo");
+    const shown = JSON.parse(String(await tool(agentTools(current), "campaign_results")({ campaignId: CAMPAIGN }))) as Record<string, unknown>;
+    current.session.close();
+    expect(shown.payouts).toEqual({
+      items: 3,
+      byStatus: { SUCCESS: 1, UNCLAIMED: 1, RETURNED: 1 },
+      claimedMinor: 10,
+      unclaimedMinor: 10,
+      returnedMinor: 10,
+      failedMinor: 0,
+      pendingMinor: 0,
+      unclaimedReturnBy: "2026-11-23T05:00:00+00:00",
+    });
+    expect(state.engineCalls).toEqual([{ task: "results", args: [CAMPAIGN, { role: "demo", session: OWNER.sessionId }] }]);
+  });
 });
 
 describe("runAgent", () => {

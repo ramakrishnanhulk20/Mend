@@ -110,7 +110,45 @@ const BENCHMARK = z.strictObject({
   computedAt: time,
 });
 
-const CUTOFF_ANSWER = z.strictObject({ cutoff: day, customers: count, converged: z.boolean(), auc_model: share.nullable(), auc_recency: share });
+// Any upper-case word, not a list of PayPal's item statuses: a list here would turn a
+// status PayPal adds later into a broken results page instead of one more count.
+const statusCounts = z.record(z.string().regex(/^[A-Z][A-Z_]{0,31}$/), count).refine((counts) => Object.keys(counts).length <= 20);
+
+const PAYOUTS_ANSWER = z.strictObject({
+  items: count,
+  by_status: statusCounts,
+  claimed_minor: cents,
+  unclaimed_minor: cents,
+  returned_minor: cents,
+  failed_minor: cents,
+  pending_minor: cents,
+  unclaimed_return_by: time.nullable(),
+});
+const PAYOUTS = z.strictObject({
+  items: count,
+  byStatus: statusCounts,
+  claimedMinor: cents,
+  unclaimedMinor: cents,
+  returnedMinor: cents,
+  failedMinor: cents,
+  pendingMinor: cents,
+  unclaimedReturnBy: time.nullable(),
+});
+
+function payouts(answer: z.output<typeof PAYOUTS_ANSWER>): z.input<typeof PAYOUTS> {
+  return {
+    items: answer.items,
+    byStatus: answer.by_status,
+    claimedMinor: answer.claimed_minor,
+    unclaimedMinor: answer.unclaimed_minor,
+    returnedMinor: answer.returned_minor,
+    failedMinor: answer.failed_minor,
+    pendingMinor: answer.pending_minor,
+    unclaimedReturnBy: answer.unclaimed_return_by,
+  };
+}
+
+const CUTOFF_ANSWER =z.strictObject({ cutoff: day, customers: count, converged: z.boolean(), auc_model: share.nullable(), auc_recency: share });
 const CUTOFF = z.strictObject({ cutoff: day, customers: count, converged: z.boolean(), aucModel: share.nullable(), aucRecency: share });
 const DECILE_ANSWER = z.strictObject({ decile: z.number().int().min(1).max(10), customers: count, returned_share: share });
 const DECILE = z.strictObject({ decile: z.number().int().min(1).max(10), customers: count, returnedShare: share });
@@ -250,6 +288,7 @@ const SPECS: Readonly<Record<TaskName, Spec>> = {
       window_open: z.boolean(),
       p_value: share.nullable(),
       verdict: z.string().min(1).max(200),
+      payouts: PAYOUTS_ANSWER,
     }),
     (a) => ({
       campaignId: a.campaign_id,
@@ -263,6 +302,7 @@ const SPECS: Readonly<Record<TaskName, Spec>> = {
       windowOpen: a.window_open,
       pValue: a.p_value,
       verdict: a.verdict,
+      payouts: payouts(a.payouts),
     }),
     z.strictObject({
       campaignId,
@@ -276,6 +316,7 @@ const SPECS: Readonly<Record<TaskName, Spec>> = {
       windowOpen: z.boolean(),
       pValue: share.nullable(),
       verdict: z.string().min(1).max(200),
+      payouts: PAYOUTS,
     }),
   ),
   shop_summary: spec(
@@ -441,6 +482,12 @@ const SPECS: Readonly<Record<TaskName, Spec>> = {
     z.strictObject({ ok: z.literal(true), left: z.boolean(), voided: count }),
     () => ({ outcome: "left" as const }),
     z.strictObject({ outcome: z.literal("left") }),
+  ),
+  cancel_unclaimed: spec(
+    200,
+    z.strictObject({ ok: z.literal(true), campaign_id: campaignId, cancelled: count, returned_minor: cents, still_unclaimed: count, not_cancellable: count }),
+    (a) => ({ campaignId: a.campaign_id, cancelled: a.cancelled, returnedMinor: a.returned_minor, stillUnclaimed: a.still_unclaimed, notCancellable: a.not_cancellable }),
+    z.strictObject({ campaignId, cancelled: count, returnedMinor: cents, stillUnclaimed: count, notCancellable: count }),
   ),
 };
 

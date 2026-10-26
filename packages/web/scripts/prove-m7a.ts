@@ -457,7 +457,7 @@ async function main(): Promise<void> {
       demoDenied.every((result) => !result.ok && result.status === 403) &&
       ownerAllowed.every((result) => result.ok) &&
       !unknownLive.ok &&
-      ACTIONS.length === 20,
+      ACTIONS.length === 21,
     "permissions: every action not in the table is denied; demo is denied admin.events, admin.reconcile and admin.purge",
   );
 

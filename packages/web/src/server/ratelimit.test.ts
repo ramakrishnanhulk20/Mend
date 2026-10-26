@@ -187,6 +187,14 @@ describe("takeHit", () => {
     expect(await hits("join_consent", "198.51.100.7")).toBe(60);
   });
 
+  it("lets a session pull back unclaimed rewards 10 times an hour, counted apart from its submits", async () => {
+    for (let n = 0; n < 10; n += 1) expect((await takeHit(LIMITS.cancelUnclaimed, "a-session")).allowed).toBe(true);
+    const refused = await takeHit(LIMITS.cancelUnclaimed, "a-session");
+    expect(!refused.allowed && refused.retryAfterSeconds <= 3600).toBe(true);
+    expect((await takeHit(LIMITS.submit, "a-session")).allowed).toBe(true);
+    expect((await takeHit(LIMITS.cancelUnclaimed, "another-session")).allowed).toBe(true);
+  });
+
   it("sweeps out rows older than every window", async () => {
     await admin.query("insert into rate_limit_hits (bucket, subject, at) values ('draft', 'old', now() - interval '25 hours')");
     await takeHit(LIMITS.draft, "a-session");

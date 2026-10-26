@@ -159,6 +159,16 @@ const RESULTS = z.object({
   windowOpen: z.boolean(),
   pValue: z.number().nullable(),
   verdict: z.string(),
+  payouts: z.object({
+    items: z.number(),
+    byStatus: z.record(z.string(), z.number()),
+    claimedMinor: z.number(),
+    unclaimedMinor: z.number(),
+    returnedMinor: z.number(),
+    failedMinor: z.number(),
+    pendingMinor: z.number(),
+    unclaimedReturnBy: z.string().nullable(),
+  }),
 });
 
 const PAYPAL_REFUSALS: Readonly<Record<RefusedReason | FailedReason | "host_refused", string>> = {
@@ -336,7 +346,7 @@ export function agentTools(turn: Turn): AgentTool[] {
       name: "campaign_results",
       action: "campaign.results",
       description:
-        "Call when the owner asks whether a sent campaign worked: how many rewarded and held-back customers came back, what it cost, and whether the difference is real. Money is in US cents.",
+        "Call when the owner asks whether a sent campaign worked: how many rewarded and held-back customers came back, what it cost, whether the difference is real, and how much reward money was claimed, is still unclaimed or came back to the shop, with the date unclaimed money returns on its own. Money is in US cents.",
       input: z.strictObject({ campaignId: CAMPAIGN_ID }),
       run: async ({ campaignId }) => RESULTS.parse(await answered("results", [campaignId, actor])),
     }),

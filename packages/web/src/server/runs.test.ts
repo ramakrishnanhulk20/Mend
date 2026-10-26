@@ -207,6 +207,16 @@ describe("finished runs become each route's own response", () => {
       window_open: true,
       p_value: 0.5,
       verdict: "too early to tell",
+      payouts: {
+        items: 2,
+        by_status: { SUCCESS: 1, UNCLAIMED: 1 },
+        claimed_minor: 5,
+        unclaimed_minor: 5,
+        returned_minor: 0,
+        failed_minor: 0,
+        pending_minor: 0,
+        unclaimed_return_by: "2026-11-23T05:00:00+00:00",
+      },
     });
     expect(await results.json()).toMatchObject({ rewarded: { members: 10, realReturns: 0, realRate: 0, simulatedReturns: 1 }, holdout: { simulatedReturns: 0 }, verdict: "too early to tell" });
   });

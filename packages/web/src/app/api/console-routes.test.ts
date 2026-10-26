@@ -1,9 +1,11 @@
 // Covers the M7b console routes as handlers: CSRF on every POST, the permission table
 // on every route (demo refused on the admin jobs), input checks, the 409 on approval
-// conflicts, the public summary's cache, and runs answering only the session that
-// started them. Sessions live in a throwaway Postgres schema; the engine is a fake dev
-// bridge on 127.0.0.1. Does NOT cover: the real engine or PayPal (npm run prove:m7b
-// drives these routes against both), Next.js routing itself, or Render's run API.
+// conflicts, the public summary's cache, runs answering only the session that started
+// them, and pulling back unclaimed rewards with the payout states in results. Sessions
+// live in a throwaway Postgres schema; the engine is a fake dev bridge on 127.0.0.1.
+// Does NOT cover: the real engine or PayPal (npm run prove:m7b drives the M7b routes
+// against both; which campaigns a cancel may touch is the engine's own tests), Next.js
+// routing itself, or Render's run API.
 import { spawn } from "node:child_process";
 import { once } from "node:events";
 import { readFileSync } from "node:fs";
@@ -59,6 +61,16 @@ const CAMPAIGN = "0b6c2f8e-6a4e-4c1b-9d2a-7e5f1a3b9c4d";
 const ENGINE_REF = "6f1c1d3e-2b9a-4f0e-9a51-3c1d2e4f5a6b";
 const HASH = "e".repeat(64);
 const ARM = { members: 10, real_returns: 0, real_rate: 0, simulated_returns: 1 };
+const PAYOUTS = {
+  items: 3,
+  by_status: { SUCCESS: 1, UNCLAIMED: 1, RETURNED: 1 },
+  claimed_minor: 10,
+  unclaimed_minor: 10,
+  returned_minor: 10,
+  failed_minor: 0,
+  pending_minor: 0,
+  unclaimed_return_by: "2026-11-23T05:00:00+00:00",
+};
 const ANSWERS: Record<string, unknown> = {
   approve_campaign: { ok: true, campaign_id: CAMPAIGN, snapshot_hash: HASH, approved_at: "2026-10-24T05:00:00.123456+00:00" },
   submit_campaign: { ok: true, campaign_id: CAMPAIGN, status: "submitted", sent: true, payout_batch_id: "BATCH1" },
@@ -76,7 +88,9 @@ const ANSWERS: Record<string, unknown> = {
     window_open: true,
     p_value: 0.5,
     verdict: "too early to tell",
+    payouts: PAYOUTS,
   },
+  cancel_unclaimed: { ok: true, campaign_id: CAMPAIGN, cancelled: 2, returned_minor: 20, still_unclaimed: 0, not_cancellable: 1 },
   shop_summary: {
     ok: true,
     as_of: "2026-10-16",
@@ -376,5 +390,114 @@ describe("runs", () => {
     expect(await json(polled)).toEqual(await json(direct));
     const { rows } = await admin.query("select task, session_id_hash from run_owners where run_id = $1", [runId]);
     expect(rows).toEqual([{ task: "results", session_id_hash: mine.sessionId }]);
+  });
+});
+
+describe("pulling back unclaimed rewards, and the payout states in results", () => {
+  const CANCELLED = { campaignId: CAMPAIGN, cancelled: 2, returnedMinor: 20, stillUnclaimed: 0, notCancellable: 1 };
+
+  it("lets the owner pull back unclaimed rewards, sending only the id and the actor", async () => {
+    const { POST } = await import("./campaigns/[id]/cancel-unclaimed/route");
+    const owner = await createSession("owner");
+    const response = await POST(request("POST", "/x", { session: owner }), params({ id: CAMPAIGN }));
+    expect(response.status).toBe(200);
+    expect(await json(response)).toEqual(CANCELLED);
+    expect(bridge.seen).toEqual([{ task: "cancel_unclaimed", args: [CAMPAIGN, { role: "owner", session: owner.sessionId }] }]);
+  });
+
+  it("lets a demo visitor pull back its own campaign's unclaimed rewards", async () => {
+    const { POST } = await import("./campaigns/[id]/cancel-unclaimed/route");
+    const demo = await createSession("demo");
+    const response = await POST(request("POST", "/x", { session: demo }), params({ id: CAMPAIGN }));
+    expect(response.status).toBe(200);
+    expect(await json(response)).toEqual(CANCELLED);
+    expect(bridge.seen).toEqual([{ task: "cancel_unclaimed", args: [CAMPAIGN, { role: "demo", session: demo.sessionId }] }]);
+  });
+
+  it("refuses a demo visitor another session's campaign with the same 404 submit gives", async () => {
+    const submit = await import("./campaigns/[id]/submit/route");
+    const cancel = await import("./campaigns/[id]/cancel-unclaimed/route");
+    bridge.overrides.submit_campaign = { ok: false, error: "not_found", ref: ENGINE_REF };
+    bridge.overrides.cancel_unclaimed = { ok: false, error: "not_found", ref: ENGINE_REF };
+    const demo = await createSession("demo");
+    const viaSubmit = await submit.POST(request("POST", "/x", { session: demo }), params({ id: CAMPAIGN }));
+    const viaCancel = await cancel.POST(request("POST", "/x", { session: demo }), params({ id: CAMPAIGN }));
+    expect([viaSubmit.status, viaCancel.status]).toEqual([404, 404]);
+    expect(await json(viaCancel)).toEqual(await json(viaSubmit));
+    expect(bridge.seen.at(-1)).toEqual({ task: "cancel_unclaimed", args: [CAMPAIGN, { role: "demo", session: demo.sessionId }] });
+  });
+
+  it("refuses a missing CSRF token, a foreign origin and another session's token before the engine is asked", async () => {
+    const { POST } = await import("./campaigns/[id]/cancel-unclaimed/route");
+    const owner = await createSession("owner");
+    const other = await createSession("owner");
+    for (const options of [{ csrf: null }, { origin: "https://evil.example" }, { origin: null }, { csrf: csrfTokenForSession(other.sessionId) }]) {
+      const response = await POST(request("POST", "/x", { session: owner, ...options }), params({ id: CAMPAIGN }));
+      expect(response.status, JSON.stringify(options)).toBe(403);
+      expect((await json(response)).error).toBe("csrf_refused");
+    }
+    expect(bridge.seen).toEqual([]);
+  });
+
+  it("answers 409 not_submitted for a campaign never sent, and a polled run answers the same", async () => {
+    const cancel = await import("./campaigns/[id]/cancel-unclaimed/route");
+    const runs = await import("./runs/[runId]/route");
+    bridge.overrides.cancel_unclaimed = { ok: false, error: "not_submitted", ref: ENGINE_REF };
+    const demo = await createSession("demo");
+    const direct = await cancel.POST(request("POST", "/x", { session: demo }), params({ id: CAMPAIGN }));
+    expect(direct.status).toBe(409);
+    expect(await json(direct)).toEqual({ error: "not_submitted", message: expect.any(String), ref: ENGINE_REF });
+
+    const started = await cancel.POST(request("POST", "/x", { session: demo, prefer: "respond-async" }), params({ id: CAMPAIGN }));
+    expect(started.status).toBe(202);
+    const { runId } = (await json(started)) as { runId: string };
+    let polled = await runs.GET(request("GET", "/x", { session: demo }), params({ runId }));
+    for (let n = 0; n < 20 && polled.status === 202; n += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      polled = await runs.GET(request("GET", "/x", { session: demo }), params({ runId }));
+    }
+    expect(polled.status).toBe(409);
+    expect(await json(polled)).toEqual({ error: "not_submitted", message: expect.any(String), ref: ENGINE_REF });
+  });
+
+  it("answers 503 paypal_unavailable when PayPal is out of reach", async () => {
+    const { POST } = await import("./campaigns/[id]/cancel-unclaimed/route");
+    bridge.overrides.cancel_unclaimed = { ok: false, error: "paypal_unavailable", ref: ENGINE_REF };
+    const response = await POST(request("POST", "/x", { session: await createSession("owner") }), params({ id: CAMPAIGN }));
+    expect(response.status).toBe(503);
+    expect(await json(response)).toEqual({ error: "paypal_unavailable", message: expect.any(String), ref: ENGINE_REF });
+  });
+
+  it("results carry the payout states, with PayPal's status names exactly as the engine sent them", async () => {
+    const { GET } = await import("./campaigns/[id]/results/route");
+    const response = await GET(request("GET", "/x", { session: await createSession("demo") }), params({ id: CAMPAIGN }));
+    expect(response.status).toBe(200);
+    expect((await json(response)).payouts).toEqual({
+      items: 3,
+      byStatus: { SUCCESS: 1, UNCLAIMED: 1, RETURNED: 1 },
+      claimedMinor: 10,
+      unclaimedMinor: 10,
+      returnedMinor: 10,
+      failedMinor: 0,
+      pendingMinor: 0,
+      unclaimedReturnBy: "2026-11-23T05:00:00+00:00",
+    });
+  });
+
+  it.each([
+    ["no payouts block", { payouts: undefined }],
+    ["a field nobody listed", { payouts: { ...PAYOUTS, receiver: "maya@shop.example" } }],
+    ["a negative amount", { payouts: { ...PAYOUTS, returned_minor: -1 } }],
+    ["a fractional amount", { payouts: { ...PAYOUTS, claimed_minor: 0.5 } }],
+    ["a status that is not an upper-case word", { payouts: { ...PAYOUTS, by_status: { "success<script>": 1 } } }],
+    ["a return date that is not a time", { payouts: { ...PAYOUTS, unclaimed_return_by: "soon" } }],
+  ])("treats a results answer with %s as an engine failure: a generic 500", async (_label, change) => {
+    const { GET } = await import("./campaigns/[id]/results/route");
+    bridge.overrides.results = { ...(ANSWERS.results as object), ...change };
+    const response = await GET(request("GET", "/x", { session: await createSession("demo") }), params({ id: CAMPAIGN }));
+    const text = await response.text();
+    expect(response.status).toBe(500);
+    expect(JSON.parse(text)).toEqual({ error: "internal", message: "Something went wrong.", ref: expect.any(String) });
+    expect(text).not.toMatch(/maya|script/);
   });
 });

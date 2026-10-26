@@ -37,6 +37,8 @@ export const LIMITS = {
   approve: { bucket: "approve", max: 20, windowMs: HOUR_MS },
   demoApprovals: { bucket: "demo_approvals_all", max: 100, windowMs: HOUR_MS },
   submit: { bucket: "submit", max: 10, windowMs: HOUR_MS },
+  // Its own count, so pulling rewards back never uses up a session's submits.
+  cancelUnclaimed: { bucket: "cancel_unclaimed", max: 10, windowMs: HOUR_MS },
   simulate: { bucket: "simulate", max: 10, windowMs: HOUR_MS },
   simulates: { bucket: "simulates_all", max: 100, windowMs: HOUR_MS },
   results: { bucket: "results", max: 240, windowMs: HOUR_MS },

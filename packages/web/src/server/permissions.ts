@@ -38,6 +38,7 @@ export const ACTIONS = [
   "campaign.request_approval",
   "agent.chat",
   "paypal.read",
+  "campaign.cancel_unclaimed",
 ] as const;
 
 export type Action = (typeof ACTIONS)[number];
@@ -69,6 +70,8 @@ const PERMISSIONS: Readonly<Record<Action, readonly PrincipalRole[]>> = Object.f
   "agent.chat": ["demo", "owner"],
   // The assistant's four read-only PayPal lookups through PayPal's MCP server, identity stripped (paypal-mcp.ts).
   "paypal.read": ["demo", "owner"],
+  // Pulls back sent rewards nobody has claimed, so the money returns to the shop; the engine holds demo to its own campaigns.
+  "campaign.cancel_unclaimed": ["demo", "owner"],
 });
 
 /** True only when the table grants action to role. Any other string, prototype names included, is false. */
@@ -112,6 +115,7 @@ const MESSAGES: Readonly<Record<number, string>> = {
   401: "Sign in first.",
   403: "Not allowed.",
   404: "Not found.",
+  409: "That changed since you last looked. Reload it and try again.",
   413: "The request is too large.",
   415: "Send JSON.",
   422: "That breaks a rule for this account.",

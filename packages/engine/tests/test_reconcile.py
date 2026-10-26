@@ -1,7 +1,8 @@
 # Not covered here: the real PayPal duplicate refusal and the batch webhook that
 # resolves exists_unresolved (prove_m5 shows both live), the scheduler that runs
-# reconcile, and a sender that is still alive after 10 minutes (submit_batch gives
-# up within about 52 seconds, so none can be).
+# reconcile, a sender that is still alive after 10 minutes (submit_batch gives
+# up within about 52 seconds, so none can be), and PayPal's reporting balance
+# lagging behind payouts it has already taken (the floor is what absorbs that).
 import json
 import threading
 import uuid
@@ -16,12 +17,12 @@ from psycopg import sql
 
 from mend_engine.campaigns.approval import approve, review_hash
 from mend_engine.campaigns.reconcile import RECONCILE_LOCK, reconcile
-from mend_engine.campaigns.submission import REFUSED_REASON, submit
+from mend_engine.campaigns.submission import submit
 from mend_engine.config import SANDBOX_API_HOST, Config
 from mend_engine.db.connect import PGDATA
 from mend_engine.db.migrate import apply_schema
 from mend_engine.members.consent import DEMO_SHOP_NAME
-from mend_engine.members.membership import join_member
+from mend_engine.members.membership import join_member, leave_member
 from mend_engine.paypal import payouts
 from mend_engine.paypal.http import PayPalHttp
 
@@ -91,18 +92,27 @@ class Payouts:
     """A fake Payouts API that, like PayPal, holds at most one batch per sender_batch_id.
 
     lose_answers makes the next that many POSTs time out after PayPal has acted on them.
+    balance is the USD available balance as PayPal writes it, or an HTTP status to fail with.
     """
 
-    def __init__(self, lose_answers: int = 0, refuse: Callable[[], httpx.Response] | None = None) -> None:
+    def __init__(
+        self, lose_answers: int = 0, refuse: Callable[[], httpx.Response] | None = None, balance: str | int = "5033.32"
+    ) -> None:
         self.batches: dict[str, str] = {}
         self.posts: list[str] = []
         self.lose_answers = lose_answers
         self.refuse = refuse
+        self.balance = balance
         self.lock = threading.Lock()
 
     def __call__(self, request: httpx.Request) -> httpx.Response:
         if request.url.path == "/v1/oauth2/token":
             return httpx.Response(200, json={"access_token": "tok", "expires_in": 32000})
+        if request.method == "GET" and request.url.path == "/v1/reporting/balances":
+            if isinstance(self.balance, int):
+                return httpx.Response(self.balance, json={"name": "SERVICE_UNAVAILABLE"})
+            money = {"currency_code": "USD", "value": self.balance}
+            return httpx.Response(200, json={"balances": [{"currency": "USD", "available_balance": money}]})
         if request.method == "GET":
             payout_batch_id = request.url.path.rsplit("/", 1)[1]
             sender = next(s for s, b in self.batches.items() if b == payout_batch_id)
@@ -229,7 +239,7 @@ def test_a_campaign_stuck_in_submitting_for_over_10_minutes_is_settled_and_a_you
     assert marked == [(str(old),)]
 
 
-def test_a_refusal_follows_submits_rules_and_a_bad_snapshot_is_left_alone(conn: psycopg.Connection) -> None:
+def test_a_refusal_after_an_unclear_send_voids_nothing_and_a_bad_snapshot_is_left_alone(conn: psycopg.Connection) -> None:
     refused = approved_campaign(conn)
     submit(conn, Payouts(refuse=lambda: httpx.Response(503, json={})).http(), refused, CONFIG)
     capped = approved_campaign(conn, first=10)
@@ -242,9 +252,116 @@ def test_a_refusal_follows_submits_rules_and_a_bad_snapshot_is_left_alone(conn: 
     assert {a.reason for a in skipped} == {"the frozen snapshot fails its hash or a payout rule"} and paypal.posts == []
     assert state(conn, refused)[0] == state(conn, capped)[0] == "submission_unknown"
 
+    # Each campaign had three unanswered attempts, so a batch may exist and a 422 now proves nothing.
     actions = reconcile(conn, paypal.http()).actions
-    assert {a.after for a in actions} == {"voided"}
-    assert conn.execute("select void_reason from campaigns where campaign_id = %s", (refused,)).fetchone()[0] == REFUSED_REASON
+    assert {a.after for a in actions} == {"submission_unknown"} and len(paypal.posts) == 2
+    assert conn.execute("select void_reason from campaigns where campaign_id = %s", (refused,)).fetchone()[0] is None
+    assert [row["status"] for row in audit_rows(conn, "payout_submission_unknown")][-2:] == [422, 422]
+
+
+def unknown_after_503s(conn: psycopg.Connection, first: int = 1) -> uuid.UUID:
+    campaign_id = approved_campaign(conn, first)
+    submit(conn, Payouts(refuse=lambda: httpx.Response(503, json={})).http(), campaign_id, CONFIG)
+    assert state(conn, campaign_id)[0] == "submission_unknown"
+    return campaign_id
+
+
+def audit_rows(conn: psycopg.Connection, action: str) -> list[dict]:
+    return [row[0] for row in conn.execute("select detail from audit_log where action = %s order by id", (action,))]
+
+
+def test_after_an_unclear_send_a_429_leaves_the_campaign_unknown(conn: psycopg.Connection) -> None:
+    campaign_id = unknown_after_503s(conn)
+    limited = Payouts(refuse=lambda: httpx.Response(429, json={"name": "RATE_LIMIT_REACHED"}))
+
+    [action] = reconcile(conn, limited.http()).actions
+
+    assert (action.after, len(limited.posts)) == ("submission_unknown", 1)
+    assert state(conn, campaign_id)[0] == "submission_unknown"
+    assert audit_rows(conn, "payout_submission_unknown")[-1]["status"] == 429
+
+
+def test_a_member_who_left_after_an_unclear_send_is_never_resent(conn: psycopg.Connection) -> None:
+    campaign_id = unknown_after_503s(conn)
+    leaver = conn.execute("select member_id from members where paypal_email = 'c1@shop.example'").fetchone()[0]
+    assert leave_member(conn, leaver).voided_campaigns == ()
+    paypal = Payouts()
+
+    [action] = reconcile(conn, paypal.http()).actions
+
+    assert (action.after, action.sent, paypal.posts) == ("submission_unknown", False, [])
+    assert audit_rows(conn, "send_blocked_member_left") == [{"campaign_id": str(campaign_id)}]
+    # Rejoining is a new consent, not a reason to resend a batch PayPal may already hold.
+    join_member(
+        conn, paypal_email="c1@shop.example", paypal_payer_id=None, email_verified=True,
+        shop_name=DEMO_SHOP_NAME, client_id="cid",
+    )
+    reconcile(conn, paypal.http())
+    assert paypal.posts == [] and state(conn, campaign_id)[0] == "submission_unknown"
+    assert len(audit_rows(conn, "send_blocked_member_left")) == 1
+
+
+def test_a_batch_first_claimed_29_days_ago_is_never_resent(conn: psycopg.Connection) -> None:
+    old = unknown_after_503s(conn)
+    younger = unknown_after_503s(conn, first=10)
+    for campaign_id, days in ((old, 29), (younger, 28)):
+        conn.execute("update payout_batches set created_at = created_at - make_interval(days => %s) where campaign_id = %s",
+                     (days, str(campaign_id)))
+        backdate_submitting(conn, campaign_id, days * 24 * 60)
+    paypal = Payouts()
+
+    reconcile(conn, paypal.http())
+    reconcile(conn, paypal.http())
+
+    assert paypal.posts == [state(conn, younger)[1][0][0]] and state(conn, younger)[0] == "submitted"
+    assert state(conn, old)[0] == "submission_unknown"
+    assert [row["campaign_id"] for row in audit_rows(conn, "reconcile_too_old")] == [str(old)]
+
+
+def test_a_resend_waits_while_the_balance_is_short_or_unreadable_and_goes_out_on_a_later_run(conn: psycopg.Connection) -> None:
+    # Two items of 250 cents and 25 cents each: 550, on top of the 25000 floor.
+    campaign_id = unknown_after_503s(conn)
+    sender = state(conn, campaign_id)[1][0][0]
+
+    for balance in ("255.49", 503, "255.49"):
+        short = Payouts(balance=balance)
+        [action] = reconcile(conn, short.http()).actions
+        assert (action.after, action.sent, short.posts) == ("submission_unknown", False, [])
+
+    assert state(conn, campaign_id)[0] == "submission_unknown" and audit_rows(conn, "reconcile_resubmitting") == []
+    assert audit_rows(conn, "resend_waiting_on_balance") == [
+        {"campaign_id": str(campaign_id), "sender_batch_id": sender, "reason": "low_balance"}
+    ]
+    paypal = Payouts(balance="255.50")
+    [action] = reconcile(conn, paypal.http()).actions
+    assert (action.after, action.sent, paypal.posts) == ("submitted", True, [sender])
+
+
+def test_reconcile_skipped_is_written_once_per_campaign_not_on_every_run(conn: psycopg.Connection) -> None:
+    first = unknown_after_503s(conn)
+    second = unknown_after_503s(conn, first=10)
+    paypal = Payouts()
+    # A cap lowered since approval: both stored batches fail their payout rules on every run.
+    tight = PayPalHttp(replace(CONFIG, item_cap_minor=100), transport=httpx.MockTransport(paypal))
+
+    runs = [reconcile(conn, tight) for _ in range(3)]
+
+    assert all(len(run.actions) == 2 and all(a.reason for a in run.actions) for run in runs) and paypal.posts == []
+    assert sorted(row["campaign_id"] for row in audit_rows(conn, "reconcile_skipped")) == sorted([str(first), str(second)])
+
+
+def test_a_campaign_unsettled_for_over_an_hour_is_flagged_once(conn: psycopg.Connection) -> None:
+    stale = unknown_after_503s(conn)
+    fresh = unknown_after_503s(conn, first=10)
+    backdate_submitting(conn, stale, 61)
+    backdate_submitting(conn, fresh, 59)
+    down = Payouts(refuse=lambda: httpx.Response(503, json={}))
+
+    reconcile(conn, down.http())
+    reconcile(conn, down.http())
+
+    assert state(conn, stale)[0] == state(conn, fresh)[0] == "submission_unknown"
+    assert audit_rows(conn, "needs_attention") == [{"campaign_id": str(stale), "status": "submission_unknown"}]
 
 
 def test_two_runs_never_overlap(conn: psycopg.Connection, server_url: str) -> None:

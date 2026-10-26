@@ -12,6 +12,9 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 SANDBOX_API_HOST = "api-m.sandbox.paypal.com"
+# USD 250 that payouts leave in the shop's sandbox balance (C20). PayPal reports the
+# balance up to a few hours late, so this margin is what covers sends it has not counted yet.
+DEFAULT_BALANCE_FLOOR_MINOR = 25000
 
 _WHOLE_NUMBER = re.compile(r"[0-9]+")
 
@@ -31,6 +34,7 @@ class Config:
     item_cap_minor: int
     campaign_cap_minor: int
     daily_cap_minor: int
+    balance_floor_minor: int = DEFAULT_BALANCE_FLOOR_MINOR
 
     def __post_init__(self) -> None:
         # Checked here as well as in load_config so a Config built by hand in a
@@ -39,7 +43,7 @@ class Config:
             raise ConfigError("paypal_api_host must be the sandbox host")
         if not self.paypal_client_id or not self.paypal_client_secret:
             raise ConfigError("PAYPAL_CLIENT_ID and PAYPAL_CLIENT_SECRET must both be set")
-        for name in ("item_cap_minor", "campaign_cap_minor", "daily_cap_minor"):
+        for name in ("item_cap_minor", "campaign_cap_minor", "daily_cap_minor", "balance_floor_minor"):
             value = getattr(self, name)
             if type(value) is not int or value < 1:
                 raise ConfigError(f"{name} must be a positive whole number")
@@ -86,9 +90,10 @@ def _parse_dev(raw: str | None) -> bool:
 def load_config(env_path: str | None = None) -> Config:
     """Build the Config from the process environment, plus the .env file at env_path.
 
-    The process environment wins over the file. Raises ConfigError unless
-    PAYPAL_ENV is exactly "sandbox", both PayPal keys are non-empty and every cap
-    is a positive whole number.
+    The process environment wins over the file. MEND_BALANCE_FLOOR_MINOR is 25000
+    when unset or empty. Raises ConfigError unless PAYPAL_ENV is exactly "sandbox",
+    both PayPal keys are non-empty and every cap and the floor is a positive whole
+    number.
     """
     file_values = _read_env_file(Path(env_path)) if env_path is not None else {}
 
@@ -116,4 +121,5 @@ def load_config(env_path: str | None = None) -> Config:
         item_cap_minor=_parse_cap("MEND_PAYOUT_ITEM_CAP_MINOR", get("MEND_PAYOUT_ITEM_CAP_MINOR")),
         campaign_cap_minor=_parse_cap("MEND_CAMPAIGN_CAP_MINOR", get("MEND_CAMPAIGN_CAP_MINOR")),
         daily_cap_minor=_parse_cap("MEND_DAILY_CAP_MINOR", get("MEND_DAILY_CAP_MINOR")),
+        balance_floor_minor=_parse_cap("MEND_BALANCE_FLOOR_MINOR", get("MEND_BALANCE_FLOOR_MINOR") or str(DEFAULT_BALANCE_FLOOR_MINOR)),
     )

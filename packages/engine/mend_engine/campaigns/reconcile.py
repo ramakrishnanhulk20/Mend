@@ -10,6 +10,13 @@ sender_batch_id for 30 days, so this either creates the batch that never arrived
 or finds the one that did. A new sender_batch_id is never made. exists_unresolved
 campaigns wait for the PAYOUTSBATCH webhook, which carries the batch's id. One
 lock keeps two runs from overlapping (C20), and every step is in the audit log (C23).
+
+Three campaigns are never resent: one whose sender_batch_id was first claimed 29 or
+more days ago, since PayPal stops refusing a repeat of it after 30; one whose
+receiver left after a send that may have reached PayPal (C28); and one whose
+snapshot fails its checks. A resend waits for a later run while the shop's balance
+cannot cover the batch, its fees and the floor (C20). A campaign unsettled for more
+than an hour is flagged for a person once.
 """
 
 from __future__ import annotations
@@ -22,11 +29,19 @@ import psycopg
 from psycopg.types.json import Jsonb
 
 from mend_engine.campaigns.approval import frozen_snapshot
-from mend_engine.campaigns.submission import send_claimed
+from mend_engine.campaigns.submission import BLOCKED_ACTION, send_claimed
+from mend_engine.paypal.balances import BalanceTooLow, check_room
 from mend_engine.paypal.http import PayPalHttp
 from mend_engine.paypal.payouts import SnapshotRefused, sender_batch_id_for, validate_snapshot
 
+SKIPPED_ACTION = "reconcile_skipped"
+WAITING_ACTION = "resend_waiting_on_balance"
 STUCK_AFTER = timedelta(minutes=10)
+# PayPal refuses a repeated sender_batch_id for 30 days only. A day short of that
+# leaves room for clocks that disagree and a run that starts late.
+TOO_OLD_AFTER = timedelta(days=29)
+ATTENTION_AFTER = timedelta(hours=1)
+UNSETTLED_STATUSES = ("submission_unknown", "exists_unresolved")
 RECONCILE_LOCK = 7731300003
 ACTOR = "reconcile"
 _INSERT_AUDIT = "insert into audit_log (actor, action, detail) values (%s, %s, %s)"
@@ -61,12 +76,21 @@ def reconcile(conn: psycopg.Connection, http: PayPalHttp) -> ReconcileReport:
 
     First, in one transaction, moves each campaign whose last move to submitting is
     more than 10 minutes old to submission_unknown, with an audit row each. Then for
-    each submission_unknown campaign: reads its frozen snapshot, checks it against
+    each submission_unknown campaign: skips it, with no audit row, if it has a
+    "send_blocked_member_left" row; reads its frozen snapshot, checks it against
     the payout rules and checks that the ledger holds exactly its sender_batch_id
-    (any failure leaves it submission_unknown, sends nothing, and writes a
-    "reconcile_skipped" audit row); claims it with one conditional update to
-    submitting and an audit row; then calls send_claimed with the ledger's
-    payout_batch_id, which records PayPal's answer by submit()'s rules.
+    (any failure leaves it submission_unknown, sends nothing, and writes one
+    "reconcile_skipped" audit row the first time); leaves it as it is if its
+    sender_batch_id was first claimed 29 or more days ago, writing one
+    "reconcile_too_old" row the first time; reads the shop's balance once
+    (balances.check_room) and, when it is too low or unreadable, leaves it as it is
+    for a later run, writing one "resend_waiting_on_balance" row the first time;
+    claims it with one conditional update to submitting and an audit row; then
+    calls send_claimed with the ledger's payout_batch_id, as a send after
+    ambiguity, so only a created batch or PayPal's duplicate refusal settles it.
+    Last, writes one "needs_attention" row (campaign id and status) for each
+    campaign that has been submission_unknown or exists_unresolved for more than
+    an hour and has none yet.
 
     Returns ran False, reading nothing, when another run holds the lock. Errors
     that send_claimed raises again are raised again here, after the lock is freed.
@@ -88,6 +112,7 @@ def reconcile(conn: psycopg.Connection, http: PayPalHttp) -> ReconcileReport:
                 "select campaign_id from campaigns where status = 'exists_unresolved' order by created_at, campaign_id"
             )
         )
+        _flag_needs_attention(conn)
         with conn.transaction():
             conn.execute(
                 _INSERT_AUDIT,
@@ -114,7 +139,41 @@ def _mark_stuck(conn: psycopg.Connection) -> None:
             )
 
 
+def _flag_needs_attention(conn: psycopg.Connection) -> None:
+    with conn.transaction():
+        # Measured from the first move into either status, since each resend moves the
+        # campaign through submitting and back. No recorded move means it predates the record.
+        stale = conn.execute(
+            "select c.campaign_id, c.status from campaigns c where c.status = any(%s) and coalesce("
+            "(select min(m.moved_at) from campaign_status_moves m where m.campaign_id = c.campaign_id and m.to_status = any(%s)),"
+            " '-infinity') < now() - %s and not exists (select 1 from audit_log a where a.action = 'needs_attention' "
+            "and a.detail ->> 'campaign_id' = c.campaign_id::text) order by c.created_at, c.campaign_id",
+            (list(UNSETTLED_STATUSES), list(UNSETTLED_STATUSES), ATTENTION_AFTER),
+        ).fetchall()
+        for campaign_id, status in stale:
+            conn.execute(_INSERT_AUDIT, (ACTOR, "needs_attention", Jsonb({"campaign_id": str(campaign_id), "status": status})))
+
+
+def _recorded(conn: psycopg.Connection, action: str, campaign_id: uuid.UUID) -> bool:
+    return conn.execute(
+        "select 1 from audit_log where action = %s and detail ->> 'campaign_id' = %s limit 1", (action, str(campaign_id))
+    ).fetchone() is not None
+
+
+def _first_claim_too_old(conn: psycopg.Connection, campaign_id: uuid.UUID, sender_batch_id: str) -> bool:
+    # The older of the ledger row and the first recorded claim, so a lost record errs towards too old.
+    return conn.execute(
+        "select least(b.created_at, (select min(m.moved_at) from campaign_status_moves m "
+        "where m.campaign_id = %s and m.to_status = 'submitting')) <= now() - %s "
+        "from payout_batches b where b.sender_batch_id = %s",
+        (campaign_id, TOO_OLD_AFTER, sender_batch_id),
+    ).fetchone()[0]
+
+
 def _resend(conn: psycopg.Connection, http: PayPalHttp, campaign_id: uuid.UUID) -> ReconcileAction:
+    if _recorded(conn, BLOCKED_ACTION, campaign_id):
+        reason = "a member left after a send that may have reached PayPal; the batch event settles it"
+        return ReconcileAction(campaign_id, "submission_unknown", "submission_unknown", False, None, reason)
     try:
         snap = frozen_snapshot(conn, campaign_id)
         if snap is None:
@@ -130,6 +189,30 @@ def _resend(conn: psycopg.Connection, http: PayPalHttp, campaign_id: uuid.UUID) 
     if len(ledger) != 1 or ledger[0][0] != sender_batch_id:
         return _skip(conn, campaign_id, "the ledger does not hold exactly this campaign's sender_batch_id")
     known = ledger[0][1]
+    if _first_claim_too_old(conn, campaign_id, sender_batch_id):
+        if not _recorded(conn, "reconcile_too_old", campaign_id):
+            with conn.transaction():
+                conn.execute(
+                    _INSERT_AUDIT,
+                    (ACTOR, "reconcile_too_old", Jsonb({"campaign_id": str(campaign_id), "sender_batch_id": sender_batch_id})),
+                )
+        reason = "first claimed 29 or more days ago, so PayPal may no longer refuse a repeat"
+        return ReconcileAction(campaign_id, "submission_unknown", "submission_unknown", False, known, reason)
+    try:
+        check_room(http, snap, http.config.balance_floor_minor)
+    except BalanceTooLow as short:
+        if not _recorded(conn, WAITING_ACTION, campaign_id):
+            with conn.transaction():
+                conn.execute(
+                    _INSERT_AUDIT,
+                    (
+                        ACTOR,
+                        WAITING_ACTION,
+                        Jsonb({"campaign_id": str(campaign_id), "sender_batch_id": sender_batch_id, "reason": short.code}),
+                    ),
+                )
+        reason = f"the shop's balance cannot cover the batch, its fees and the floor ({short.code}); tried again on a later run"
+        return ReconcileAction(campaign_id, "submission_unknown", "submission_unknown", False, known, reason)
     with conn.transaction():
         claimed = conn.execute(
             "update campaigns set status = 'submitting' where campaign_id = %s and status = 'submission_unknown' returning 1",
@@ -146,13 +229,15 @@ def _resend(conn: psycopg.Connection, http: PayPalHttp, campaign_id: uuid.UUID) 
             )
     if claimed is None:
         return ReconcileAction(campaign_id, "submission_unknown", _status(conn, campaign_id), False, known, "claimed elsewhere")
-    result = send_claimed(conn, http, campaign_id, snap, sender_batch_id, known)
+    result = send_claimed(conn, http, campaign_id, snap, sender_batch_id, known, after_ambiguity=True)
     return ReconcileAction(campaign_id, "submission_unknown", result.status, result.sent, result.payout_batch_id)
 
 
 def _skip(conn: psycopg.Connection, campaign_id: uuid.UUID, reason: str) -> ReconcileAction:
-    with conn.transaction():
-        conn.execute(_INSERT_AUDIT, (ACTOR, "reconcile_skipped", Jsonb({"campaign_id": str(campaign_id), "reason": reason})))
+    # Once per campaign: the run every 5 minutes would otherwise add the same row each time.
+    if not _recorded(conn, SKIPPED_ACTION, campaign_id):
+        with conn.transaction():
+            conn.execute(_INSERT_AUDIT, (ACTOR, SKIPPED_ACTION, Jsonb({"campaign_id": str(campaign_id), "reason": reason})))
     return ReconcileAction(campaign_id, "submission_unknown", "submission_unknown", False, None, reason)
 
 

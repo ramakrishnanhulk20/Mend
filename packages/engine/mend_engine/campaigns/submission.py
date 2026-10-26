@@ -6,6 +6,12 @@ PayPal. The batch is built from the frozen approved snapshot alone. Its
 sender_batch_id is derived from that snapshot, so a campaign has only ever one,
 and PayPal refuses a repeat of it for 30 days. The ledger row is written before
 PayPal is called, so a crash part way leaves a record to reconcile, never a gap.
+
+Once any attempt for a sender_batch_id may have reached PayPal, no answer but a
+created batch or PayPal's duplicate refusal settles the campaign, so a batch that
+exists is never written off as refused. Immediately before every POST, every
+receiver must still be a member (C28). Before the claim, the shop's balance must
+cover the batch, its fees and the floor (C20); when it does not, nothing is claimed.
 """
 
 from __future__ import annotations
@@ -19,12 +25,17 @@ from psycopg.types.json import Jsonb
 from mend_engine.campaigns.approval import frozen_snapshot
 from mend_engine.campaigns.spend import CapExceeded, check_daily_cap, database_now, lock_daily_cap
 from mend_engine.config import Config
+from mend_engine.members.membership import LEFT_REASON
+from mend_engine.paypal.balances import check_room
 from mend_engine.paypal.http import PayPalError, PayPalHttp
 from mend_engine.paypal.payouts import (
+    REFUSAL_STATUSES,
     BatchExistsUnresolved,
     BatchSnapshot,
+    SendBlocked,
     SnapshotRefused,
     SubmissionUnknown,
+    normalise_email,
     sender_batch_id_for,
     snapshot_hash,
     submit_batch,
@@ -33,6 +44,9 @@ from mend_engine.paypal.payouts import (
 
 ACTOR = "engine"
 REFUSED_REASON = "PayPal refused the batch"
+# Written when a member left after a send that may have reached PayPal. Reconcile
+# never resends a campaign that has one; PayPal's batch event settles it.
+BLOCKED_ACTION = "send_blocked_member_left"
 _INSERT_AUDIT = "insert into audit_log (actor, action, detail) values (%s, %s, %s)"
 
 
@@ -54,26 +68,28 @@ def submit(conn: psycopg.Connection, http: PayPalHttp, campaign_id: uuid.UUID, c
     """Send an approved campaign as one Payouts batch, at most once however often it is called.
 
     Reads the frozen snapshot and checks it against its hash and the payout rules.
-    Then, in one transaction under the daily-cap lock: moves the campaign from
-    approved to submitting with one conditional update, re-checks the rolling daily
-    cap, writes the payout_batches ledger row (status submitting) and an audit row.
-    Only then calls payouts.submit_batch, passing the payout_batch_id the ledger
-    already holds for this sender_batch_id, if any. Records the answer: created or
-    already existed moves the campaign to submitted with PayPal's payout_batch_id;
-    BatchExistsUnresolved to exists_unresolved; SubmissionUnknown, or a PayPal error
-    with no status or a 5xx, to submission_unknown; a 4xx refusal from PayPal to
-    voided ("PayPal refused the batch"), since nothing was created. A new
-    sender_batch_id is never made.
+    If the campaign is approved, reads the shop's PayPal balance once
+    (balances.check_room). Then, in one transaction under the daily-cap lock: moves
+    the campaign from approved to submitting with one conditional update, re-checks
+    the rolling daily cap, writes the payout_batches ledger row (status submitting)
+    and an audit row. Only then calls send_claimed, passing the payout_batch_id the
+    ledger already holds for this sender_batch_id, if any; a ledger row that was
+    already there means an earlier submission may have reached PayPal, so the
+    outcome counts as ambiguous. send_claimed records the answer by its rules. A
+    new sender_batch_id is never made.
 
-    When the conditional update changes nothing (the campaign was never approved,
-    is already claimed or sent, or was voided) nothing is sent and the current
-    state comes back with sent False.
+    When the campaign is not approved, or the conditional update changes nothing
+    (it was never approved, is already claimed or sent, or was voided), nothing is
+    read or sent and the current state comes back with sent False.
 
-    Raises CapExceeded, with nothing changed but an audit row, when the batch would
-    pass the daily cap; SnapshotRefused, with nothing changed, when the frozen
-    snapshot fails its hash or a payout rule; LookupError for no such campaign;
-    ValueError for a campaign_id that is not a UUID. Any other error after the
-    claim marks the campaign submission_unknown and is raised again.
+    Raises BalanceTooLow, with nothing changed (the campaign stays approved and is
+    not claimed), when the balance less the batch total and 25 cents an item is
+    below config.balance_floor_minor ("low_balance") or cannot be read
+    ("balance_unavailable"); CapExceeded, with nothing changed but an audit row,
+    when the batch would pass the daily cap; SnapshotRefused, with nothing changed,
+    when the frozen snapshot fails its hash or a payout rule; LookupError for no
+    such campaign; ValueError for a campaign_id that is not a UUID. Any other error
+    after the claim marks the campaign submission_unknown and is raised again.
     """
     if not isinstance(campaign_id, uuid.UUID):
         raise ValueError("campaign_id must be a UUID")
@@ -83,6 +99,11 @@ def submit(conn: psycopg.Connection, http: PayPalHttp, campaign_id: uuid.UUID, c
     validate_snapshot(snap, config)
     sender_batch_id = sender_batch_id_for(snap)
     total = sum(item.amount_minor for item in snap.items)
+    # Only an approved campaign can be claimed below, so only it is worth a balance read.
+    # The status guard never moves a campaign back to approved once it has left.
+    if conn.execute("select status from campaigns where campaign_id = %s", (campaign_id,)).fetchone()[0] != "approved":
+        return _current(conn, campaign_id, sender_batch_id)
+    check_room(http, snap, config.balance_floor_minor)
 
     try:
         with conn.transaction():
@@ -114,7 +135,7 @@ def submit(conn: psycopg.Connection, http: PayPalHttp, campaign_id: uuid.UUID, c
         raise
     if claimed is None:
         return _current(conn, campaign_id, sender_batch_id)
-    return send_claimed(conn, http, campaign_id, snap, sender_batch_id, known)
+    return send_claimed(conn, http, campaign_id, snap, sender_batch_id, known, after_ambiguity=in_ledger is not None)
 
 
 def send_claimed(
@@ -124,34 +145,53 @@ def send_claimed(
     snap: BatchSnapshot,
     sender_batch_id: str,
     known_payout_batch_id: str | None,
+    *,
+    after_ambiguity: bool,
 ) -> SubmissionResult:
     """Send a campaign the caller has just claimed (moved to submitting), and record PayPal's answer.
 
     The one send-and-settle step submit() and reconcile share, so both read
     PayPal's answer by the same rules. snap must be the campaign's frozen snapshot,
     sender_batch_id its sender_batch_id_for(), and known_payout_batch_id what the
-    ledger holds for it. Calls payouts.submit_batch, then in one transaction updates
-    the ledger, moves the campaign out of submitting and writes an audit row:
+    ledger holds for it. after_ambiguity must be True when an earlier submission of
+    this sender_batch_id may have reached PayPal. Calls payouts.submit_batch, which
+    checks immediately before every POST that every receiver is still a verified
+    member, then in one transaction updates the ledger, moves the campaign out of
+    submitting and writes an audit row:
     created or already existed to submitted; BatchExistsUnresolved to
-    exists_unresolved; SubmissionUnknown, or a PayPal error with no status or a 5xx,
-    to submission_unknown; a 4xx refusal or a snapshot the payout rules refuse to
-    voided (ledger status refused). Any other error marks the campaign
-    submission_unknown and is raised again.
+    exists_unresolved; a 400 or 422 refusal with nothing ambiguous, or a snapshot
+    the payout rules refuse before any send could have reached PayPal, to voided
+    (ledger status refused); every other answer to submission_unknown. When a
+    receiver is no longer a member: with nothing ambiguous, voided ("a member
+    left") and nothing sent; otherwise submission_unknown with one
+    "send_blocked_member_left" audit row holding only the campaign id. Any other
+    error marks the campaign submission_unknown and is raised again.
     """
     try:
-        result = submit_batch(http, snap, known_payout_batch_id=known_payout_batch_id)
+        result = submit_batch(
+            http,
+            snap,
+            known_payout_batch_id=known_payout_batch_id,
+            after_ambiguity=after_ambiguity,
+            may_send=lambda: _receivers_still_members(conn, snap),
+        )
+    except SendBlocked as exc:
+        return _blocked(conn, campaign_id, sender_batch_id, exc)
     except BatchExistsUnresolved as exc:
         return _settle(conn, campaign_id, sender_batch_id, "exists_unresolved", None, _error_detail(exc))
     except SubmissionUnknown as exc:
         return _settle(conn, campaign_id, sender_batch_id, "submission_unknown", None, _error_detail(exc))
     except PayPalError as exc:
         detail = {"status": exc.status, "name": exc.name, "debug_id": exc.debug_id}
-        if exc.status is None or exc.status >= 500:
+        # submit_batch raises this only for a refusal that proves nothing was created; checked again here.
+        if after_ambiguity or exc.status not in REFUSAL_STATUSES:
             return _settle(conn, campaign_id, sender_batch_id, "submission_unknown", None, detail)
         return _settle(conn, campaign_id, sender_batch_id, "voided", None, detail, ledger_status="refused")
     except SnapshotRefused as exc:
+        status = "submission_unknown" if after_ambiguity else "voided"
         return _settle(
-            conn, campaign_id, sender_batch_id, "voided", None, {"rule": str(exc)}, ledger_status="refused", sent=False
+            conn, campaign_id, sender_batch_id, status, None, {"rule": str(exc)},
+            ledger_status=None if after_ambiguity else "refused", sent=False,
         )
     except Exception:
         _settle(conn, campaign_id, sender_batch_id, "submission_unknown", None, {"reason": "unexpected error"})
@@ -172,6 +212,7 @@ def _settle(
     *,
     ledger_status: str | None = None,
     sent: bool = True,
+    void_reason: str = REFUSED_REASON,
 ) -> SubmissionResult:
     with conn.transaction():
         conn.execute(
@@ -180,10 +221,40 @@ def _settle(
         )
         conn.execute(
             "update campaigns set status = %s, void_reason = %s where campaign_id = %s and status = 'submitting'",
-            (status, REFUSED_REASON if status == "voided" else None, campaign_id),
+            (status, void_reason if status == "voided" else None, campaign_id),
         )
         _audit(conn, f"payout_{status}", campaign_id, sender_batch_id, payout_batch_id=payout_batch_id, **detail)
     return SubmissionResult(campaign_id, status, payout_batch_id, sender_batch_id, sent)
+
+
+def _blocked(conn: psycopg.Connection, campaign_id: uuid.UUID, sender_batch_id: str, exc: SendBlocked) -> SubmissionResult:
+    if not exc.ambiguous:
+        return _settle(
+            conn, campaign_id, sender_batch_id, "voided", None, {"reason": LEFT_REASON},
+            ledger_status="refused", sent=False, void_reason=LEFT_REASON,
+        )
+    with conn.transaction():
+        conn.execute("update payout_batches set status = 'submission_unknown' where sender_batch_id = %s", (sender_batch_id,))
+        conn.execute(
+            "update campaigns set status = 'submission_unknown' where campaign_id = %s and status = 'submitting'", (campaign_id,)
+        )
+        conn.execute(_INSERT_AUDIT, (ACTOR, BLOCKED_ACTION, Jsonb({"campaign_id": str(campaign_id)})))
+    return SubmissionResult(campaign_id, "submission_unknown", None, sender_batch_id, exc.attempts > 0)
+
+
+def _receivers_still_members(conn: psycopg.Connection, snap: BatchSnapshot) -> bool:
+    """True when every receiver in the frozen snapshot still has a verified member row (C28).
+
+    join_member stores paypal_email only through normalise_email, and the snapshot
+    took its receivers from those stored values, so plain equality against the
+    normalised receivers is the snapshot's own match. A row stored any other way
+    fails to match, which blocks the send rather than allowing it.
+    """
+    receivers = sorted({normalise_email(item.receiver_email) for item in snap.items})
+    found = conn.execute(
+        "select count(*) from members where email_verified and paypal_email = any(%s)", (receivers,)
+    ).fetchone()[0]
+    return found == len(receivers)
 
 
 def _current(conn: psycopg.Connection, campaign_id: uuid.UUID, sender_batch_id: str) -> SubmissionResult:

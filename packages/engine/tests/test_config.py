@@ -15,6 +15,7 @@ KEYS = (
     "MEND_PAYOUT_ITEM_CAP_MINOR",
     "MEND_CAMPAIGN_CAP_MINOR",
     "MEND_DAILY_CAP_MINOR",
+    "MEND_BALANCE_FLOOR_MINOR",
     "DATABASE_URL",
 )
 
@@ -78,6 +79,18 @@ def test_refuses_an_empty_key(tmp_path: Path, key: str) -> None:
 def test_refuses_a_cap_that_is_not_a_positive_whole_number(tmp_path: Path, cap: str) -> None:
     with pytest.raises(ConfigError):
         load_config(write_env(tmp_path, {**GOOD, "MEND_CAMPAIGN_CAP_MINOR": cap}))
+
+
+def test_the_balance_floor_is_25000_cents_unless_set(tmp_path: Path) -> None:
+    assert load_config(write_env(tmp_path, GOOD)).balance_floor_minor == 25000
+    assert load_config(write_env(tmp_path, {**GOOD, "MEND_BALANCE_FLOOR_MINOR": ""})).balance_floor_minor == 25000
+    assert load_config(write_env(tmp_path, {**GOOD, "MEND_BALANCE_FLOOR_MINOR": "40000"})).balance_floor_minor == 40000
+
+
+@pytest.mark.parametrize("floor", ["ten", "1.5", "-5", "0", "1_000", "+10"])
+def test_refuses_a_balance_floor_that_is_not_a_positive_whole_number(tmp_path: Path, floor: str) -> None:
+    with pytest.raises(ConfigError, match="MEND_BALANCE_FLOOR_MINOR"):
+        load_config(write_env(tmp_path, {**GOOD, "MEND_BALANCE_FLOOR_MINOR": floor}))
 
 
 def test_refuses_a_missing_env_file(tmp_path: Path) -> None:

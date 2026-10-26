@@ -11,6 +11,7 @@ import hashlib
 import json
 import re
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Literal
 
@@ -19,6 +20,7 @@ from mend_engine.money import MoneyError, to_decimal_string
 from mend_engine.paypal.http import (
     PayPalError,
     PayPalHttp,
+    PayPalResponse,
     PayPalUnreachable,
 )
 
@@ -32,8 +34,16 @@ MAX_RECEIVER_CHARS = 127
 # PayPal turns notes starting with these into canned sandbox answers instead of real payouts.
 SANDBOX_TRIGGER_PREFIXES = ("POSPYO", "ERRPYO", "POSPOI", "ERRPOI")
 RETRY_BACKOFF_SECONDS = (2, 5)
+# The only answers that prove PayPal created nothing, and only when no earlier attempt
+# for the same sender_batch_id went unanswered. 401, 403 and 429 say nothing about
+# the batch itself, so they never count as a refusal.
+REFUSAL_STATUSES = (400, 422)
 
 _LONG_DIGIT_RUN = re.compile(r"[0-9]{7,}")
+# What people put between the groups of a phone number: "(415) 555-0199", "415.555.0199",
+# "415,555,0199", "415/555/0199", "415_555_0199". The web app's note rule
+# (packages/web/src/server/notes.ts) is meant to remove the same set.
+_DIGIT_GROUP_SEPARATORS = re.compile(r"[ .,:'()\[\]{}/_-]")
 _LETTER_RUN = re.compile(r"[a-z]+", re.ASCII)
 # A word, a dot and two or more letters with no space between, such as "evil.example"
 # or "x.co": the same pattern the web app's note rule uses.
@@ -92,6 +102,21 @@ BATCH_EXISTS_REASON = (
     "PayPal confirms a batch with this sender_batch_id exists; its payout_batch_id must be "
     "resolved from the batch webhook or Transaction Search; never resubmit under a different id"
 )
+
+
+class SendBlocked(Exception):
+    """The caller's check said no just before a POST, so that POST was never sent.
+
+    ambiguous is True when an earlier attempt for this sender_batch_id, in this call
+    or an earlier one, may have reached PayPal. attempts counts the POSTs this call
+    had already tried.
+    """
+
+    def __init__(self, sender_batch_id: str, *, ambiguous: bool, attempts: int) -> None:
+        self.sender_batch_id = sender_batch_id
+        self.ambiguous = ambiguous
+        self.attempts = attempts
+        super().__init__(f"send blocked for {sender_batch_id} (ambiguous={ambiguous} attempts={attempts})")
 
 
 class BatchExistsUnresolved(SubmissionUnknown):
@@ -175,10 +200,13 @@ def _text_problem(text: object, max_chars: int) -> str | None:
     """Why text may not reach a customer's inbox, or None if it may.
 
     Allows printable ASCII only. Covers links and domain-like words, markup (any "<"
-    or ">"), email addresses, long numbers such as phone or card numbers, control
-    characters, sandbox test codes and the names PayPal and Venmo in any case or
-    spacing. Does not cover persuasive wording or lookalike spellings such as
-    "PayPaI"; the owner reads every note at approval for that.
+    or ">"), email addresses, long numbers such as phone or card numbers (7 or more
+    digits in a row once spaces, dots, commas, colons, apostrophes, slashes,
+    underscores, dashes and brackets are removed), control characters, sandbox test
+    codes and the names PayPal and Venmo in any case or spacing. Does not cover
+    persuasive wording, lookalike spellings such as "PayPaI", or digits split by
+    other marks such as "415*555*0199"; the owner reads every note at approval for
+    that. A full date such as "10/16/2026" counts as a long number, as "16.10.2026" did already.
     """
     if type(text) is not str:
         return "is not text"
@@ -197,7 +225,7 @@ def _text_problem(text: object, max_chars: int) -> str | None:
         return "looks like a link"
     if "@" in text:
         return "contains @"
-    if _LONG_DIGIT_RUN.search(text):
+    if _LONG_DIGIT_RUN.search(_DIGIT_GROUP_SEPARATORS.sub("", text)):
         return "has a run of 7 or more digits"
     if text.lstrip().upper().startswith(SANDBOX_TRIGGER_PREFIXES):
         return "starts with a PayPal sandbox test code"
@@ -240,8 +268,9 @@ def validate_snapshot(snapshot: BatchSnapshot, config: Config) -> None:
     per-item cap; a total above the campaign cap; a currency other than USD; a
     malformed receiver, campaign id or sender_item_id; a note or subject that is
     empty, too long, non-ASCII, has a control character, "<" or ">", "http", "www.",
-    a domain-like word, "@", a run of 7 or more digits, starts with a sandbox test
-    code, or names PayPal or Venmo.
+    a domain-like word, "@", a run of 7 or more digits once spaces, dots, commas,
+    colons, apostrophes, slashes, underscores, dashes and brackets are removed,
+    starts with a sandbox test code, or names PayPal or Venmo.
     """
     if not isinstance(snapshot, BatchSnapshot):
         raise SnapshotRefused("not a BatchSnapshot")
@@ -324,10 +353,12 @@ def _error_name(body: dict) -> str | None:
 
 def _is_already_exists(body: dict) -> bool:
     details = body.get("details")
-    if not isinstance(details, list) or not details or not isinstance(details[0], dict):
+    if not isinstance(details, list):
         return False
-    issue = details[0].get("issue")
-    return isinstance(issue, str) and "already exists" in issue
+    return any(
+        isinstance(entry, dict) and isinstance(entry.get("issue"), str) and "already exists" in entry["issue"]
+        for entry in details
+    )
 
 
 def _batch_id_if_ours(body: dict, sender_batch_id: str) -> str | None:
@@ -364,71 +395,98 @@ def _confirm_known(http: PayPalHttp, known_payout_batch_id: str, sender_batch_id
     return SubmitResult(known_payout_batch_id, sender_batch_id, "already_existed")
 
 
+def _read_answer(
+    http: PayPalHttp, response: PayPalResponse, sender_batch_id: str, known_payout_batch_id: str | None, ambiguous: bool
+) -> SubmitResult:
+    """submit_batch's reading of one answer below 500, by the rules in its docstring."""
+    name = _error_name(response.body)
+    if response.status == 201:
+        payout_batch_id = _batch_id_if_ours(response.body, sender_batch_id)
+        if payout_batch_id is None:
+            raise SubmissionUnknown(
+                sender_batch_id,
+                "PayPal accepted the batch but its answer did not match the request",
+                status=response.status,
+                debug_id=response.debug_id,
+            )
+        return SubmitResult(payout_batch_id, sender_batch_id, "created")
+    if response.status == 400 and _is_already_exists(response.body):
+        if known_payout_batch_id is None:
+            raise BatchExistsUnresolved(sender_batch_id, status=response.status, name=name, debug_id=response.debug_id)
+        return _confirm_known(http, known_payout_batch_id, sender_batch_id)
+    if not ambiguous and response.status in REFUSAL_STATUSES:
+        raise PayPalError(response.status, name, response.debug_id)
+    if 200 <= response.status < 300:
+        reason = "unexpected success status from PayPal"
+    elif ambiguous:
+        reason = "PayPal refused after an earlier attempt may have reached it, so the refusal settles nothing"
+    else:
+        reason = "PayPal's answer does not show the batch was refused; resend with the same sender_batch_id"
+    raise SubmissionUnknown(sender_batch_id, reason, status=response.status, name=name, debug_id=response.debug_id)
+
+
 def submit_batch(
     http: PayPalHttp,
     snapshot: BatchSnapshot,
     *,
     known_payout_batch_id: str | None = None,
+    after_ambiguity: bool = False,
+    may_send: Callable[[], bool] | None = None,
 ) -> SubmitResult:
     """Send the snapshot as one Payouts batch, or confirm the batch it already became.
 
     Validates the snapshot first. Uses the snapshot's sender_batch_id as both the
     batch id and the PayPal-Request-Id. A timeout, connection error or 5xx is retried
-    with the identical request at most twice (after 2 s, then 5 s).
+    with the identical request at most twice (after 2 s, then 5 s). Before every POST
+    the access token is fetched first, then may_send, when given, is called, so
+    nothing but the send itself comes after it; if it returns False nothing is sent
+    and SendBlocked is raised. A token fetch that fails counts as an attempt that
+    got no clear answer, as it did when the fetch sat inside the POST.
 
-    Returns outcome "created" on 201. When PayPal refuses a repeated sender_batch_id,
-    returns "already_existed" only if known_payout_batch_id (from our ledger) is a
-    batch PayPal reports under this same sender_batch_id; PayPal's error carries no
-    usable link, so there is no other way to find the original. Raises
-    BatchExistsUnresolved when no known id is given (the batch exists; resolve its
-    id from the webhook or Transaction Search, never resubmit under a different id),
-    SubmissionUnknown when the outcome cannot be confirmed, SnapshotRefused for a bad
-    snapshot, and PayPalError for any other refusal (including a rejected purpose).
+    The outcome is ambiguous once any attempt for this sender_batch_id timed out,
+    went unanswered or got a 5xx, in this call or, when after_ambiguity is True, in
+    an earlier one. Returns outcome "created" on 201. When PayPal refuses a repeated
+    sender_batch_id, returns "already_existed" only if known_payout_batch_id (from
+    our ledger) is a batch PayPal reports under this same sender_batch_id; PayPal's
+    error carries no usable link, so there is no other way to find the original.
+
+    Raises BatchExistsUnresolved for that refusal when no known id is given (the
+    batch exists; resolve its id from the webhook or Transaction Search, never
+    resubmit under a different id); PayPalError only for a 400 or 422 while nothing
+    is ambiguous, the one answer that proves no batch was created; SubmissionUnknown
+    for every other answer, 401, 403 and 429 included, and for any answer at all
+    once the outcome is ambiguous; SendBlocked as above; SnapshotRefused for a bad
+    snapshot.
     """
     validate_snapshot(snapshot, http.config)
     sender_batch_id = sender_batch_id_for(snapshot)
     body = _payload(snapshot, sender_batch_id)
     headers = {"PayPal-Request-Id": sender_batch_id}
 
+    ambiguous = after_ambiguity
     last: PayPalError | None = None
     for attempt in range(1 + len(RETRY_BACKOFF_SECONDS)):
         if attempt:
             _sleep(RETRY_BACKOFF_SECONDS[attempt - 1])
         try:
+            # A token fetch can take up to 15 s. Done first, so the request below reuses
+            # the cached token and may_send is the last step before the POST.
+            http._bearer()
+            if may_send is not None and not may_send():
+                raise SendBlocked(sender_batch_id, ambiguous=ambiguous, attempts=attempt)
             response = http.request("POST", PAYOUTS_PATH, json_body=body, headers=headers)
         except PayPalUnreachable as exc:
-            last = exc
+            ambiguous, last = True, exc
             continue
-        if response.status >= 500:
-            last = PayPalError(response.status, _error_name(response.body), response.debug_id)
-            continue
-        if response.status == 201:
-            payout_batch_id = _batch_id_if_ours(response.body, sender_batch_id)
-            if payout_batch_id is None:
-                raise SubmissionUnknown(
-                    sender_batch_id,
-                    "PayPal accepted the batch but its answer did not match the request",
-                    status=response.status,
-                    debug_id=response.debug_id,
-                )
-            return SubmitResult(payout_batch_id, sender_batch_id, "created")
-        if response.status == 400 and _is_already_exists(response.body):
-            if known_payout_batch_id is None:
-                raise BatchExistsUnresolved(
-                    sender_batch_id,
-                    status=response.status,
-                    name=_error_name(response.body),
-                    debug_id=response.debug_id,
-                )
-            return _confirm_known(http, known_payout_batch_id, sender_batch_id)
-        if 200 <= response.status < 300:
+        except PayPalError as exc:
+            # No token, or an answer too large to read: neither proves PayPal created nothing.
             raise SubmissionUnknown(
-                sender_batch_id,
-                "unexpected success status from PayPal",
-                status=response.status,
-                debug_id=response.debug_id,
-            )
-        raise PayPalError(response.status, _error_name(response.body), response.debug_id)
+                sender_batch_id, "no readable answer from PayPal", status=exc.status, name=exc.name, debug_id=exc.debug_id
+            ) from None
+        if response.status >= 500:
+            ambiguous, last = True, PayPalError(response.status, _error_name(response.body), response.debug_id)
+            continue
+        return _read_answer(http, response, sender_batch_id, known_payout_batch_id, ambiguous)
 
     raise SubmissionUnknown(
         sender_batch_id,

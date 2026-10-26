@@ -14,6 +14,7 @@ from mend_engine.paypal.payouts import (
     BatchSnapshot,
     PayoutIdRefused,
     PayoutItemSpec,
+    SendBlocked,
     SnapshotRefused,
     SubmissionUnknown,
     cancel_item,
@@ -177,6 +178,24 @@ def test_the_note_rule_names_why_paypal_or_venmo_is_refused_and_passes_ordinary_
         assert payouts.note_problem(ordinary, 400) is None
     assert payouts.note_problem("<i>hi</i>", 400) == "has markup"
     assert payouts.note_problem("Visit evil.example", 400) == "looks like a link"
+
+
+@pytest.mark.parametrize(
+    ("note", "problem"),
+    [
+        ("Call us on 415 555 0199.", "has a run of 7 or more digits"),
+        ("(415) 555-0199", "has a run of 7 or more digits"),
+        ("Ring [415] 555.0199 any time", "has a run of 7 or more digits"),
+        ("Call 415,555,0199 today", "has a run of 7 or more digits"),
+        ("Call 415:555:0199 today", "has a run of 7 or more digits"),
+        ("Call 415'555'0199 today", "has a run of 7 or more digits"),
+        ("Call 415/555/0199 today", "has a run of 7 or more digits"),
+        ("Call 415_555_0199 today", "has a run of 7 or more digits"),
+        ("Order 12 of 2026", None),
+    ],
+)
+def test_a_phone_number_split_by_separators_is_refused(note: str, problem: str | None) -> None:
+    assert payouts.note_problem(note, 400) == problem
 
 
 class PayPalScript:
@@ -355,6 +374,24 @@ def test_already_exists_with_no_known_id_raises_batch_exists_unresolved() -> Non
     assert script.gets == []
 
 
+def test_a_duplicate_id_named_in_a_later_detail_is_recognised() -> None:
+    answer = httpx.Response(
+        400,
+        json={
+            "name": "USER_BUSINESS_ERROR",
+            "details": [
+                {"issue": "Some other issue", "field": "items[0].note"},
+                {"issue": "Batch with given sender_batch_id already exists", "field": "SENDER_BATCH_ID"},
+            ],
+            "links": [],
+        },
+    )
+    script = PayPalScript([answer])
+    with pytest.raises(BatchExistsUnresolved):
+        run(script, snapshot())
+    assert len(script.posts) == 1
+
+
 def test_server_error_then_already_exists_with_a_known_id_returns_already_existed(sleeps: list[float]) -> None:
     snap = snapshot()
     sbid = sender_batch_id_for(snap)
@@ -368,6 +405,23 @@ def test_server_error_then_already_exists_with_a_known_id_returns_already_existe
     assert len(script.posts) == 2
     assert script.posts[0].headers["PayPal-Request-Id"] == script.posts[1].headers["PayPal-Request-Id"] == sbid
     assert sleeps == [2]
+
+
+def test_a_member_who_leaves_while_the_token_is_fetched_stops_the_send(sleeps: list[float]) -> None:
+    # The token is fetched first, so the consent check is the last step before the POST.
+    snap = snapshot()
+    script = PayPalScript([created(sender_batch_id_for(snap))])
+    left: list[bool] = []
+
+    def leave_during_token_fetch(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/v1/oauth2/token":
+            left.append(True)
+        return script(request)
+
+    http = PayPalHttp(make_config(), transport=httpx.MockTransport(leave_during_token_fetch))
+    with pytest.raises(SendBlocked) as caught:
+        submit_batch(http, snap, may_send=lambda: not left)
+    assert script.posts == [] and (caught.value.ambiguous, caught.value.attempts) == (False, 0)
 
 
 def cancelled_answer(item_id: str = "ITEM1", status: str = "RETURNED") -> httpx.Response:

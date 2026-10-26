@@ -1,7 +1,8 @@
 # Not covered here: real PayPal answers and timing (prove_m4b sends one real batch
 # and races 20 real connections against it), reconciling a campaign left in
-# submitting or submission_unknown (not built yet), and a process killed between
-# PayPal's answer and the ledger write.
+# submitting or submission_unknown (test_reconcile.py), a process killed between
+# PayPal's answer and the ledger write, and PayPal's reporting balance lagging
+# behind payouts it has already taken (the floor is what absorbs that).
 import json
 import threading
 import time
@@ -14,6 +15,7 @@ import psycopg
 import pytest
 from psycopg import sql
 
+from mend_engine.campaigns import submission
 from mend_engine.campaigns.approval import approve, review_hash, set_amount
 from mend_engine.campaigns.spend import CapExceeded
 from mend_engine.campaigns.submission import REFUSED_REASON, submit
@@ -21,8 +23,9 @@ from mend_engine.config import SANDBOX_API_HOST, Config
 from mend_engine.db.connect import PGDATA
 from mend_engine.db.migrate import apply_schema
 from mend_engine.members.consent import DEMO_SHOP_NAME
-from mend_engine.members.membership import join_member
+from mend_engine.members.membership import LEFT_REASON, join_member, leave_member
 from mend_engine.paypal import payouts
+from mend_engine.paypal.balances import BalanceTooLow
 from mend_engine.paypal.http import PayPalHttp
 from mend_engine.paypal.payouts import BatchSnapshot, PayoutItemSpec, SnapshotRefused, canonical_json, snapshot_hash
 
@@ -100,19 +103,41 @@ def approved_campaign(conn: psycopg.Connection, amounts: tuple[int, ...] = (250,
     return campaign_id
 
 
-class FakePayPal:
-    """Answers the token and batch calls; post decides each Payouts answer. Thread safe."""
+BALANCES_PATH = "/v1/reporting/balances"
 
-    def __init__(self, post: Callable[[dict], httpx.Response], gets: dict[str, httpx.Response] | None = None) -> None:
+
+def balance_answer(balance: str | int) -> httpx.Response:
+    """PayPal's balance answer in its live shape for a USD value, or an error with that HTTP status."""
+    if isinstance(balance, int):
+        return httpx.Response(balance, json={"name": "SERVICE_UNAVAILABLE"})
+    money = {"currency_code": "USD", "value": balance}
+    return httpx.Response(200, json={"balances": [{"currency": "USD", "available_balance": money, "total_balance": money}]})
+
+
+class FakePayPal:
+    """Answers the token, balance and batch calls; post decides each Payouts answer. Thread safe.
+
+    balance is the USD available balance as PayPal writes it, or an HTTP status to fail with.
+    """
+
+    def __init__(
+        self, post: Callable[[dict], httpx.Response], gets: dict[str, httpx.Response] | None = None, balance: str | int = "5033.32"
+    ) -> None:
         self.post = post
         self.gets = gets or {}
+        self.balance = balance
         self.payout_posts: list[dict] = []
         self.get_paths: list[str] = []
+        self.balance_reads = 0
         self._lock = threading.Lock()
 
     def __call__(self, request: httpx.Request) -> httpx.Response:
         if request.url.path == "/v1/oauth2/token":
             return httpx.Response(200, json={"access_token": "tok", "expires_in": 32000})
+        if request.method == "GET" and request.url.path == BALANCES_PATH:
+            with self._lock:
+                self.balance_reads += 1
+            return balance_answer(self.balance)
         if request.method == "POST" and request.url.path == payouts.PAYOUTS_PATH:
             body = json.loads(request.content)
             with self._lock:
@@ -157,10 +182,17 @@ def actions(conn: psycopg.Connection) -> list[str]:
     return [r[0] for r in conn.execute("select action from audit_log where action like 'payout%%' order by id")]
 
 
+def member_id(conn: psycopg.Connection, email: str) -> uuid.UUID:
+    return conn.execute("select member_id from members where paypal_email = %s", (email,)).fetchone()[0]
+
+
 def test_an_approved_campaign_is_sent_once_from_its_frozen_snapshot(conn: psycopg.Connection) -> None:
     campaign_id = approved_campaign(conn)
     # A live change after approval must not reach the batch: only the frozen copy is read.
-    conn.execute("update members set paypal_email = 'someone.else@shop.example' where paypal_email = 'c1@shop.example'")
+    # The rows are frozen by a trigger, so it is off for this one staged statement.
+    conn.execute("alter table campaign_members disable trigger campaign_members_frozen")
+    conn.execute("update campaign_members set amount_minor = 999 where campaign_id = %s and ref = 'R1'", (campaign_id,))
+    conn.execute("alter table campaign_members enable trigger campaign_members_frozen")
     paypal = FakePayPal(created)
 
     result = submit(conn, paypal.http(), campaign_id, CONFIG)
@@ -180,6 +212,8 @@ def test_an_approved_campaign_is_sent_once_from_its_frozen_snapshot(conn: psycop
         "submitted", "BATCH1", result.sender_batch_id, False,
     )
     assert len(paypal.payout_posts) == 1 and actions(conn) == ["payout_submitting", "payout_submitted"]
+    # The balance is read once, before the claim; a campaign already sent needs no read.
+    assert paypal.balance_reads == 1
 
 
 def test_twenty_concurrent_submits_on_separate_connections_send_one_request(
@@ -271,12 +305,95 @@ def test_a_refusal_voids_the_campaign_and_a_failed_token_leaves_it_unknown(conn:
     assert (audit["status"], audit["name"], audit["debug_id"]) == (422, "UNPROCESSABLE_ENTITY", "d1")
 
     unknown = approved_campaign(conn, first=10)
+    tokens: list[int] = []
 
-    def no_token(request: httpx.Request) -> httpx.Response:
-        return httpx.Response(500, json={"name": "INTERNAL_SERVER_ERROR"})
+    def no_second_token(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/v1/oauth2/token":
+            tokens.append(1)
+            if len(tokens) == 1:
+                # A token PayPal says lasts 60 seconds is never reused, so the send needs a second one.
+                return httpx.Response(200, json={"access_token": "tok", "expires_in": 60})
+            return httpx.Response(500, json={"name": "INTERNAL_SERVER_ERROR"})
+        if request.url.path == BALANCES_PATH:
+            return balance_answer("5033.32")
+        raise AssertionError("nothing but the token and the balance may be asked for")
 
-    result = submit(conn, PayPalHttp(CONFIG, transport=httpx.MockTransport(no_token)), unknown, CONFIG)
+    result = submit(conn, PayPalHttp(CONFIG, transport=httpx.MockTransport(no_second_token)), unknown, CONFIG)
     assert state(conn, unknown) == (("submission_unknown", None), [("submission_unknown", None)]) and result.sent
+
+
+@pytest.mark.parametrize(
+    ("status", "outcome"),
+    [(400, "voided"), (422, "voided"), (401, "submission_unknown"), (403, "submission_unknown"), (429, "submission_unknown")],
+)
+def test_with_no_unclear_attempt_only_400_and_422_void_the_campaign(conn: psycopg.Connection, status: int, outcome: str) -> None:
+    campaign_id = approved_campaign(conn)
+    paypal = FakePayPal(lambda _b: httpx.Response(status, json={"name": "REFUSED", "debug_id": "d1"}))
+
+    result = submit(conn, paypal.http(), campaign_id, CONFIG)
+
+    assert (result.status, len(paypal.payout_posts)) == (outcome, 1)
+    if outcome == "voided":
+        assert state(conn, campaign_id) == (("voided", REFUSED_REASON), [("refused", None)])
+    else:
+        assert state(conn, campaign_id) == (("submission_unknown", None), [("submission_unknown", None)])
+
+
+def test_a_refusal_after_a_timeout_leaves_the_campaign_unknown(conn: psycopg.Connection) -> None:
+    campaign_id = approved_campaign(conn)
+    answers: list = [httpx.ReadTimeout("slow"), httpx.Response(429, json={"name": "RATE_LIMIT_REACHED", "debug_id": "d2"})]
+
+    def post(_body: dict) -> httpx.Response:
+        answer = answers.pop(0)
+        if isinstance(answer, Exception):
+            raise answer
+        return answer
+
+    paypal = FakePayPal(post)
+    result = submit(conn, paypal.http(), campaign_id, CONFIG)
+
+    assert (result.status, result.sent, len(paypal.payout_posts)) == ("submission_unknown", True, 2)
+    assert state(conn, campaign_id) == (("submission_unknown", None), [("submission_unknown", None)])
+    audit = conn.execute("select detail from audit_log where action = 'payout_submission_unknown'").fetchone()[0]
+    assert (audit["status"], audit["debug_id"]) == (429, "d2")
+
+
+def test_a_member_who_leaves_before_the_first_post_voids_the_campaign_and_nothing_is_sent(
+    conn: psycopg.Connection, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    campaign_id = approved_campaign(conn)
+    leaver = member_id(conn, "c2@shop.example")
+    real_submit_batch = submission.submit_batch
+
+    def leave_then_send(*args: object, **kwargs: object) -> object:
+        # The leave lands after submit() claimed the campaign, so leave_member no longer voids it.
+        leave_member(conn, leaver)
+        return real_submit_batch(*args, **kwargs)
+
+    monkeypatch.setattr(submission, "submit_batch", leave_then_send)
+    paypal = FakePayPal(created)
+
+    result = submit(conn, paypal.http(), campaign_id, CONFIG)
+
+    assert (result.status, result.sent, paypal.payout_posts) == ("voided", False, [])
+    assert state(conn, campaign_id) == (("voided", LEFT_REASON), [("refused", None)])
+
+
+def test_a_member_who_leaves_between_retries_stops_the_resend_and_the_campaign_stays_unknown(conn: psycopg.Connection) -> None:
+    campaign_id = approved_campaign(conn)
+    leaver = member_id(conn, "c1@shop.example")
+
+    def leave_then_fail(_body: dict) -> httpx.Response:
+        leave_member(conn, leaver)
+        return httpx.Response(503, json={"name": "SERVICE_UNAVAILABLE"})
+
+    paypal = FakePayPal(leave_then_fail)
+    result = submit(conn, paypal.http(), campaign_id, CONFIG)
+
+    assert (result.status, result.sent, len(paypal.payout_posts)) == ("submission_unknown", True, 1)
+    assert state(conn, campaign_id) == (("submission_unknown", None), [("submission_unknown", None)])
+    blocked = conn.execute("select actor, detail from audit_log where action = 'send_blocked_member_left'").fetchall()
+    assert blocked == [("engine", {"campaign_id": str(campaign_id)})]
 
 
 def test_nothing_is_sent_for_a_campaign_that_is_not_approved(conn: psycopg.Connection) -> None:
@@ -314,6 +431,25 @@ def test_the_daily_cap_is_checked_again_at_submission(conn: psycopg.Connection) 
         submit(conn, paypal.http(), campaign_id, CONFIG)
     assert paypal.payout_posts == [] and state(conn, campaign_id) == (("approved", None), [])
     assert actions(conn) == ["payout_refused_daily_cap"]
+
+
+@pytest.mark.parametrize(("balance", "code"), [("255.99", "low_balance"), (503, "balance_unavailable"), ("lots", "balance_unavailable")])
+def test_a_balance_short_of_the_batch_its_fees_and_the_floor_leaves_the_campaign_approved_and_unclaimed(
+    conn: psycopg.Connection, balance: str | int, code: str
+) -> None:
+    # 250 + 300 cents and 25 cents for each of the 2 items: 600, on top of the 25000 floor.
+    campaign_id = approved_campaign(conn)
+    short = FakePayPal(created, balance=balance)
+
+    with pytest.raises(BalanceTooLow) as caught:
+        submit(conn, short.http(), campaign_id, CONFIG)
+
+    assert caught.value.code == code and short.balance_reads == 1 and short.payout_posts == []
+    assert state(conn, campaign_id) == (("approved", None), []) and actions(conn) == []
+    claims = "select count(*) from campaign_status_moves where campaign_id = %s and to_status = 'submitting'"
+    assert conn.execute(claims, (campaign_id,)).fetchone() == (0,)
+    enough = FakePayPal(created, balance="256.00")
+    assert submit(conn, enough.http(), campaign_id, CONFIG).status == "submitted" and len(enough.payout_posts) == 1
 
 
 def test_a_frozen_snapshot_altered_behind_the_triggers_back_is_never_sent(conn: psycopg.Connection) -> None:

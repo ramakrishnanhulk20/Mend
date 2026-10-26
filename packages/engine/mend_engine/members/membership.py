@@ -41,7 +41,16 @@ _INSERT_AUDIT = "insert into audit_log (actor, action, detail) values (%s, %s, %
 
 
 class MembershipRefused(ValueError):
-    """A join that breaks a membership rule. Messages never repeat the email or payer id."""
+    """A join that breaks a membership rule. Messages never repeat the email or payer id.
+
+    reason is one of three fixed codes: "not_payable" for an email PayPal could not
+    be paid at, "identity_conflict" when the email or payer id belongs to a different
+    member, and "bad_input" for every other refused value.
+    """
+
+    def __init__(self, reason: str, message: str) -> None:
+        super().__init__(message)
+        self.reason = reason
 
 
 @dataclass(frozen=True)
@@ -64,26 +73,35 @@ def join_member(
     """Record a customer's consent to the thank-you list and return their member id.
 
     Stores the email after normalise_email, the consent version and the hash of the
-    consent text for shop_name. Joining again with the same email returns the same
-    member id and changes nothing. Writes one audit_log row with the member id and
+    consent text for shop_name. Writes one audit_log row with the member id and
     consent version when a member is created.
+
+    Joining again with the same email returns the same member id. When the stored
+    email is unverified and this call's is verified, the member is upgraded in one
+    transaction: email_verified becomes true, the current consent version and text
+    hash replace the earlier ones (the verified owner is consenting now, the first
+    consent came from someone PayPal had not verified), a missing payer id is filled
+    from this call, and one audit_log row "member_email_verified" holds the member
+    id and consent version. A verified member is never downgraded. Every other
+    repeat join changes nothing and writes no audit row.
 
     Raises MembershipRefused for an email PayPal could not be paid at, a malformed
     payer id or client id, an email_verified that is not a bool, a bad shop name, or
     an email or payer id that already belongs to a different member (a PayPal
-    account is never silently moved to another email or the reverse).
+    account is never silently moved to another email or the reverse). Nothing is
+    written when it raises.
     """
     email = _checked_email(paypal_email)
     if paypal_payer_id is not None and (type(paypal_payer_id) is not str or not _PAYER_ID.fullmatch(paypal_payer_id)):
-        raise MembershipRefused("payer id is malformed")
+        raise MembershipRefused("bad_input", "payer id is malformed")
     if type(email_verified) is not bool:
-        raise MembershipRefused("email_verified must be true or false")
+        raise MembershipRefused("bad_input", "email_verified must be true or false")
     if type(client_id) is not str or not _CLIENT_ID.fullmatch(client_id):
-        raise MembershipRefused("client id is malformed")
+        raise MembershipRefused("bad_input", "client id is malformed")
     try:
         digest = consent_hash(consent_text_for(shop_name))
     except ValueError as exc:
-        raise MembershipRefused(str(exc)) from None
+        raise MembershipRefused("bad_input", str(exc)) from None
 
     with conn.transaction():
         row = conn.execute(
@@ -96,15 +114,32 @@ def join_member(
                 (ACTOR, "member_joined", Jsonb({"member_id": str(member_id), "consent_version": CONSENT_VERSION})),
             )
             return member_id
+        # Locked until commit, so two verified joins at once upgrade the member and write its audit row only once.
         existing = conn.execute(
-            "select member_id, paypal_email, paypal_payer_id from members where paypal_email = %s or paypal_payer_id = %s",
+            "select member_id, paypal_email, paypal_payer_id, email_verified from members "
+            "where paypal_email = %s or paypal_payer_id = %s for update",
             (email, paypal_payer_id),
         ).fetchall()
-    if len(existing) == 1:
-        member_id, stored_email, stored_payer_id = existing[0]
-        if stored_email == email and (paypal_payer_id is None or stored_payer_id in (None, paypal_payer_id)):
-            return member_id
-    raise MembershipRefused("this email or PayPal account already belongs to a different member")
+        if len(existing) == 1:
+            member_id, stored_email, stored_payer_id, stored_verified = existing[0]
+            if stored_email == email and (paypal_payer_id is None or stored_payer_id in (None, paypal_payer_id)):
+                if email_verified and not stored_verified:
+                    conn.execute(
+                        # The verified owner consents now, so the consent record's time and app are theirs too.
+                        "update members set email_verified = true, consent_version = %s, consent_text_sha256 = %s, "
+                        "paypal_payer_id = coalesce(paypal_payer_id, %s), client_id = %s, joined_at = now() where member_id = %s",
+                        (CONSENT_VERSION, digest, paypal_payer_id, client_id, member_id),
+                    )
+                    conn.execute(
+                        _INSERT_AUDIT,
+                        (
+                            ACTOR,
+                            "member_email_verified",
+                            Jsonb({"member_id": str(member_id), "consent_version": CONSENT_VERSION}),
+                        ),
+                    )
+                return member_id
+    raise MembershipRefused("identity_conflict", "this email or PayPal account already belongs to a different member")
 
 
 def leave_member(conn: psycopg.Connection, member_id: uuid.UUID) -> LeaveResult:
@@ -196,7 +231,7 @@ def _checked_email(value: object) -> str:
     try:
         email = normalise_email(value)  # type: ignore[arg-type]
     except SnapshotRefused:
-        raise MembershipRefused("email must be text") from None
+        raise MembershipRefused("not_payable", "email must be text") from None
     if len(email) > MAX_RECEIVER_CHARS or not EMAIL_SHAPE.fullmatch(email):
-        raise MembershipRefused("email is not a plain address PayPal can pay")
+        raise MembershipRefused("not_payable", "email is not a plain address PayPal can pay")
     return email

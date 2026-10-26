@@ -57,7 +57,14 @@ from mend_engine.config import Config, ConfigError, load_config
 from mend_engine.db.connect import connect
 from mend_engine.events.process import process_events as process_stored_events
 from mend_engine.maintenance.purge import purge_paypal_events
-from mend_engine.members.membership import customer_refs_by_email
+from mend_engine.members.consent import DEMO_SHOP_NAME, consent_hash, consent_text_for
+from mend_engine.members.membership import (
+    MembershipRefused,
+    customer_refs_by_email,
+    join_member,
+    leave_member,
+    match_member_to_customer,
+)
 from mend_engine.paypal.http import PayPalError, PayPalHttp
 from mend_engine.paypal.payouts import SnapshotRefused, normalise_email, note_problem
 from mend_engine.store_facts import CDNOW_KEY, UCI_KEY, read_facts
@@ -81,6 +88,9 @@ TASK_NAMES = (
     "note_context",
     "set_note",
     "request_approval",
+    "consent_text",
+    "join",
+    "leave",
 )
 
 ROLES = ("owner", "demo")
@@ -118,8 +128,22 @@ _CODE = re.compile(r"[a-z][a-z_]{0,63}", re.ASCII)
 _INSERT_AUDIT = "insert into audit_log (actor, action, detail) values (%s, %s, %s)"
 _SETTINGS_KEYS = frozenset({"goal_text", "as_of", "budget_minor", "per_recipient_minor", "holdout_share", "max_candidates"})
 _ACTOR_KEYS = frozenset({"role", "session"})
+# What the web app passes on from Log in with PayPal, and nothing else (PLAN.md 3a).
+_IDENTITY_KEYS = frozenset({"email", "email_verified", "payer_id"})
+MAX_IDENTITY_EMAIL_CHARS = 254
+# PayPal documents payer ids as 13 characters; real ones are upper-case letters and digits.
+_PAYER_ID = re.compile(r"[A-Z0-9]{13}", re.ASCII)
+# MembershipRefused reasons to this module's codes. A reason missing here is unexpected and fails as "internal".
+_MEMBERSHIP_CODES = {"not_payable": "not_payable", "identity_conflict": "identity_conflict", "bad_input": "bad_identity"}
+_MEMBERSHIP_DETAILS = {
+    "not_payable": "the PayPal email is not an address PayPal can pay",
+    "identity_conflict": "this email or PayPal account already belongs to a different member",
+    "bad_identity": "the membership rules refused the identity",
+}
 _LOG_HEX = re.compile(r"\b[0-9a-f]{64}\b")
 _LOG_COOKIE = re.compile(r"s1\.[A-Za-z0-9_-]{20,}")
+# The same email shape the web app removes before text reaches the model (packages/web/src/server/claude.ts).
+_LOG_EMAIL = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+")
 _SECRET_ENV_NAMES = (
     "PAYPAL_CLIENT_SECRET",
     "PAYPAL_CLIENT_ID",
@@ -589,6 +613,97 @@ def request_approval(campaign_id: object, actor: object) -> dict:
     return _run("request_approval", work)
 
 
+def consent_text() -> dict:
+    """The sentence a customer agrees to when they join the demo shop's thank-you list, and its hash. No actor.
+
+    The join page shows text and sends hash back to join, so a change of wording
+    between the page and the click is refused rather than recorded (C28).
+    """
+
+    def work(config: Config, conn: psycopg.Connection) -> dict:
+        text = consent_text_for(DEMO_SHOP_NAME)
+        return {"ok": True, "shop_name": DEMO_SHOP_NAME, "text": text, "hash": consent_hash(text)}
+
+    return _run("consent_text", work)
+
+
+def join(identity: object, consent: object) -> dict:
+    """Add the customer PayPal just signed in to the demo shop's thank-you list (C28).
+
+    identity is exactly {"email", "email_verified", "payer_id"} from Log in with
+    PayPal; consent is the hash consent_text gave the page the customer saw. The
+    member is recorded with the current consent version and this app's client id.
+    Joining again returns the same member_id; it changes nothing, except that a verified
+    join upgrades a member who first joined unverified (join_member). created says
+    whether this call made the member; it is read just before the join, so two
+    first joins at the same moment may both say True for the same member_id.
+    linked says whether a verified email matches one shop customer. Refuses
+    "bad_identity" for an identity of the wrong shape, "consent_changed" when
+    consent is not exactly the current hash, "not_payable" for an email PayPal
+    could not pay, and "identity_conflict" when the email or payer id belongs to a
+    different member. Nothing is written on a refusal.
+    """
+
+    def work(config: Config, conn: psycopg.Connection) -> dict:
+        email, verified, payer_id = _checked_identity(identity)
+        if type(consent) is not str or consent != consent_hash(consent_text_for(DEMO_SHOP_NAME)):
+            raise _Refused("consent_changed", "the consent hash is not the current wording's")
+        existing = conn.execute("select 1 from members where paypal_email = %s", (normalise_email(email),)).fetchone()
+        try:
+            member_id = join_member(
+                conn,
+                paypal_email=email,
+                paypal_payer_id=payer_id,
+                email_verified=verified,
+                shop_name=DEMO_SHOP_NAME,
+                client_id=config.paypal_client_id,
+            )
+        except MembershipRefused as refused:
+            code = _MEMBERSHIP_CODES.get(refused.reason)
+            if code is None:
+                raise
+            raise _Refused(code, _MEMBERSHIP_DETAILS[code]) from None
+        return {
+            "ok": True,
+            "member_id": str(member_id),
+            "created": existing is None,
+            "linked": match_member_to_customer(conn, member_id) is not None,
+        }
+
+    return _run("join", work)
+
+
+def leave(identity: object) -> dict:
+    """Take the customer PayPal just signed in off the thank-you list at once (C28).
+
+    identity has the same shape join takes. The member is found by the one email
+    normaliser. Leaving voids every campaign not yet sent that holds the member, in
+    the same transaction that deletes them; voided counts those campaigns. left is
+    False when no member has that email, which is not an error. Refuses
+    "bad_identity" for an identity of the wrong shape, "email_unverified" before
+    any lookup when PayPal has not verified the email (an unverified email proves
+    nothing about who owns it), and "identity_conflict" when the member has a payer
+    id and the identity carries a different one.
+    """
+
+    def work(config: Config, conn: psycopg.Connection) -> dict:
+        email, verified, payer_id = _checked_identity(identity)
+        if verified is not True:
+            raise _Refused("email_unverified", "leaving needs an email PayPal has verified")
+        row = conn.execute(
+            "select member_id, paypal_payer_id from members where paypal_email = %s", (normalise_email(email),)
+        ).fetchone()
+        if row is None:
+            return {"ok": True, "left": False, "voided": 0}
+        member_id, stored_payer_id = row
+        if stored_payer_id is not None and payer_id is not None and stored_payer_id != payer_id:
+            raise _Refused("identity_conflict", "the member's PayPal account is not the one signed in")
+        result = leave_member(conn, member_id)
+        return {"ok": True, "left": result.removed, "voided": len(result.voided_campaigns)}
+
+    return _run("leave", work)
+
+
 def process_events() -> dict:
     """Give stored webhook deliveries their one outcome each (C10). A scheduled job; no actor."""
 
@@ -694,7 +809,7 @@ def _log(record: dict) -> None:
 
 
 def _scrub(text: str, config: Config | None) -> str:
-    """text with every known secret, session id and cookie-shaped token replaced, and capped in length."""
+    """text with every known secret, session id, cookie-shaped token and email address replaced, and capped in length."""
     secrets = [os.environ.get(name) for name in _SECRET_ENV_NAMES]
     if config is not None:
         secrets += [config.paypal_client_secret, config.paypal_client_id, config.database_url]
@@ -706,7 +821,7 @@ def _scrub(text: str, config: Config | None) -> str:
     for secret in secrets:
         if secret and len(secret) >= 6:
             text = text.replace(secret, "[removed]")
-    text = _LOG_COOKIE.sub("[cookie]", _LOG_HEX.sub("[hex64]", text))
+    text = _LOG_EMAIL.sub("[email]", _LOG_COOKIE.sub("[cookie]", _LOG_HEX.sub("[hex64]", text)))
     return text[:MAX_LOG_DETAIL_CHARS]
 
 
@@ -773,6 +888,24 @@ def _checked_settings(settings: object) -> DraftSettings:
         holdout_share=Decimal(share_text),
         max_candidates=settings["max_candidates"],
     )
+
+
+def _checked_identity(identity: object) -> tuple[str, bool, str | None]:
+    """(email, email_verified, payer_id) from an identity of exactly the Log in with PayPal shape.
+
+    Checks shape only. Whether PayPal could pay the email is join_member's rule, so
+    one function decides it for joining and for the payout.
+    """
+    if type(identity) is not dict or set(identity) != _IDENTITY_KEYS:
+        raise _Refused("bad_identity", "identity must be exactly {email, email_verified, payer_id}")
+    email, verified, payer_id = identity["email"], identity["email_verified"], identity["payer_id"]
+    if type(email) is not str or len(email) > MAX_IDENTITY_EMAIL_CHARS:
+        raise _Refused("bad_identity", f"email must be text of at most {MAX_IDENTITY_EMAIL_CHARS} characters")
+    if type(verified) is not bool:
+        raise _Refused("bad_identity", "email_verified must be true or false")
+    if payer_id is not None and (type(payer_id) is not str or not _PAYER_ID.fullmatch(payer_id)):
+        raise _Refused("bad_identity", "payer_id must be null or 13 capital letters and digits")
+    return email, verified, payer_id
 
 
 def _checked_ref(ref: object) -> str:

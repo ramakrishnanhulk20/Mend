@@ -165,6 +165,28 @@ describe("takeHit", () => {
     expect((await takeHit(LIMITS.approve, "a-session")).allowed).toBe(true);
   });
 
+  it("lets 20 join starts and 20 join returns through per address in a minute, each counted apart", async () => {
+    for (let n = 0; n < 20; n += 1) expect((await takeHit(LIMITS.joinStart, "198.51.100.7")).allowed).toBe(true);
+    const refused = await takeHit(LIMITS.joinStart, "198.51.100.7");
+    expect(!refused.allowed && refused.retryAfterSeconds <= 60).toBe(true);
+    expect((await takeHit(LIMITS.joinCallback, "198.51.100.7")).allowed).toBe(true);
+    expect((await takeHit(LIMITS.joinStart, "198.51.100.8")).allowed).toBe(true);
+    await admin.query("update rate_limit_hits set at = at - interval '61 seconds'");
+    expect((await takeHit(LIMITS.joinStart, "198.51.100.7")).allowed).toBe(true);
+    expect(LIMITS.joinCallback).toEqual({ bucket: "join_callback", max: 20, windowMs: 60_000 });
+  });
+
+  it("lets 60 consent reads through per address in a minute and refuses the 61st", async () => {
+    await admin.query(
+      "insert into rate_limit_hits (bucket, subject, at) select 'join_consent', '198.51.100.7', now() - interval '30 seconds' from generate_series(1, 59)",
+    );
+    expect((await takeHit(LIMITS.joinConsent, "198.51.100.7")).allowed).toBe(true);
+    const refused = await takeHit(LIMITS.joinConsent, "198.51.100.7");
+    expect(!refused.allowed && refused.retryAfterSeconds <= 60).toBe(true);
+    expect((await takeHit(LIMITS.joinConsent, "198.51.100.8")).allowed).toBe(true);
+    expect(await hits("join_consent", "198.51.100.7")).toBe(60);
+  });
+
   it("sweeps out rows older than every window", async () => {
     await admin.query("insert into rate_limit_hits (bucket, subject, at) values ('draft', 'old', now() - interval '25 hours')");
     await takeHit(LIMITS.draft, "a-session");

@@ -22,7 +22,8 @@ import { database } from "./db";
 
 export type Limit = { readonly bucket: string; readonly max: number; readonly windowMs: number };
 
-const HOUR_MS = 60 * 60 * 1000;
+const MINUTE_MS = 60 * 1000;
+const HOUR_MS = 60 * MINUTE_MS;
 const DAY_MS = 24 * HOUR_MS;
 
 // Per-session limits count against a session id this server issued. The two "all"
@@ -47,6 +48,12 @@ export const LIMITS = {
   claudeDemoSession: { bucket: "claude_demo_session", max: 40, windowMs: DAY_MS },
   claudeDemoAll: { bucket: "claude_demo_all", max: 600, windowMs: DAY_MS },
   claudeOwner: { bucket: "claude_owner", max: 2000, windowMs: DAY_MS },
+  // The two public Join with PayPal steps, per client address. A person signs in once,
+  // so a few retries after a cancel stay well inside 20 a minute.
+  joinStart: { bucket: "join_start", max: 20, windowMs: MINUTE_MS },
+  joinCallback: { bucket: "join_callback", max: 20, windowMs: MINUTE_MS },
+  // The public consent words: each read is an engine run, so one address cannot keep the engine busy.
+  joinConsent: { bucket: "join_consent", max: 60, windowMs: MINUTE_MS },
 } as const satisfies Record<string, Limit>;
 
 /** The subject for limits that count every caller together. */

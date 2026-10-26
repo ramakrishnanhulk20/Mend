@@ -36,6 +36,9 @@ export const TASK_NAMES = [
   "note_context",
   "set_note",
   "request_approval",
+  "consent_text",
+  "join",
+  "leave",
 ] as const;
 
 export type TaskName = (typeof TASK_NAMES)[number];

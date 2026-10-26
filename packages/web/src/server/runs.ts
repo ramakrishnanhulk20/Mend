@@ -37,6 +37,11 @@ const memberRef = z.string().regex(/^R[1-9][0-9]{0,3}$/);
 // Letters, digits, spaces and ordinary punctuation only: no control or invisible
 // characters, and no "@" so an email can never pass for a name.
 const displayName = z.string().min(1).max(80).regex(/^[^\p{Cc}\p{Cf}@]+$/u);
+// No character from Unicode's "other" group (controls, invisible format marks,
+// private-use, unassigned), the same rule the engine applies to a shop name.
+const shopName = z.string().min(1).max(100).regex(/^\P{C}+$/u);
+const consentText = z.string().min(1).max(400).regex(/^\P{C}+$/u);
+const sha256Hex = z.string().regex(/^[0-9a-f]{64}$/);
 
 function carriesNoIdentifier(body: unknown): boolean {
   const text = JSON.stringify(body);
@@ -416,6 +421,26 @@ const SPECS: Readonly<Record<TaskName, Spec>> = {
     z.strictObject({ ok: z.literal(true), campaign_id: campaignId, status: z.literal("awaiting_approval") }),
     (a) => ({ campaignId: a.campaign_id, status: a.status }),
     z.strictObject({ campaignId, status: z.literal("awaiting_approval") }),
+  ),
+  // The join link carries hash back unchanged, so a join is bound to these exact words (C28).
+  consent_text: spec(
+    200,
+    z.strictObject({ ok: z.literal(true), shop_name: shopName, text: consentText, hash: sha256Hex }),
+    (a) => ({ shopName: a.shop_name, text: a.text, hash: a.hash }),
+    z.strictObject({ shopName, text: consentText, hash: sha256Hex }),
+  ),
+  // Joining and leaving answer the outcome only: the member id stays on the server (C15).
+  join: spec(
+    200,
+    z.strictObject({ ok: z.literal(true), member_id: z.uuid(), created: z.boolean(), linked: z.boolean() }),
+    (a) => ({ outcome: "joined" as const, linked: a.linked }),
+    z.strictObject({ outcome: z.literal("joined"), linked: z.boolean() }),
+  ),
+  leave: spec(
+    200,
+    z.strictObject({ ok: z.literal(true), left: z.boolean(), voided: count }),
+    () => ({ outcome: "left" as const }),
+    z.strictObject({ outcome: z.literal("left") }),
   ),
 };
 

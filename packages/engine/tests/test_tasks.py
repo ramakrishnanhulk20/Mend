@@ -2,8 +2,8 @@
 # (packages/web tests and prove:m7a/m7b), real PayPal answers (prove_m4b and prove_m5),
 # the real model facts (python -m mend_engine.store_facts computes and stores them),
 # the task server that runs these tasks on Render (test_task_server.py), and two demo
-# drafts from one session racing on separate connections (the session lock is
-# exercised only in sequence).
+# drafts, or two demo submits, from one session racing on separate connections (the
+# session lock and the demo spend lock are exercised only in sequence).
 import hashlib
 import json
 import random
@@ -48,24 +48,35 @@ DEMO_SETTINGS = {
 
 
 class FakePayPal:
-    """Answers the token, Payouts create, item cancel and Orders create calls, and records every other request.
+    """Answers the token, balance, Payouts create, item cancel and Orders create calls, and records every other request.
 
-    A cancel is answered RETURNED, or with cancel_status when that is not 200.
+    Each batch created gets the next id, BATCH1 first. A cancel is answered RETURNED,
+    or with cancel_status when that is not 200. balance is the USD available balance
+    as PayPal writes it, or an HTTP status to fail the balance read with.
     """
 
     def __init__(self) -> None:
         self.requests: list[httpx.Request] = []
         self.cancel_status = 200
+        self.batches = 0
+        self.balance: str | int = "5033.32"
 
     def __call__(self, request: httpx.Request) -> httpx.Response:
         if request.url.path == "/v1/oauth2/token":
             return httpx.Response(200, json={"access_token": "tok", "expires_in": 32000})
         self.requests.append(request)
+        if request.method == "GET" and request.url.path == "/v1/reporting/balances":
+            if isinstance(self.balance, int):
+                return httpx.Response(self.balance, json={"name": "SERVICE_UNAVAILABLE"})
+            money = {"currency_code": "USD", "value": self.balance}
+            return httpx.Response(200, json={"balances": [{"currency": "USD", "available_balance": money}]})
         body = json.loads(request.content) if request.content else {}
         if request.method == "POST" and request.url.path == payouts.PAYOUTS_PATH:
+            self.batches += 1
             sender_batch_id = body["sender_batch_header"]["sender_batch_id"]
             return httpx.Response(
-                201, json={"batch_header": {"payout_batch_id": "BATCH1", "sender_batch_header": {"sender_batch_id": sender_batch_id}}}
+                201,
+                json={"batch_header": {"payout_batch_id": f"BATCH{self.batches}", "sender_batch_header": {"sender_batch_id": sender_batch_id}}},
             )
         if request.method == "POST" and request.url.path == "/v2/checkout/orders":
             return httpx.Response(201, json={"id": "5O190127TN364715T", "status": "COMPLETED"})
@@ -236,6 +247,28 @@ def test_a_demo_session_may_draft_five_campaigns_a_day(conn: psycopg.Connection,
     assert tasks.draft_campaign(DEMO_SETTINGS, actor(conn, "demo"))["ok"] is True
 
 
+def test_a_demo_draft_may_consider_at_most_20_candidates_and_is_refused_before_scoring(
+    conn: psycopg.Connection, paypal: FakePayPal, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    seed_shop(conn)
+    demo = actor(conn, "demo")
+    built: list[int] = []
+    real_build_draft = tasks.build_draft
+
+    def counted(*args: object, **kwargs: object) -> object:
+        built.append(1)
+        return real_build_draft(*args, **kwargs)
+
+    monkeypatch.setattr(tasks, "build_draft", counted)
+
+    assert refused(tasks.draft_campaign({**DEMO_SETTINGS, "max_candidates": 21}, demo), "over_cap")
+    assert built == [] and counts(conn) == (0, 0)
+    assert tasks.draft_campaign({**DEMO_SETTINGS, "max_candidates": 20}, demo)["ok"] is True
+    owner = actor(conn, "owner")
+    assert tasks.draft_campaign({**DEMO_SETTINGS, "max_candidates": 21}, owner)["ok"] is True
+    assert refused(tasks.draft_campaign({**DEMO_SETTINGS, "max_candidates": 251}, owner), "invalid_settings")
+
+
 def test_the_demo_pool_of_5000_cents_a_day_is_shared_by_every_demo_session(conn: psycopg.Connection, paypal: FakePayPal) -> None:
     seed_shop(conn)
     demo_spend(conn, 4950)
@@ -334,6 +367,84 @@ def test_a_demo_submit_that_would_pass_the_demo_pool_is_refused(conn: psycopg.Co
     assert refused(tasks.submit_campaign(campaign_id, demo), "over_demo_daily_cap")
     assert paypal.money_requests() == []
     assert conn.execute("select status from campaigns where campaign_id = %s", (uuid.UUID(campaign_id),)).fetchone() == ("approved",)
+
+
+def approved_campaign(sender: dict) -> str:
+    campaign_id = tasks.draft_campaign(DEMO_SETTINGS, sender)["campaign_id"]
+    assert tasks.approve_campaign(campaign_id, sender, tasks.view_campaign(campaign_id, sender)["review_hash"])["ok"] is True
+    return campaign_id
+
+
+def test_a_demo_session_may_send_two_campaigns_a_day_while_other_sessions_and_the_owner_still_can(
+    conn: psycopg.Connection, paypal: FakePayPal
+) -> None:
+    seed_shop(conn)
+    demo = actor(conn, "demo")
+    first, second, third = (approved_campaign(demo) for _ in range(3))
+    assert [tasks.submit_campaign(cid, demo)["sent"] for cid in (first, second)] == [True, True]
+
+    assert refused(tasks.submit_campaign(third, demo), "limit_reached")
+    assert len(paypal.money_requests()) == 2 and campaign_status(conn, third) == "approved"
+    assert conn.execute("select count(*) from payout_batches where campaign_id = %s", (third,)).fetchone() == (0,)
+    # Asking again about a campaign already sent can never send a second batch, so the limit lets it answer.
+    again = tasks.submit_campaign(first, demo)
+    assert (again["ok"], again["sent"], len(paypal.money_requests())) == (True, False, 2)
+
+    other = actor(conn, "demo")
+    assert tasks.submit_campaign(approved_campaign(other), other)["sent"] is True
+    owner = actor(conn, "owner")
+    assert [tasks.submit_campaign(approved_campaign(owner), owner)["sent"] for _ in range(3)] == [True, True, True]
+    assert len(paypal.money_requests()) == 6
+
+
+def test_submit_campaign_refuses_a_low_or_unreadable_balance_and_the_campaign_stays_approved(
+    conn: psycopg.Connection, paypal: FakePayPal
+) -> None:
+    seed_shop(conn)
+    owner = actor(conn, "owner")
+    campaign_id = approved_campaign(owner)
+
+    for balance, code in (("250.00", "low_balance"), (503, "balance_unavailable")):
+        paypal.balance = balance
+        assert refused(tasks.submit_campaign(campaign_id, owner), code)
+        assert paypal.money_requests() == [] and campaign_status(conn, campaign_id) == "approved"
+    assert conn.execute("select count(*) from payout_batches").fetchone() == (0,)
+
+    paypal.balance = "5033.32"
+    assert tasks.submit_campaign(campaign_id, owner)["sent"] is True
+
+
+def test_every_limit_refusal_writes_one_limit_hit_row_with_only_the_task_the_code_and_the_role(
+    conn: psycopg.Connection, paypal: FakePayPal
+) -> None:
+    seed_shop(conn)
+    demo = actor(conn, "demo")
+    assert refused(tasks.draft_campaign({**DEMO_SETTINGS, "max_candidates": 21}, demo), "over_cap")
+    assert all(tasks.draft_campaign(DEMO_SETTINGS, demo)["ok"] for _ in range(5))
+    assert refused(tasks.draft_campaign(DEMO_SETTINGS, demo), "limit_reached")
+    demo_spend(conn, 4950)
+    assert refused(tasks.draft_campaign(DEMO_SETTINGS, actor(conn, "demo")), "over_demo_daily_cap")
+    owner = actor(conn, "owner")
+    campaign_id = approved_campaign(owner)
+    paypal.balance = "250.00"
+    assert refused(tasks.submit_campaign(campaign_id, owner), "low_balance")
+    paypal.balance = "5033.32"
+    assert tasks.submit_campaign(campaign_id, owner)["sent"] is True
+    for _ in range(10):
+        conn.execute("insert into simulated_orders (simulated_order_id, campaign_id, ref) values (%s, %s, 'R1')", (uuid.uuid4(), uuid.UUID(campaign_id)))
+    assert refused(tasks.simulate_return(campaign_id, "R1", owner), "limit_reached")
+    # Refusals with any other code write none.
+    assert refused(tasks.draft_campaign({**DEMO_SETTINGS, "budget_minor": 1001}, actor(conn, "demo")), "budget_over_cap")
+    assert refused(tasks.view_campaign("not-a-uuid", demo), "invalid_input")
+
+    rows = conn.execute("select actor, detail from audit_log where action = 'limit_hit' order by id").fetchall()
+    assert rows == [
+        ("engine", {"task": "draft_campaign", "code": "over_cap", "role": "demo"}),
+        ("engine", {"task": "draft_campaign", "code": "limit_reached", "role": "demo"}),
+        ("engine", {"task": "draft_campaign", "code": "over_demo_daily_cap", "role": "demo"}),
+        ("engine", {"task": "submit_campaign", "code": "low_balance", "role": "owner"}),
+        ("engine", {"task": "simulate_return", "code": "limit_reached", "role": "owner"}),
+    ]
 
 
 def test_simulate_and_results_return_json_safe_answers(conn: psycopg.Connection, paypal: FakePayPal) -> None:

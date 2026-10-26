@@ -27,6 +27,7 @@ import traceback
 import uuid
 from collections.abc import Callable, Iterable, Iterator
 from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import replace
 from datetime import date, datetime, time, timedelta, timezone
 from decimal import Decimal
@@ -66,6 +67,7 @@ from mend_engine.members.membership import (
     leave_member,
     match_member_to_customer,
 )
+from mend_engine.paypal.balances import BalanceTooLow
 from mend_engine.paypal.http import PayPalError, PayPalHttp
 from mend_engine.paypal.payouts import SnapshotRefused, normalise_email, note_problem
 from mend_engine.store_facts import CDNOW_KEY, UCI_KEY, read_facts
@@ -102,12 +104,18 @@ DEMO_ITEM_CAP_MINOR = 200
 DEMO_CAMPAIGN_CAP_MINOR = 1000
 DEMO_DAILY_CAP_MINOR = 5000
 DEMO_CAMPAIGNS_PER_SESSION_PER_DAY = 5
+DEMO_SUBMITS_PER_SESSION_PER_DAY = 2
+# Scoring and drafting cost grows with the candidates asked for; the owner keeps build_draft's 2 to 250.
+DEMO_MAX_CANDIDATES = 20
+# Refusal codes that mean a limit was hit. Each one writes a "limit_hit" audit row (C20, C23).
+LIMIT_CODES = frozenset({"limit_reached", "over_cap", "low_balance", "over_demo_daily_cap"})
 # Must match the web app's idle limit (packages/web/src/server/sessions.ts), so a
 # session the web app would refuse is refused here too.
 SESSION_IDLE = timedelta(hours=2)
 
 # Lock keys. The two-number form keeps one lock per demo session for drafting; the
-# single number serialises demo submissions, so two cannot both fit under the demo pool.
+# single number serialises demo submissions, so two cannot both fit under the demo pool
+# or both be a session's second send of the day.
 DRAFT_LOCK_CLASS = 773131
 DEMO_SPEND_LOCK = 7731300005
 
@@ -155,6 +163,9 @@ _SECRET_ENV_NAMES = (
     "MEND_ENGINE_TOKEN",
     "RENDER_API_KEY",
 )
+# The role of the actor the running task checked, so a refusal raised anywhere below
+# it, in this module or another, is recorded against the right role. _run resets it.
+_ACTING_ROLE: ContextVar[str | None] = ContextVar("mend_acting_role", default=None)
 
 
 class _Refused(Exception):
@@ -163,6 +174,10 @@ class _Refused(Exception):
     def __init__(self, code: str, detail: str) -> None:
         super().__init__(detail)
         self.code = code
+
+
+# Every refusal that carries a code: _Refused as code, the others as reason.
+_CODED_REFUSALS = (_Refused, DraftRefused, ApprovalRefused, simulate.SimulateRefused)
 
 
 def _load_config() -> Config:
@@ -198,16 +213,20 @@ def draft_campaign(settings: object, actor: object) -> dict:
 
     settings is {"goal_text", "as_of" (YYYY-MM-DD), "budget_minor", "per_recipient_minor",
     "holdout_share" (a string such as "0.30"), "max_candidates"} and nothing else.
-    A demo actor drafts under 1000 cents per campaign and 200 per person, at most 5
-    campaigns per session in any 24 hours, and the demo pool of 5000 cents per rolling
-    day. The campaign is recorded against the actor's session in campaign_owners in
-    the same transaction as the draft. Returns campaign_id and counts; refusals carry
-    build_draft's reason, "limit_reached" or "over_demo_daily_cap".
+    A demo actor drafts under 1000 cents per campaign and 200 per person, from at most
+    20 candidates, at most 5 campaigns per session in any 24 hours, and the demo pool
+    of 5000 cents per rolling day; a demo max_candidates above 20 is refused before
+    anything is scored. The campaign is recorded against the actor's session in
+    campaign_owners in the same transaction as the draft. Returns campaign_id and
+    counts; refusals carry build_draft's reason, "over_cap", "limit_reached" or
+    "over_demo_daily_cap".
     """
 
     def work(config: Config, conn: psycopg.Connection) -> dict:
         role, session = _checked_actor(conn, actor)
         draft_settings = _checked_settings(settings)
+        if role == "demo" and draft_settings.max_candidates > DEMO_MAX_CANDIDATES:
+            raise _Refused("over_cap", f"a demo draft may consider at most {DEMO_MAX_CANDIDATES} candidates")
         with conn.transaction():
             if role == "demo":
                 # Held until commit, so two drafts from one session cannot both pass the count.
@@ -314,30 +333,41 @@ def approve_campaign(campaign_id: object, actor: object, presented_hash: object)
 def submit_campaign(campaign_id: object, actor: object) -> dict:
     """Send the actor's approved campaign as its one Payouts batch (C1, C3).
 
-    A demo actor's batch must also fit the demo pool; demo submissions take one lock
-    so two cannot both use the same headroom. Calling it again never sends a second
-    batch: sent is True only for the call that sent it.
+    A demo session may send at most 2 campaigns in any 24 hours, and its batch must
+    also fit the demo pool; demo submissions take one lock so two cannot both use
+    the same headroom or the same allowance. A demo send past either is refused,
+    "limit_reached" or "over_demo_daily_cap", before anything is sent. Calling it
+    again never sends a second batch, so a campaign already in the ledger is not
+    held to the 2 a day: sent is True only for the call that sent it. For either
+    role, a send the shop's PayPal balance cannot cover with the floor left over is
+    refused "low_balance", or "balance_unavailable" when the balance cannot be
+    read; the campaign stays approved and can be sent later.
     """
 
     def work(config: Config, conn: psycopg.Connection) -> dict:
         role, session = _checked_actor(conn, actor)
         cid = _checked_campaign(conn, campaign_id, role, session)
         role_config = _role_config(config, role)
-        with _paypal_client(config) as http:
-            if role != "demo":
-                result = submit(conn, http, cid, role_config)
-            else:
-                conn.execute("select pg_advisory_lock(%s)", (DEMO_SPEND_LOCK,))
-                try:
-                    in_ledger = conn.execute(
-                        "select 1 from payout_batches where campaign_id = %s", (str(cid),)
-                    ).fetchone()
-                    snap = frozen_snapshot(conn, cid)
-                    if snap is not None and in_ledger is None:
-                        _check_demo_pool(conn, sum(item.amount_minor for item in snap.items))
+        try:
+            with _paypal_client(config) as http:
+                if role != "demo":
                     result = submit(conn, http, cid, role_config)
-                finally:
-                    conn.execute("select pg_advisory_unlock(%s)", (DEMO_SPEND_LOCK,))
+                else:
+                    conn.execute("select pg_advisory_lock(%s)", (DEMO_SPEND_LOCK,))
+                    try:
+                        in_ledger = conn.execute(
+                            "select 1 from payout_batches where campaign_id = %s", (str(cid),)
+                        ).fetchone()
+                        if in_ledger is None:
+                            _check_demo_submits(conn, session)
+                        snap = frozen_snapshot(conn, cid)
+                        if snap is not None and in_ledger is None:
+                            _check_demo_pool(conn, sum(item.amount_minor for item in snap.items))
+                        result = submit(conn, http, cid, role_config)
+                    finally:
+                        conn.execute("select pg_advisory_unlock(%s)", (DEMO_SPEND_LOCK,))
+        except BalanceTooLow as short:
+            raise _Refused(short.code, str(short)) from None
         return {
             "ok": True,
             "campaign_id": str(cid),
@@ -782,13 +812,21 @@ def purge() -> dict:
 
 
 def _run(task: str, work: Callable[[Config, psycopg.Connection], dict]) -> dict:
-    """Run one task's work and turn every outcome into a JSON-safe dict; never raises."""
+    """Run one task's work and turn every outcome into a JSON-safe dict; never raises.
+
+    A refusal whose code is in LIMIT_CODES also writes one "limit_hit" audit row.
+    """
     ref = str(uuid.uuid4())
     config: Config | None = None
+    acting = _ACTING_ROLE.set(None)
     try:
         config = _load_config()
         with _database(config) as conn:
-            result = work(config, conn)
+            try:
+                result = work(config, conn)
+            except _CODED_REFUSALS as refused:
+                _record_limit_hit(conn, task, refused, config)
+                raise
         # Checked here so a value JSON cannot carry fails now, as a logged error, not in the caller.
         json.dumps(result, allow_nan=False)
         _log({"task": task, "ref": ref, "outcome": "ok"})
@@ -813,6 +851,21 @@ def _run(task: str, work: Callable[[Config, psycopg.Connection], dict]) -> dict:
         return _failure(task, ref, "internal", broken, config)
     except Exception as unexpected:
         return _failure(task, ref, "internal", unexpected, config)
+    finally:
+        _ACTING_ROLE.reset(acting)
+
+
+def _record_limit_hit(conn: psycopg.Connection, task: str, refused: Exception, config: Config) -> None:
+    """One "limit_hit" audit row holding only the task, the code and the actor's role, when the refusal's code is a limit."""
+    code = _code(refused.code if isinstance(refused, _Refused) else getattr(refused, "reason", None))
+    if code not in LIMIT_CODES:
+        return
+    try:
+        with conn.transaction():
+            conn.execute(_INSERT_AUDIT, ("engine", "limit_hit", Jsonb({"task": task, "code": code, "role": _ACTING_ROLE.get()})))
+    except psycopg.Error as lost:
+        # The refusal stays the answer; a row that could not be written is logged instead.
+        _log({"task": task, "outcome": "limit_hit_not_recorded", "error": code, "detail": _scrub(str(lost), config)})
 
 
 def _refusal(task: str, ref: str, code: str, exc: BaseException, config: Config | None) -> dict:
@@ -882,6 +935,7 @@ def _checked_actor(conn: psycopg.Connection, actor: object) -> tuple[str, str]:
     ).fetchone()
     if live is None or live[0] != role:
         raise _Refused("forbidden", "the actor's session is not live with that role")
+    _ACTING_ROLE.set(role)
     return role, session
 
 
@@ -1010,6 +1064,21 @@ def _check_demo_pool(conn: psycopg.Connection, extra_minor: int) -> None:
             "over_demo_daily_cap",
             f"demo campaigns spent {spent} cents in 24 hours; {extra_minor} more would pass {DEMO_DAILY_CAP_MINOR}",
         )
+
+
+def _check_demo_submits(conn: psycopg.Connection, session: str) -> None:
+    """Refuse once this demo session's campaigns hold DEMO_SUBMITS_PER_SESSION_PER_DAY batches written in the last 24 hours.
+
+    A campaign counts from the moment its payout_batches row is written, the same
+    moment the shop's cap and the demo pool start counting it.
+    """
+    sent = conn.execute(
+        "select count(*) from campaign_owners o where o.role = 'demo' and o.session_id = %s and exists "
+        "(select 1 from payout_batches b where b.campaign_id = o.campaign_id::text and b.created_at > now() - %s)",
+        (session, WINDOW),
+    ).fetchone()[0]
+    if sent >= DEMO_SUBMITS_PER_SESSION_PER_DAY:
+        raise _Refused("limit_reached", f"a demo session may send {DEMO_SUBMITS_PER_SESSION_PER_DAY} campaigns a day")
 
 
 def _approver(role: str, session: str) -> str:

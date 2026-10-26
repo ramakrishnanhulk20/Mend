@@ -15,7 +15,7 @@ from psycopg import sql
 from mend_engine.config import SANDBOX_API_HOST, Config
 from mend_engine.db.connect import PGDATA
 from mend_engine.db.migrate import apply_schema
-from mend_engine.events.process import EVENT_LOCK, MAX_ATTEMPTS, process_events
+from mend_engine.events.process import EVENT_LOCK, MAX_ATTEMPTS, MAX_PASSES, process_events
 from mend_engine.maintenance.purge import purge_paypal_events
 from mend_engine.paypal.http import PayPalHttp
 
@@ -143,6 +143,34 @@ class FakePayPal:
 
     def http(self) -> PayPalHttp:
         return PayPalHttp(CONFIG, transport=httpx.MockTransport(self))
+
+
+class ArrivingPayPal(FakePayPal):
+    """FakePayPal that calls on_read before each re-read is answered, as when a delivery lands mid-run."""
+
+    def __init__(self, on_read, answers: dict[str, dict] | None = None) -> None:
+        super().__init__(answers)
+        self.on_read = on_read
+
+    def __call__(self, request: httpx.Request) -> httpx.Response:
+        if request.url.path != "/v1/oauth2/token":
+            self.on_read()
+        return super().__call__(request)
+
+
+@pytest.fixture
+def other(server_url: str, conn: psycopg.Connection) -> Iterator[psycopg.Connection]:
+    """A second connection to the same test schema, as the web receiver's process holds."""
+    schema = conn.execute("select current_schema()").fetchone()[0]
+    with psycopg.connect(server_url, autocommit=True) as connection:
+        connection.execute(sql.SQL("set search_path to {}").format(sql.Identifier(schema)))
+        yield connection
+
+
+def attempts(conn: psycopg.Connection, transmission_id: str) -> int:
+    return conn.execute(
+        "select count(*) from audit_log where action = 'event_attempt_failed' and detail ->> 'transmission_id' = %s", (transmission_id,)
+    ).fetchone()[0]
 
 
 def outcome(conn: psycopg.Connection, transmission_id: str) -> tuple | None:
@@ -347,6 +375,48 @@ def test_each_delivery_gets_one_outcome_oldest_first_and_a_second_run_waits_for_
     for bad in (0, 501, 1.5, True):
         with pytest.raises(ValueError):
             process_events(conn, paypal.http(), limit=bad)
+
+
+def test_a_delivery_stored_while_a_run_holds_the_lock_is_picked_up_by_that_calls_next_pass(
+    conn: psycopg.Connection, other: psycopg.Connection
+) -> None:
+    sent(conn)
+    nudges: list[tuple[str, object]] = []
+
+    def arrives() -> None:
+        # The web receiver stores a delivery and nudges a run, which finds the lock held.
+        if not nudges:
+            late = deliver(other, "CHECKOUT.ORDER.APPROVED", {})
+            nudges.append((late, process_events(other, paypal.http())))
+
+    paypal = ArrivingPayPal(arrives, {"/v1/payments/payouts-item/ITEM1": item_answer("ITEM1", "SUCCESS")})
+    first = deliver(conn, "PAYMENT.PAYOUTS-ITEM.SUCCEEDED", {"payout_item_id": "ITEM1"})
+
+    report = process_events(conn, paypal.http())
+
+    [(late, nudge)] = nudges
+    assert (nudge.ran, nudge.passes, nudge.outcomes) == (False, 0, {})
+    assert (report.ran, report.passes, report.outcomes) == (True, 2, {"status recorded": 1, "ignored": 1})
+    assert (outcome(conn, first)[0], outcome(conn, late)[0]) == ("status recorded", "ignored")
+
+
+def test_a_call_runs_at_most_three_passes_and_tries_each_delivery_once(conn: psycopg.Connection, other: psycopg.Connection) -> None:
+    sent(conn)
+    stored: list[str] = []
+
+    def arrives() -> None:
+        stored.append(deliver(other, "PAYMENT.PAYOUTS-ITEM.SUCCEEDED", {"payout_item_id": f"ITEM{len(stored) + 2}"}))
+
+    # No answers: every re-read gets a 503, so every delivery waits for a retry.
+    paypal = ArrivingPayPal(arrives)
+    first = deliver(conn, "PAYMENT.PAYOUTS-ITEM.SUCCEEDED", {"payout_item_id": "ITEM1"})
+
+    report = process_events(conn, paypal.http())
+
+    assert (report.passes, report.retrying, report.outcomes) == (MAX_PASSES, 3, {}) and MAX_PASSES == 3
+    assert paypal.reads == [f"/v1/payments/payouts-item/ITEM{n}" for n in (1, 2, 3)]
+    # The waiting delivery cost one attempt, not one per pass; the one stored in pass 3 waits untried.
+    assert (attempts(conn, first), attempts(conn, stored[-1]), outcome(conn, stored[-1])) == (1, 0, None)
 
 
 def test_outcomes_hold_no_payload_email_or_name_and_survive_the_purge(conn: psycopg.Connection) -> None:

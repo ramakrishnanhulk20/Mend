@@ -12,9 +12,11 @@ from mend_engine.paypal.http import PayPalError, PayPalHttp
 from mend_engine.paypal.payouts import (
     BatchExistsUnresolved,
     BatchSnapshot,
+    PayoutIdRefused,
     PayoutItemSpec,
     SnapshotRefused,
     SubmissionUnknown,
+    cancel_item,
     canonical_json,
     sender_batch_id_for,
     submit_batch,
@@ -366,3 +368,55 @@ def test_server_error_then_already_exists_with_a_known_id_returns_already_existe
     assert len(script.posts) == 2
     assert script.posts[0].headers["PayPal-Request-Id"] == script.posts[1].headers["PayPal-Request-Id"] == sbid
     assert sleeps == [2]
+
+
+def cancelled_answer(item_id: str = "ITEM1", status: str = "RETURNED") -> httpx.Response:
+    # The live sandbox answer's fields (M7e-1 probe), with a receiver that must never be read.
+    return httpx.Response(
+        200,
+        json={
+            "payout_item_id": item_id,
+            "transaction_status": status,
+            "payout_batch_id": "BATCH1",
+            "sender_batch_id": "mend-x",
+            "payout_item": {"receiver": "m1@shop.example", "sender_item_id": "R1"},
+            "errors": {"name": "RECEIVER_UNREGISTERED"},
+            "links": [],
+        },
+    )
+
+
+def test_cancel_item_posts_an_empty_body_once_and_returns_paypals_status() -> None:
+    script = PayPalScript([cancelled_answer()])
+    http = PayPalHttp(make_config(), transport=httpx.MockTransport(script))
+    assert cancel_item(http, "ITEM1") == "RETURNED"
+    [post] = script.posts
+    assert (post.url.host, post.url.path) == (SANDBOX_API_HOST, "/v1/payments/payouts-item/ITEM1/cancel")
+    assert json.loads(post.content) == {} and post.headers["Content-Type"] == "application/json"
+
+
+@pytest.mark.parametrize(
+    ("answer", "status"),
+    [
+        (httpx.Response(422, json={"name": "ITEM_INCORRECT_STATUS", "debug_id": "dbg"}), 422),
+        (httpx.Response(500, json={"name": "INTERNAL_SERVER_ERROR"}), 500),
+        (cancelled_answer(status="returned"), 200),
+        (cancelled_answer(item_id="ITEM2"), 200),
+    ],
+    ids=["422", "500 not retried", "lowercase status", "another item"],
+)
+def test_cancel_item_raises_paypal_error_with_the_status_for_any_other_answer(answer: httpx.Response, status: int) -> None:
+    script = PayPalScript([answer])
+    http = PayPalHttp(make_config(), transport=httpx.MockTransport(script))
+    with pytest.raises(PayPalError) as caught:
+        cancel_item(http, "ITEM1")
+    assert caught.value.status == status and len(script.posts) == 1
+
+
+@pytest.mark.parametrize("bad", ["../oauth2", "item1", "A" * 33, "", None, 7])
+def test_cancel_item_refuses_a_malformed_id_before_any_request(bad: object) -> None:
+    script = PayPalScript([])
+    http = PayPalHttp(make_config(), transport=httpx.MockTransport(script))
+    with pytest.raises(PayoutIdRefused):
+        cancel_item(http, bad)  # type: ignore[arg-type]
+    assert script.posts == [] and http.requests_sent == 0

@@ -48,10 +48,14 @@ DEMO_SETTINGS = {
 
 
 class FakePayPal:
-    """Answers the token, Payouts create and Orders create calls, and records every other request."""
+    """Answers the token, Payouts create, item cancel and Orders create calls, and records every other request.
+
+    A cancel is answered RETURNED, or with cancel_status when that is not 200.
+    """
 
     def __init__(self) -> None:
         self.requests: list[httpx.Request] = []
+        self.cancel_status = 200
 
     def __call__(self, request: httpx.Request) -> httpx.Response:
         if request.url.path == "/v1/oauth2/token":
@@ -65,6 +69,10 @@ class FakePayPal:
             )
         if request.method == "POST" and request.url.path == "/v2/checkout/orders":
             return httpx.Response(201, json={"id": "5O190127TN364715T", "status": "COMPLETED"})
+        if request.method == "POST" and request.url.path.startswith(payouts.PAYOUT_ITEM_PATH) and request.url.path.endswith("/cancel"):
+            if self.cancel_status != 200:
+                return httpx.Response(self.cancel_status, json={"name": "INTERNAL_SERVER_ERROR"})
+            return httpx.Response(200, json={"payout_item_id": request.url.path.split("/")[-2], "transaction_status": "RETURNED"})
         return httpx.Response(404, json={"name": "RESOURCE_NOT_FOUND"})
 
     def money_requests(self) -> list[httpx.Request]:
@@ -162,8 +170,8 @@ def actor(conn: psycopg.Connection, role: str, *, idle: bool = False, expired: b
     return {"role": role, "session": session}
 
 
-def demo_spend(conn: psycopg.Connection, cents: int) -> None:
-    """A demo-created campaign that reached submitting just now, carrying cents in 10-cent items."""
+def demo_spend(conn: psycopg.Connection, cents: int) -> str:
+    """A demo-created campaign that reached submitting just now, carrying cents in 10-cent items R1... Returns its sender_batch_id."""
     campaign_id = conn.execute(
         "insert into campaigns (shop_name, goal_text, as_of, budget_minor, per_recipient_minor, holdout_share, status) "
         "values ('Shop', 'goal', '2026-10-16', 1000, 10, 0.5, 'submitted') returning campaign_id"
@@ -176,6 +184,7 @@ def demo_spend(conn: psycopg.Connection, cents: int) -> None:
         (sender_batch_id_for(snap), str(campaign_id), snapshot_hash(snap)),
     )
     conn.execute("insert into campaign_owners values (%s, 'demo', %s)", (campaign_id, "e" * 64))
+    return sender_batch_id_for(snap)
 
 
 def counts(conn: psycopg.Connection) -> tuple:
@@ -236,6 +245,21 @@ def test_the_demo_pool_of_5000_cents_a_day_is_shared_by_every_demo_session(conn:
     assert counts(conn) == before
     assert tasks.draft_campaign({**DEMO_SETTINGS, "budget_minor": 50}, actor(conn, "demo"))["ok"] is True
     assert tasks.draft_campaign(DEMO_SETTINGS, actor(conn, "owner"))["ok"] is True
+
+
+def test_returned_demo_items_free_the_demo_pool_and_items_with_no_status_still_count(conn: psycopg.Connection, paypal: FakePayPal) -> None:
+    seed_shop(conn)
+    sender_batch_id = demo_spend(conn, 4950)
+    assert refused(tasks.draft_campaign(DEMO_SETTINGS, actor(conn, "demo")), "over_demo_daily_cap")
+    # 100 ten-cent items came back and three more never left or were refunded; one waits unclaimed.
+    marks = [(f"R{n}", "RETURNED") for n in range(1, 101)] + [("R101", "FAILED"), ("R102", "BLOCKED"), ("R103", "REFUNDED"), ("R104", "UNCLAIMED")]
+    with conn.cursor() as cur:
+        cur.executemany(
+            "insert into payout_items (payout_item_id, sender_batch_id, sender_item_id, status) values (%s, %s, %s, %s)",
+            [("ITEM" + ref, sender_batch_id, ref, status) for ref, status in marks],
+        )
+    assert tasks.demo_spent_last_24h_minor(conn) == 4950 - 1000 - 30
+    assert tasks.draft_campaign(DEMO_SETTINGS, actor(conn, "demo"))["ok"] is True
 
 
 def test_another_demo_session_gets_not_found_for_everything_on_a_campaign_it_did_not_create(
@@ -325,7 +349,73 @@ def test_simulate_and_results_return_json_safe_answers(conn: psycopg.Connection,
     assert order == {"ok": True, "campaign_id": campaign_id, "ref": "R1", "paypal_order_id": "5O190127TN364715T", "paypal_status": "COMPLETED"}
     assert found["ok"] and found["status"] == "submitted" and found["verdict"] == "too early to tell"
     assert found["rewarded"]["members"] + found["holdout"]["members"] == 10
+    # Sent, and PayPal has reported on no item yet: all five wait as PENDING.
+    assert found["payouts"] == {
+        "items": 5, "by_status": {"PENDING": 5}, "claimed_minor": 0, "unclaimed_minor": 0, "returned_minor": 0,
+        "failed_minor": 0, "pending_minor": 1000, "unclaimed_return_by": None,
+    }
     json.dumps(found, allow_nan=False)
+
+
+def sent_with_items(conn: psycopg.Connection, sender: dict) -> tuple[str, int]:
+    """A campaign sender drafted, approved and sent: its first item waits unclaimed, its second was claimed.
+
+    Returns the campaign id and the first item's approved amount.
+    """
+    campaign_id = tasks.draft_campaign(DEMO_SETTINGS, sender)["campaign_id"]
+    assert tasks.approve_campaign(campaign_id, sender, tasks.view_campaign(campaign_id, sender)["review_hash"])["ok"]
+    assert tasks.submit_campaign(campaign_id, sender)["sent"] is True
+    sender_batch_id = conn.execute("select sender_batch_id from payout_batches where campaign_id = %s", (campaign_id,)).fetchone()[0]
+    snapshot = conn.execute("select canonical_json from approved_snapshots where campaign_id = %s", (uuid.UUID(campaign_id),)).fetchone()[0]
+    items = json.loads(snapshot)["items"]
+    for n, (item, status) in enumerate(zip(items, ("UNCLAIMED", "SUCCESS")), start=1):
+        conn.execute(
+            "insert into payout_items (payout_item_id, sender_batch_id, sender_item_id, status) values (%s, %s, %s, %s)",
+            (f"ITEM{n}", sender_batch_id, item["sender_item_id"], status),
+        )
+    return campaign_id, items[0]["amount_minor"]
+
+
+def cancels(paypal: FakePayPal) -> list[str]:
+    return [r.url.path for r in paypal.requests if r.url.path.endswith("/cancel")]
+
+
+def test_cancel_unclaimed_refuses_a_campaign_with_no_payout_batch(conn: psycopg.Connection, paypal: FakePayPal) -> None:
+    seed_shop(conn)
+    owner = actor(conn, "owner")
+    campaign_id = tasks.draft_campaign(DEMO_SETTINGS, owner)["campaign_id"]
+    assert refused(tasks.cancel_unclaimed(campaign_id, owner), "not_submitted")
+    assert paypal.requests == []
+
+
+def test_cancel_unclaimed_works_for_its_creator_and_the_owner_and_is_not_found_for_another_demo_session(
+    conn: psycopg.Connection, paypal: FakePayPal
+) -> None:
+    seed_shop(conn)
+    creator = actor(conn, "demo")
+    campaign_id, first_amount = sent_with_items(conn, creator)
+
+    assert refused(tasks.cancel_unclaimed(campaign_id, actor(conn, "demo")), "not_found")
+    assert refused(tasks.cancel_unclaimed(str(uuid.uuid4()), creator), "not_found")
+    assert cancels(paypal) == []
+
+    assert tasks.cancel_unclaimed(campaign_id, creator) == {
+        "ok": True, "campaign_id": campaign_id, "cancelled": 1, "returned_minor": first_amount, "still_unclaimed": 0, "not_cancellable": 0,
+    }
+    assert cancels(paypal) == ["/v1/payments/payouts-item/ITEM1/cancel"]
+    assert tasks.cancel_unclaimed(campaign_id, actor(conn, "owner")) == {
+        "ok": True, "campaign_id": campaign_id, "cancelled": 0, "returned_minor": 0, "still_unclaimed": 0, "not_cancellable": 0,
+    }
+    assert len(cancels(paypal)) == 1 and "cancel_unclaimed" in tasks.TASK_NAMES
+
+
+def test_cancel_unclaimed_fails_as_paypal_unavailable_when_paypal_errors(conn: psycopg.Connection, paypal: FakePayPal) -> None:
+    seed_shop(conn)
+    owner = actor(conn, "owner")
+    campaign_id, _ = sent_with_items(conn, owner)
+    paypal.cancel_status = 503
+    assert refused(tasks.cancel_unclaimed(campaign_id, owner), "paypal_unavailable")
+    assert conn.execute("select status from payout_items where payout_item_id = 'ITEM1'").fetchone() == ("UNCLAIMED",)
 
 
 def test_the_scheduled_tasks_run_with_no_actor(conn: psycopg.Connection, paypal: FakePayPal) -> None:

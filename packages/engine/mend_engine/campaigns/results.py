@@ -5,14 +5,17 @@ rates, the test and the verdict; simulated ones are shown beside them so a demo
 can be seen working without its button presses passing for lift. Spend is the
 amount of every item PayPal says is SUCCESS or still PENDING (an unknown status
 counts as PENDING), priced from the frozen approved snapshot by sender_item_id.
+The payouts block prices every item of the batch the same way and says where each
+one stands, so a reward that failed, waits unclaimed or came back is shown plainly.
 """
 
 from __future__ import annotations
 
 import math
 import uuid
+from collections import Counter
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 
 import psycopg
 from scipy.stats import norm
@@ -21,11 +24,45 @@ from mend_engine.campaigns.approval import frozen_snapshot
 from mend_engine.campaigns.attribution import attribution_window
 from mend_engine.campaigns.spend import database_now
 from mend_engine.events.payout_status import effective
+from mend_engine.paypal.payouts import BatchSnapshot
 
 MIN_PER_ARM = 30
 SIGNIFICANCE = 0.05
 TOO_EARLY = "too early to tell"
 SPENT_STATUSES = ("SUCCESS", "PENDING")
+CLAIMED_STATUSES = ("SUCCESS",)
+UNCLAIMED_STATUSES = ("UNCLAIMED",)
+RETURNED_STATUSES = ("RETURNED", "REFUNDED")
+FAILED_STATUSES = ("FAILED", "BLOCKED")
+# PayPal returns an unclaimed payout to the shop by itself this long after sending it.
+UNCLAIMED_RETURN_AFTER = timedelta(days=30)
+
+
+@dataclass(frozen=True)
+class PayoutStanding:
+    """Where each item of the campaign's batch stands now, in USD cents at its approved amount.
+
+    Realised first: claimed_minor (SUCCESS) is in the customer's PayPal account.
+    Not realised: unclaimed_minor (UNCLAIMED) has left the shop's balance but waits
+    for the customer to claim it, and pending_minor is every item not in another
+    bucket, one PayPal has not reported on yet included. returned_minor (RETURNED,
+    REFUNDED) came back to the shop; failed_minor (FAILED, BLOCKED) never left it.
+    items counts the snapshot's items and by_status counts them by the status every
+    decision reads (effective), so its keys are only ever PayPal's known statuses,
+    with an unknown or missing status counted as PENDING. unclaimed_return_by is 30
+    days after the earliest ledger row of a batch holding an UNCLAIMED item, when
+    PayPal returns that money by itself, or None when nothing waits. Everything is
+    zero, and by_status empty, until the campaign has a payout batch.
+    """
+
+    items: int
+    by_status: dict[str, int]
+    claimed_minor: int
+    unclaimed_minor: int
+    returned_minor: int
+    failed_minor: int
+    pending_minor: int
+    unclaimed_return_by: datetime | None
 
 
 @dataclass(frozen=True)
@@ -53,6 +90,7 @@ class CampaignResults:
     window_open: bool
     p_value: float | None
     verdict: str
+    payouts: PayoutStanding
 
 
 def lift_p_value(rewarded_returns: int, rewarded: int, holdout_returns: int, holdout: int) -> float:
@@ -103,7 +141,8 @@ def campaign_results(conn: psycopg.Connection, campaign_id: uuid.UUID) -> Campai
     }
     rewarded = _arm(sizes.get("reward", 0), returns.get(("reward", False), 0), returns.get(("reward", True), 0))
     holdout = _arm(sizes.get("holdout", 0), returns.get(("holdout", False), 0), returns.get(("holdout", True), 0))
-    spend, fees = _spend_and_fees(conn, campaign_id)
+    snap = frozen_snapshot(conn, campaign_id)
+    spend, fees = _spend_and_fees(conn, campaign_id, snap)
 
     window = attribution_window(conn, campaign_id)
     window_open = window is None or database_now(conn) < window[1]
@@ -128,6 +167,7 @@ def campaign_results(conn: psycopg.Connection, campaign_id: uuid.UUID) -> Campai
         window_open=window_open,
         p_value=p_value,
         verdict=verdict,
+        payouts=_payout_standing(conn, campaign_id, snap),
     )
 
 
@@ -135,8 +175,51 @@ def _arm(members: int, real: int, simulated: int) -> ArmResults:
     return ArmResults(members, real, real / members if members else None, simulated)
 
 
-def _spend_and_fees(conn: psycopg.Connection, campaign_id: uuid.UUID) -> tuple[int, int]:
-    snap = frozen_snapshot(conn, campaign_id)
+def _payout_standing(conn: psycopg.Connection, campaign_id: uuid.UUID, snap: BatchSnapshot | None) -> PayoutStanding:
+    batch = conn.execute("select 1 from payout_batches where campaign_id = %s", (str(campaign_id),)).fetchone()
+    if snap is None or batch is None:
+        return PayoutStanding(0, {}, 0, 0, 0, 0, 0, None)
+    ledger: dict[str, list[tuple[str, datetime]]] = {}
+    for sender_item_id, status, batch_created_at in conn.execute(
+        "select i.sender_item_id, i.status, b.created_at from payout_items i "
+        "join payout_batches b on b.sender_batch_id = i.sender_batch_id where b.campaign_id = %s",
+        (str(campaign_id),),
+    ):
+        ledger.setdefault(sender_item_id, []).append((status, batch_created_at))
+    by_status: Counter[str] = Counter()
+    claimed = unclaimed = returned = failed = pending = 0
+    waiting_since: datetime | None = None
+    for item in snap.items:
+        rows = ledger.get(item.sender_item_id, [])
+        # The ledger holds one row per item; if it ever held two, neither is believed.
+        status, batch_created_at = rows[0] if len(rows) == 1 else (None, None)
+        current = effective(status)
+        by_status[current] += 1
+        if current in CLAIMED_STATUSES:
+            claimed += item.amount_minor
+        elif current in UNCLAIMED_STATUSES:
+            unclaimed += item.amount_minor
+            if waiting_since is None or batch_created_at < waiting_since:
+                waiting_since = batch_created_at
+        elif current in RETURNED_STATUSES:
+            returned += item.amount_minor
+        elif current in FAILED_STATUSES:
+            failed += item.amount_minor
+        else:
+            pending += item.amount_minor
+    return PayoutStanding(
+        items=len(snap.items),
+        by_status=dict(by_status),
+        claimed_minor=claimed,
+        unclaimed_minor=unclaimed,
+        returned_minor=returned,
+        failed_minor=failed,
+        pending_minor=pending,
+        unclaimed_return_by=waiting_since + UNCLAIMED_RETURN_AFTER if waiting_since is not None else None,
+    )
+
+
+def _spend_and_fees(conn: psycopg.Connection, campaign_id: uuid.UUID, snap: BatchSnapshot | None) -> tuple[int, int]:
     price = {item.sender_item_id: item.amount_minor for item in snap.items} if snap else {}
     spend = fees = 0
     for sender_item_id, status, fee_minor in conn.execute(

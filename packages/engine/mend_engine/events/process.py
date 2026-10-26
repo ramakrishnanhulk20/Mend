@@ -32,6 +32,9 @@ from mend_engine.paypal.payouts import get_batch, get_item
 ACTOR = "events"
 MAX_ATTEMPTS = 5
 MAX_LIMIT = 500
+# A delivery stored while a run holds the lock is picked up by that run's next pass;
+# the cap stops a steady stream of deliveries from keeping one call going for ever.
+MAX_PASSES = 3
 # Held for a whole run, so two runs never act on the same event at once (C20).
 EVENT_LOCK = 7731300004
 ITEM_PREFIX = "PAYMENT.PAYOUTS-ITEM."
@@ -55,12 +58,14 @@ class ProcessReport:
 
     outcomes counts the outcome rows this run wrote, by outcome. retrying counts
     events left without an outcome for the next run, because PayPal could not be
-    read or the ledger is still waiting on the batch's id.
+    read or the ledger is still waiting on the batch's id. passes counts the times
+    this call held the lock and read deliveries: 0 when ran is False, at most 3.
     """
 
     ran: bool
     outcomes: dict[str, int] = field(default_factory=dict)
     retrying: int = 0
+    passes: int = 0
 
     @property
     def processed(self) -> int:
@@ -99,37 +104,66 @@ def process_events(conn: psycopg.Connection, http: PayPalHttp, *, limit: int = 1
     run retries; the fifth failed attempt across runs writes "gave up".
 
     Each outcome is written in one transaction with its effects and an audit row.
-    Returns ran False, reading nothing, when another run holds the lock. Raises
-    ValueError for a limit that is not a whole number from 1 to 500.
+    Returns ran False, reading nothing, when another run holds the lock.
+
+    After a pass releases the lock, if a delivery this call has not tried is still
+    without an outcome (one stored while the lock was held, whose own nudge found
+    the lock taken and returned ran False), the call takes the lock again and runs
+    another pass: at most 3 passes and limit deliveries in all. A delivery this call
+    already tried, such as one waiting on PayPal, is left for the next call, so a
+    retry still costs one attempt per call. Raises ValueError for a limit that is
+    not a whole number from 1 to 500.
     """
     if type(limit) is not int or not 1 <= limit <= MAX_LIMIT:
         raise ValueError(f"limit must be a whole number from 1 to {MAX_LIMIT}")
-    if not conn.execute("select pg_try_advisory_lock(%s)", (EVENT_LOCK,)).fetchone()[0]:
-        return ProcessReport(ran=False)
     outcomes: Counter[str] = Counter()
     retrying = 0
-    try:
-        rows = conn.execute(
-            "select e.transmission_id, e.event_type, e.raw from paypal_events e "
-            "where not exists (select 1 from event_outcomes o where o.transmission_id = e.transmission_id) "
-            "order by e.received_at, e.transmission_id limit %s",
-            (limit,),
-        ).fetchall()
-        for transmission_id, event_type, raw in rows:
-            try:
-                result = _handle(conn, http, transmission_id, event_type, raw)
-            except _AlreadyDecided:
-                continue
-            if isinstance(result, _Retry):
-                if _note_failed_attempt(conn, transmission_id, event_type, result.detail):
-                    outcomes["gave up"] += 1
+    passes = 0
+    tried: list[str] = []
+    while passes < MAX_PASSES and len(tried) < limit:
+        if not conn.execute("select pg_try_advisory_lock(%s)", (EVENT_LOCK,)).fetchone()[0]:
+            break
+        passes += 1
+        try:
+            rows = conn.execute(
+                "select e.transmission_id, e.event_type, e.raw from paypal_events e "
+                "where not exists (select 1 from event_outcomes o where o.transmission_id = e.transmission_id) "
+                "and e.transmission_id <> all(%s::text[]) "
+                "order by e.received_at, e.transmission_id limit %s",
+                (tried, limit - len(tried)),
+            ).fetchall()
+            for transmission_id, event_type, raw in rows:
+                tried.append(transmission_id)
+                try:
+                    result = _handle(conn, http, transmission_id, event_type, raw)
+                except _AlreadyDecided:
+                    continue
+                if isinstance(result, _Retry):
+                    if _note_failed_attempt(conn, transmission_id, event_type, result.detail):
+                        outcomes["gave up"] += 1
+                    else:
+                        retrying += 1
                 else:
-                    retrying += 1
-            else:
-                outcomes[result] += 1
-    finally:
-        conn.execute("select pg_advisory_unlock(%s)", (EVENT_LOCK,))
-    return ProcessReport(ran=True, outcomes=dict(outcomes), retrying=retrying)
+                    outcomes[result] += 1
+        finally:
+            conn.execute("select pg_advisory_unlock(%s)", (EVENT_LOCK,))
+        # Asked only once the lock is free, so a delivery whose nudge was turned away
+        # while this pass held it is already stored and visible here.
+        if not _untried_waiting(conn, tried):
+            break
+    if passes == 0:
+        return ProcessReport(ran=False)
+    return ProcessReport(ran=True, outcomes=dict(outcomes), retrying=retrying, passes=passes)
+
+
+def _untried_waiting(conn: psycopg.Connection, tried: list[str]) -> bool:
+    """Whether any stored delivery not in tried has no outcome yet."""
+    return conn.execute(
+        "select exists (select 1 from paypal_events e "
+        "where not exists (select 1 from event_outcomes o where o.transmission_id = e.transmission_id) "
+        "and e.transmission_id <> all(%s::text[]))",
+        (tried,),
+    ).fetchone()[0]
 
 
 def _handle(conn: psycopg.Connection, http: PayPalHttp, transmission_id: str, event_type: str, raw: str) -> str | _Retry:

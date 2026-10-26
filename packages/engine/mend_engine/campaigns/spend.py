@@ -3,7 +3,8 @@
 A campaign counts from the moment it reaches submitting, which is when its row in
 the payout_batches ledger is written, for the total of its frozen snapshot. Counting
 from that moment rather than from PayPal's answer means a batch whose outcome is
-unknown still counts, so the cap errs towards spending less.
+unknown still counts, so the cap errs towards spending less. An item stops counting
+only once PayPal reports that its money never left the shop or came back to it.
 """
 
 from __future__ import annotations
@@ -19,6 +20,19 @@ WINDOW = timedelta(hours=24)
 # Any fixed number works, as long as every check made just before money moves
 # takes this same one, so two campaigns cannot both pass on the same headroom.
 DAILY_CAP_LOCK = 7731300002
+# Money that never left the shop (FAILED, BLOCKED) or came back to it (RETURNED,
+# REFUNDED). effective() keeps each of these as it is, so comparing stored text with
+# them in SQL gives the answer effective() would give.
+MONEY_BACK_STATUSES = ("FAILED", "BLOCKED", "RETURNED", "REFUNDED")
+# True for a snapshot item ("item", from approved snapshot "s") whose every ledger row
+# holds one of MONEY_BACK_STATUSES, its one parameter. With no row yet, or any other
+# status, it is false and the item counts. Shared so the shop's cap and the demo pool
+# count by the same rule.
+ITEM_CAME_BACK_SQL = (
+    "coalesce((select bool_and(i.status = any(%s)) from payout_items i "
+    "join payout_batches b on b.sender_batch_id = i.sender_batch_id "
+    "where b.campaign_id = s.campaign_id::text and i.sender_item_id = item ->> 'sender_item_id'), false)"
+)
 
 
 class CapExceeded(ValueError):
@@ -45,10 +59,11 @@ def spent_last_24h_minor(conn: psycopg.Connection, now: datetime) -> int:
 
     A campaign reaches submitting when its payout_batches row is written, and its
     amount is the sum of the items in its approved snapshot, exactly what the batch
-    carries. It counts whatever PayPal did afterwards. A ledger row stamped later
-    than now also counts, so a caller's clock running behind errs towards counting.
-    Ledger rows with no approved snapshot (the M1 proof payouts) are not campaigns
-    and are not counted.
+    carries, less each item PayPal has since reported FAILED, BLOCKED, RETURNED or
+    REFUNDED. An item PayPal has not reported on yet, or reports as anything else,
+    still counts. A ledger row stamped later than now also counts, so a caller's
+    clock running behind errs towards counting. Ledger rows with no approved
+    snapshot (the M1 proof payouts) are not campaigns and are not counted.
 
     Raises ValueError if now carries no time zone.
     """
@@ -57,8 +72,9 @@ def spent_last_24h_minor(conn: psycopg.Connection, now: datetime) -> int:
     row = conn.execute(
         "select coalesce(sum((item ->> 'amount_minor')::bigint), 0) "
         "from approved_snapshots s cross join lateral jsonb_array_elements(s.canonical_json::jsonb -> 'items') item "
-        "where exists (select 1 from payout_batches b where b.campaign_id = s.campaign_id::text and b.created_at > %s)",
-        (now - WINDOW,),
+        "where exists (select 1 from payout_batches b where b.campaign_id = s.campaign_id::text and b.created_at > %s) "
+        "and not " + ITEM_CAME_BACK_SQL,
+        (now - WINDOW, list(MONEY_BACK_STATUSES)),
     ).fetchone()
     return int(row[0])
 

@@ -46,12 +46,13 @@ from mend_engine.campaigns.approval import (
     review_hash,
 )
 from mend_engine.campaigns.approval import set_note as set_campaign_note
+from mend_engine.campaigns.cancel import cancel_unclaimed as cancel_unclaimed_items
 from mend_engine.campaigns.drafts import NOTE_TEMPLATE, DraftRefused, DraftSettings, build_draft, draft_view
 from mend_engine.campaigns.eligibility import REGULAR_MIN_DAYS, SILENT_MIN_DAYS
 from mend_engine.campaigns.reconcile import reconcile as reconcile_campaigns
-from mend_engine.campaigns.results import ArmResults, campaign_results
+from mend_engine.campaigns.results import ArmResults, PayoutStanding, campaign_results
 from mend_engine.campaigns.scoring import SHOP_ZONE, ScoreSet, score_customers
-from mend_engine.campaigns.spend import WINDOW, CapExceeded
+from mend_engine.campaigns.spend import ITEM_CAME_BACK_SQL, MONEY_BACK_STATUSES, WINDOW, CapExceeded
 from mend_engine.campaigns.submission import submit
 from mend_engine.config import Config, ConfigError, load_config
 from mend_engine.db.connect import connect
@@ -91,6 +92,7 @@ TASK_NAMES = (
     "consent_text",
     "join",
     "leave",
+    "cancel_unclaimed",
 )
 
 ROLES = ("owner", "demo")
@@ -367,7 +369,12 @@ def simulate_return(campaign_id: object, ref: object, actor: object) -> dict:
 
 
 def results(campaign_id: object, actor: object) -> dict:
-    """The actor's campaign results: rewarded against held back, real and simulated apart."""
+    """The actor's campaign results: rewarded against held back, real and simulated apart.
+
+    payouts says where each item of the batch stands (campaigns.results.PayoutStanding):
+    items, by_status, claimed_minor, unclaimed_minor, returned_minor, failed_minor,
+    pending_minor and unclaimed_return_by (UTC ISO 8601 text, or None).
+    """
 
     def work(config: Config, conn: psycopg.Connection) -> dict:
         role, session = _checked_actor(conn, actor)
@@ -386,9 +393,42 @@ def results(campaign_id: object, actor: object) -> dict:
             "window_open": found.window_open,
             "p_value": _finite(found.p_value),
             "verdict": found.verdict,
+            "payouts": _payouts(found.payouts),
         }
 
     return _run("results", work)
+
+
+def cancel_unclaimed(campaign_id: object, actor: object) -> dict:
+    """Ask PayPal to return the actor's campaign's unclaimed cashback to the shop now, not after 30 days.
+
+    The same actor and campaign checks as results: the owner on any campaign, a demo
+    actor only on its own. Only items the ledger holds as UNCLAIMED are asked about,
+    one cancel call each (campaigns.cancel). cancelled counts the items PayPal
+    accepted the cancel for, returned_minor the approved cents of those it answered
+    RETURNED, still_unclaimed the items still waiting afterwards, not_cancellable
+    the items PayPal refused. Refuses "not_submitted" when the campaign has no
+    payout batch, and fails "paypal_unavailable" when PayPal errors or cannot be
+    reached part way; items cancelled before that stay cancelled.
+    """
+
+    def work(config: Config, conn: psycopg.Connection) -> dict:
+        role, session = _checked_actor(conn, actor)
+        cid = _checked_campaign(conn, campaign_id, role, session)
+        if conn.execute("select 1 from payout_batches where campaign_id = %s", (str(cid),)).fetchone() is None:
+            raise _Refused("not_submitted", "the campaign has no payout batch, so nothing is waiting to be claimed")
+        with _paypal_client(config) as http:
+            report = cancel_unclaimed_items(conn, http, cid)
+        return {
+            "ok": True,
+            "campaign_id": str(cid),
+            "cancelled": report.cancelled,
+            "returned_minor": report.returned_minor,
+            "still_unclaimed": report.still_unclaimed,
+            "not_cancellable": report.not_cancellable,
+        }
+
+    return _run("cancel_unclaimed", work)
 
 
 def shop_summary() -> dict:
@@ -949,14 +989,16 @@ def demo_spent_last_24h_minor(conn: psycopg.Connection) -> int:
     """Cents in every demo-created campaign that reached submitting in the last 24 hours.
 
     Counted the way spend.spent_last_24h_minor counts the shop's own cap, limited to
-    campaigns a demo session created.
+    campaigns a demo session created: an item PayPal reports FAILED, BLOCKED,
+    RETURNED or REFUNDED stops counting, one with no status yet still counts.
     """
     row = conn.execute(
         "select coalesce(sum((item ->> 'amount_minor')::bigint), 0) "
         "from approved_snapshots s join campaign_owners o on o.campaign_id = s.campaign_id and o.role = 'demo' "
         "cross join lateral jsonb_array_elements(s.canonical_json::jsonb -> 'items') item "
-        "where exists (select 1 from payout_batches b where b.campaign_id = s.campaign_id::text and b.created_at > now() - %s)",
-        (WINDOW,),
+        "where exists (select 1 from payout_batches b where b.campaign_id = s.campaign_id::text and b.created_at > now() - %s) "
+        "and not " + ITEM_CAME_BACK_SQL,
+        (WINDOW, list(MONEY_BACK_STATUSES)),
     ).fetchone()
     return int(row[0])
 
@@ -1040,6 +1082,19 @@ def _arm(arm: ArmResults) -> dict:
         "real_returns": arm.real_returns,
         "real_rate": _finite(arm.real_rate),
         "simulated_returns": arm.simulated_returns,
+    }
+
+
+def _payouts(standing: PayoutStanding) -> dict:
+    return {
+        "items": standing.items,
+        "by_status": dict(standing.by_status),
+        "claimed_minor": standing.claimed_minor,
+        "unclaimed_minor": standing.unclaimed_minor,
+        "returned_minor": standing.returned_minor,
+        "failed_minor": standing.failed_minor,
+        "pending_minor": standing.pending_minor,
+        "unclaimed_return_by": _utc_text(standing.unclaimed_return_by),
     }
 
 

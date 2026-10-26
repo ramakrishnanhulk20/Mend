@@ -1,6 +1,7 @@
 # Not covered here: the cap being checked at draft, approval and submission
-# (test_drafts.py, test_approval.py, test_submission.py), and clocks that disagree
-# between the engine and the database.
+# (test_drafts.py, test_approval.py, test_submission.py), clocks that disagree
+# between the engine and the database, and how item statuses reach the ledger
+# (test_events.py, test_cancel.py).
 import uuid
 from collections.abc import Iterator
 from datetime import datetime, timedelta, timezone
@@ -12,6 +13,7 @@ from psycopg import sql
 
 from mend_engine.campaigns.spend import (
     DAILY_CAP_LOCK,
+    MONEY_BACK_STATUSES,
     CapExceeded,
     check_daily_cap,
     database_now,
@@ -21,6 +23,7 @@ from mend_engine.campaigns.spend import (
 from mend_engine.config import SANDBOX_API_HOST, Config
 from mend_engine.db.connect import PGDATA
 from mend_engine.db.migrate import apply_schema
+from mend_engine.events.payout_status import effective
 from mend_engine.paypal.payouts import BatchSnapshot, PayoutItemSpec, canonical_json, sender_batch_id_for, snapshot_hash
 
 CONFIG = Config(
@@ -69,12 +72,22 @@ def approved(conn: psycopg.Connection, amounts: list[int]) -> tuple[uuid.UUID, B
     return campaign_id, snap
 
 
-def reached_submitting(conn: psycopg.Connection, amounts: list[int], at: datetime) -> None:
+def reached_submitting(conn: psycopg.Connection, amounts: list[int], at: datetime) -> str:
+    """Items R1.. carry amounts in order. Returns the batch's sender_batch_id."""
     campaign_id, snap = approved(conn, amounts)
     conn.execute(
         "insert into payout_batches (sender_batch_id, campaign_id, snapshot_hash, status, created_at) "
         "values (%s, %s, %s, 'created', %s)",
         (sender_batch_id_for(snap), str(campaign_id), snapshot_hash(snap), at),
+    )
+    return sender_batch_id_for(snap)
+
+
+def item_status(conn: psycopg.Connection, sender_batch_id: str, ref: str, status: str) -> None:
+    conn.execute(
+        "insert into payout_items (payout_item_id, sender_batch_id, sender_item_id, status) values (%s, %s, %s, %s) "
+        "on conflict (payout_item_id) do update set status = excluded.status",
+        ("ITEM" + ref, sender_batch_id, ref, status),
     )
 
 
@@ -90,6 +103,30 @@ def test_spend_counts_each_campaign_that_reached_submitting_in_the_last_24_hours
     )
     assert spent_last_24h_minor(conn, now) == 357
     assert spent_last_24h_minor(conn, now + timedelta(hours=24)) == 7
+
+
+def test_items_whose_money_never_left_or_came_back_stop_counting_and_unreported_ones_still_count(conn: psycopg.Connection) -> None:
+    # The SQL compares stored text, which matches effective() only for statuses it keeps as they are.
+    assert all(effective(status) == status for status in MONEY_BACK_STATUSES)
+    now = database_now(conn)
+    sender_batch_id = reached_submitting(conn, [100, 200, 300, 400, 500, 600, 700], now - timedelta(hours=1))
+    for ref, status in (("R1", "FAILED"), ("R2", "BLOCKED"), ("R3", "RETURNED"), ("R4", "REFUNDED"),
+                        ("R5", "UNCLAIMED"), ("R6", "PROCESSING_LATER")):
+        item_status(conn, sender_batch_id, ref, status)
+    # R5 waits unclaimed, R6's status is unknown and R7 has none yet: all three still count.
+    assert spent_last_24h_minor(conn, now) == 500 + 600 + 700
+
+
+def test_a_returned_item_frees_its_amount_under_the_daily_cap(conn: psycopg.Connection) -> None:
+    now = database_now(conn)
+    sender_batch_id = reached_submitting(conn, [600, 400], now - timedelta(hours=1))
+    item_status(conn, sender_batch_id, "R1", "UNCLAIMED")
+    with pytest.raises(CapExceeded):
+        check_daily_cap(conn, CONFIG, 1, now)
+    item_status(conn, sender_batch_id, "R1", "RETURNED")
+    check_daily_cap(conn, CONFIG, 600, now)
+    with pytest.raises(CapExceeded, match="400 cents left the shop"):
+        check_daily_cap(conn, CONFIG, 601, now)
 
 
 def test_the_cap_passes_exactly_at_the_limit_and_refuses_one_cent_over(conn: psycopg.Connection) -> None:

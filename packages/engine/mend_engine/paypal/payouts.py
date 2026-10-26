@@ -42,6 +42,8 @@ _DOMAIN_LIKE = re.compile(r"[A-Za-z0-9-]\.[A-Za-z]{2,}", re.ASCII)
 # never needs to name either.
 _PAYMENT_BRANDS = {"paypal": "PayPal", "venmo": "Venmo"}
 _PAYOUT_ID = re.compile(r"[A-Z0-9]{1,32}", re.ASCII)
+# Every item status PayPal documents is one word of capitals; anything else is not read.
+_ITEM_STATUS = re.compile(r"[A-Z]{1,36}", re.ASCII)
 _SENDER_ITEM_ID = re.compile(r"[A-Za-z0-9_-]{1,63}", re.ASCII)
 _CAMPAIGN_ID = re.compile(r"[A-Za-z0-9_.:-]{1,64}", re.ASCII)
 _EMAIL_SHAPE = re.compile(r"[!-?A-~]+@[!-?A-~]+\.[!-?A-~]+", re.ASCII)
@@ -456,3 +458,27 @@ def get_item(http: PayPalHttp, payout_item_id: str) -> dict:
     if type(payout_item_id) is not str or not _PAYOUT_ID.fullmatch(payout_item_id):
         raise PayoutIdRefused("payout_item_id is malformed")
     return _get(http, f"{PAYOUT_ITEM_PATH}/{payout_item_id}")
+
+
+def cancel_item(http: PayPalHttp, payout_item_id: str) -> str:
+    """Ask PayPal to cancel one UNCLAIMED payout item, so its money returns to the shop.
+
+    Sends POST /v1/payments/payouts-item/{id}/cancel once and never retries: PayPal
+    cancels only while an item is UNCLAIMED, so after an unclear answer the ledger
+    and the item's webhook settle what happened, not a second call. Returns the
+    item's transaction_status from a 200 answer for this same item (PayPal documents
+    RETURNED as the only value). Raises PayoutIdRefused for a malformed id before
+    anything is sent, PayPalUnreachable on a timeout or connection failure, and
+    PayPalError carrying the HTTP status for any other answer, a 200 included when
+    it names another item or a status that is not one word of capital letters.
+    """
+    if type(payout_item_id) is not str or not _PAYOUT_ID.fullmatch(payout_item_id):
+        raise PayoutIdRefused("payout_item_id is malformed")
+    # PayPal's own sample sends an empty JSON object as the body.
+    response = http.request("POST", f"{PAYOUT_ITEM_PATH}/{payout_item_id}/cancel", json_body={})
+    if response.status != 200:
+        raise PayPalError(response.status, _error_name(response.body), response.debug_id)
+    status = response.body.get("transaction_status")
+    if response.body.get("payout_item_id") != payout_item_id or not isinstance(status, str) or not _ITEM_STATUS.fullmatch(status):
+        raise PayPalError(response.status, "UNREADABLE_CANCEL_ANSWER", response.debug_id)
+    return status

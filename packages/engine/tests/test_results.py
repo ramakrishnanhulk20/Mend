@@ -1,5 +1,6 @@
 # Not covered here: how statuses and attributions get in (test_events.py), real
-# returns from a live storefront (none yet), and the results page that shows this.
+# returns from a live storefront (none yet), the results page that shows this, and
+# PayPal's own 30-day clock, which may start a little after our ledger row is written.
 import math
 import uuid
 from collections.abc import Iterator
@@ -11,7 +12,7 @@ import pytest
 from psycopg import sql
 
 from mend_engine.campaigns.attribution import attribute_purchase
-from mend_engine.campaigns.results import TOO_EARLY, campaign_results, lift_p_value
+from mend_engine.campaigns.results import TOO_EARLY, PayoutStanding, campaign_results, lift_p_value
 from mend_engine.db.connect import PGDATA
 from mend_engine.db.migrate import apply_schema
 from mend_engine.paypal.payouts import BatchSnapshot, PayoutItemSpec, canonical_json, snapshot_hash
@@ -154,6 +155,61 @@ def test_spend_counts_success_and_pending_items_at_their_approved_amounts(conn: 
     # SUCCESS 100 + PENDING 200 + an unknown status counted as PENDING 400.
     assert (result.spend_minor, result.fees_minor) == (700, 100)
     assert (result.rewarded.members, result.holdout.members, result.verdict) == (6, 2, TOO_EARLY)
+
+
+def test_the_payouts_block_puts_each_item_in_its_bucket_at_its_approved_amount(conn: psycopg.Connection) -> None:
+    campaign_id = campaign(conn, 10, 2, sent_days_ago=1)
+    items = tuple(PayoutItemSpec(f"m{n}@shop.example", 100 * n, "Thanks", f"R{n}") for n in range(1, 11))
+    snap = BatchSnapshot(str(campaign_id), "USD", "A thank-you", items)
+    conn.execute(
+        "insert into approved_snapshots values (%s, %s, %s, now(), 'owner')", (campaign_id, snapshot_hash(snap), canonical_json(snap))
+    )
+    sent_at = datetime(2026, 10, 20, 9, 30, tzinfo=timezone.utc)
+    conn.execute(
+        "insert into payout_batches (sender_batch_id, campaign_id, snapshot_hash, payout_batch_id, status, created_at) "
+        "values ('mend-p', %s, 'h', 'BATCHP', 'created', %s)",
+        (str(campaign_id), sent_at),
+    )
+    # R10 has no ledger row: PayPal has not reported on it yet.
+    statuses = ["SUCCESS", "PENDING", "UNCLAIMED", "ONHOLD", "FAILED", "BLOCKED", "RETURNED", "REFUNDED", "PROCESSING_LATER"]
+    for n, status in enumerate(statuses, start=1):
+        conn.execute("insert into payout_items values (%s, 'mend-p', %s, %s, 25, now())", (f"ITEM{n}", f"R{n}", status))
+
+    result = campaign_results(conn, campaign_id)
+
+    assert result.payouts == PayoutStanding(
+        items=10,
+        by_status={"SUCCESS": 1, "PENDING": 3, "UNCLAIMED": 1, "ONHOLD": 1, "FAILED": 1, "BLOCKED": 1, "RETURNED": 1, "REFUNDED": 1},
+        claimed_minor=100,
+        unclaimed_minor=300,
+        returned_minor=700 + 800,
+        failed_minor=500 + 600,
+        pending_minor=200 + 400 + 900 + 1000,
+        unclaimed_return_by=sent_at + timedelta(days=30),
+    )
+    # The existing keys keep their meaning: SUCCESS, PENDING and the unknown status counted as PENDING.
+    assert (result.spend_minor, result.fees_minor) == (100 + 200 + 900, 9 * 25)
+    assert (result.rewarded.members, result.holdout.members, result.verdict) == (10, 2, TOO_EARLY)
+
+
+def test_the_payouts_block_is_empty_before_a_batch_and_has_no_return_date_when_nothing_waits(conn: psycopg.Connection) -> None:
+    campaign_id = campaign(conn, 2, 2, sent_days_ago=None)
+    items = (PayoutItemSpec("m1@shop.example", 100, "Thanks", "R1"), PayoutItemSpec("m2@shop.example", 200, "Thanks", "R2"))
+    snap = BatchSnapshot(str(campaign_id), "USD", "A thank-you", items)
+    conn.execute(
+        "insert into approved_snapshots values (%s, %s, %s, now(), 'owner')", (campaign_id, snapshot_hash(snap), canonical_json(snap))
+    )
+    assert campaign_results(conn, campaign_id).payouts == PayoutStanding(0, {}, 0, 0, 0, 0, 0, None)
+
+    conn.execute(
+        "insert into payout_batches (sender_batch_id, campaign_id, snapshot_hash, status) values ('mend-q', %s, 'h', 'created')",
+        (str(campaign_id),),
+    )
+    conn.execute("insert into payout_items values ('ITEM1', 'mend-q', 'R1', 'RETURNED', 25, now())")
+    standing = campaign_results(conn, campaign_id).payouts
+    assert (standing.by_status, standing.returned_minor, standing.pending_minor, standing.unclaimed_return_by) == (
+        {"RETURNED": 1, "PENDING": 1}, 100, 200, None,
+    )
 
 
 def test_an_unknown_campaign_is_refused(conn: psycopg.Connection) -> None:

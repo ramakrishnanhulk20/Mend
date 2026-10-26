@@ -10,15 +10,38 @@
     "region": "virginia",
     "postgres": "18",
     "diskSizeGB": 1,
+    "schemaSha256": "27a5bbc9b4ba2314b01ef382b502cbd3ebb19056ada8c1bdbbd31819d8c9a813",
     "dashboardUrl": "https://dashboard.render.com/d/dpg-dbe3hq8m7kps73c7ap6g-a"
   },
-  "service": {
-    "id": "srv-dbe53259fdbs739blp30",
-    "name": "mend-web",
-    "url": "https://mend-web.onrender.com",
-    "plan": "starter",
-    "region": "virginia",
-    "dashboardUrl": "https://dashboard.render.com/web/srv-dbe53259fdbs739blp30"
+  "services": {
+    "web": {
+      "id": "srv-dbe53259fdbs739blp30",
+      "name": "mend-web",
+      "type": "web_service",
+      "plan": "starter",
+      "region": "virginia",
+      "url": "https://mend-web.onrender.com",
+      "dashboardUrl": "https://dashboard.render.com/web/srv-dbe53259fdbs739blp30"
+    },
+    "engine": {
+      "id": "srv-dbetn2fb9u1s73au0djg",
+      "name": "mend-engine",
+      "type": "private_service",
+      "plan": "starter",
+      "region": "virginia",
+      "internalAddress": "http://mend-engine:10000",
+      "publicUrl": null,
+      "dashboardUrl": "https://dashboard.render.com/pserv/srv-dbetn2fb9u1s73au0djg"
+    },
+    "jobs": {
+      "id": "crn-dbetnj29lscs7383obg0",
+      "name": "mend-jobs",
+      "type": "cron_job",
+      "plan": "starter",
+      "region": "virginia",
+      "schedule": "*/5 * * * *",
+      "dashboardUrl": "https://dashboard.render.com/cron/crn-dbetnj29lscs7383obg0"
+    }
   },
   "webhook": {
     "id": "8N112937B9769545W",

@@ -1,16 +1,19 @@
 # Deploy: Mend on Render
 
-`render.mjs` builds and checks Mend's live setup on Render from `.env`, with no dashboard clicks.
+`render.mjs` builds and checks Mend's live setup on Render from `.env`, with no dashboard clicks. Everything is in region virginia and deploys `main` on every push:
 
-It creates, in region virginia: the web service `mend-web` (plan starter, about USD 7 a month, builds `packages/web` from `main` on every push, Node 26.7.0) and the Postgres database `mend-db` (plan basic_256mb, 1 GB, Postgres 18, about USD 6 a month). It also registers one PayPal sandbox webhook for `mend-web`'s `/api/webhooks/paypal`, which is free.
+- `mend-web`, web service (Starter, about USD 7 a month): the site at https://mend-web.onrender.com and the PayPal webhook receiver. Node 26.7.0.
+- `mend-engine`, private service (Starter, about USD 7 a month): the engine's task server, reachable only on Render's private network. Python 3.12.10, built with `pip install .` (no extras).
+- `mend-jobs`, cron job (Starter, USD 1 a month minimum plus run minutes): `python -m mend_engine.jobs all` every 5 minutes.
+- `mend-db`, Postgres (basic_256mb, 1 GB, about USD 6 a month), plus one free PayPal sandbox webhook for mend-web.
 
 Run from the repo root:
 - `node scripts/deploy/render.mjs status` reads only and prints what exists.
-- `node scripts/deploy/render.mjs up [--schema <file>]` finds or creates everything, applies the schema (default `packages/engine/mend_engine/db/schema.sql`), sets the env vars and redeploys only if they changed. A second run changes nothing.
-- `node scripts/deploy/render.mjs prove [--schema <file>]` runs the live proof and sends one 1.00 USD sandbox payout. It ends `D1 RESULT: PASS` or `FAIL`. Give it the same `--schema` as `up`, because it reruns `up`.
+- `node scripts/deploy/render.mjs up --migrate` finds or creates everything, runs the engine's migrate and seed commands against mend-db, sets every env var and redeploys only what changed. Plain `up` does the same but never touches mend-db. A second run changes nothing.
+- `node scripts/deploy/render.mjs prove` runs the live proof: a demo visitor plans, notes, approves and submits a campaign (at most 1.00 USD of sandbox money); the webhook, mend-engine and the results are checked; plus a simulated return, the AI agent, the jobs and a secrets sweep. It ends `D2 RESULT: PASS` or `FAIL`.
 
-`.env` keys it reads: `RENDER_API_KEY`, `PAYPAL_CLIENT_ID`, `PAYPAL_CLIENT_SECRET` and `PAYPAL_ENV` (must be `sandbox`); `prove` also reads `MEND_TEST_RECEIVER` and `MEND_PAYOUT_ITEM_CAP_MINOR`. `mend-web` gets only `PAYPAL_ENV`, `PAYPAL_CLIENT_ID`, `PAYPAL_CLIENT_SECRET`, `DATABASE_URL`, `PAYPAL_WEBHOOK_ID` and `NODE_VERSION`.
+`.env` keys it reads: `RENDER_API_KEY`, `PAYPAL_CLIENT_ID`, `PAYPAL_CLIENT_SECRET`, `PAYPAL_ENV` (must be `sandbox`), the three `MEND_*_CAP_MINOR` caps, `MEND_OWNER_PASSWORD`, `ANTHROPIC_API_KEY` and `MEND_TEST_RECEIVER`. No service is given `RENDER_API_KEY`. `MEND_CSRF_SECRET` and `MEND_ENGINE_TOKEN` are generated once and live only in Render.
 
-The schema apply and `prove` reach `mend-db` from this machine through the engine's virtual environment (`packages/engine/.venv`), so `up` allows this machine's public IPv4 address, and only that address, on the database.
+Migrate, seed and the proof reach mend-db from this machine through the engine's virtual environment (`packages/engine/.venv`) over TLS, so `up` allows this machine's public IPv4 address, and only that address, on the database.
 
-`render-state.json` holds ids and URLs, never secrets. Request bodies follow Render's OpenAPI file, https://api-docs.render.com/openapi/render-public-api-1.json, and https://render.com/docs/postgresql-creating-connecting.
+`render-state.json` holds ids and addresses, never secrets. Request bodies follow Render's OpenAPI file, https://api-docs.render.com/openapi/render-public-api-1.json, and https://render.com/docs/private-network.

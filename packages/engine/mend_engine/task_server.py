@@ -132,6 +132,7 @@ def make_task_handler(
             match = _TASK_PATH.fullmatch(self.path)
             task = registry.get(match.group(1)) if match else None
             if match is None or task is None:
+                self._discard_body()
                 self._answer(404, {"error": "no such task"})
                 return
             length = self.headers.get("Content-Length", "")
@@ -190,12 +191,21 @@ def make_task_handler(
             given = self.headers.get(token_header, "")
             if hmac.compare_digest(given.encode("utf-8", "replace"), expected):
                 return True
+            self._discard_body()
             self._answer(401, {"error": "unauthorised"})
             return False
 
+        def _discard_body(self) -> None:
+            # A body left unread makes Windows reset the socket on close, and the client
+            # then loses the answer; anything over the cap is left alone.
+            length = self.headers.get("Content-Length", "")
+            if length.isascii() and length.isdigit() and int(length) <= MAX_BODY_BYTES:
+                self.rfile.read(int(length))
+
         def _answer(self, status: int, body: object, task: str | None = None) -> None:
-            self._send(status, json.dumps(body, allow_nan=False).encode("utf-8"), "application/json")
+            # Logged before sending, so the line exists by the time the caller has its answer.
             _log({"kind": log_kind, "status": status, "task": task})
+            self._send(status, json.dumps(body, allow_nan=False).encode("utf-8"), "application/json")
 
         def _send(self, status: int, data: bytes, content_type: str) -> None:
             self.send_response(status)

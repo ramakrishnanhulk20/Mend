@@ -9,7 +9,7 @@ Mend runs against the PayPal sandbox only.
 The review left seven questions open. They are settled here; each one is also logged in the project's decision record.
 
 1. **Code owns every amount.** The language model proposes wording and may suggest who to include. It never sets an amount. (C4)
-2. **The agent gets read-only PayPal toolkit tools only,** registered one by one by name, plus Mend's own guarded tools. No toolkit tool that creates orders, captures, refunds or changes webhooks is registered. (C1)
+2. **The agent gets four read-only PayPal tools only,** from PayPal's hosted MCP server, called by Mend's server: get_order, list_disputes, get_dispute and show_product_details, named one by one in code, plus Mend's own guarded tools. The model never connects to PayPal itself. PayPal's Agent Toolkit package was rejected on 24 Oct for its production audit findings. No tool that creates orders, captures, refunds or changes webhooks can be called. (C1)
 3. **Two roles.** Owner and demo. The demo role plans and approves campaigns only under demo caps tighter than the owner's, and cannot touch credentials, environment, caps, webhooks or the audit log. (C18, C20)
 4. **One credential source:** server environment variables. No PayPal credential is stored in the database. (C16, C17)
 5. **The MCP server is off on the public deployment** and, when on, accepts only an owner-scoped token. (C18)
@@ -62,7 +62,7 @@ This is the one place value leaves the shop.
 
 **A13. Absolute URLs built from the request.** If the app builds its own public URL from Host or X-Forwarded-Host, an attacker can make it register a webhook that points at the attacker.
 
-**A14. Third-party tool supply chain.** The Agent Toolkit decides which tools exist. A version bump or a changed default can quietly add write tools.
+**A14. Third-party tool supply chain.** PayPal's hosted MCP server decides which tools exist. PayPal can add a write tool to it at any time, and a widened list in Mend's code would expose it.
 
 **Does not apply, and why:**
 - SSRF from URLs users supply: no flow fetches a URL a user typed. The near cases are the webhook cert URL (C9) and `links` hrefs returned by PayPal (C16).
@@ -96,7 +96,7 @@ This is the one place value leaves the shop.
 - PayPal fields shaped by attacker behaviour: purchase count and recency (many tiny payments), refunds and disputes after buying, unclaimed or returned payout status.
 - PayPal responses as a whole: shape, unexpected fields, paging tokens, `links` hrefs, error text.
 - Model output: free text, JSON shape, customer references, amounts, notes, tool names, arguments, number of tool calls.
-- Agent Toolkit outputs and its set of tools.
+- PayPal MCP server answers and the set of tools it lists.
 - Values stored earlier and read back: transactions, profiles, drafts, notes, goal text, chat history, other visitors' text, audit entries, payout statuses.
 - Every cell of the public CSV.
 - Time and order: webhook transmission time, out-of-order events, a race between webhook and sync.
@@ -117,7 +117,7 @@ This is the one place value leaves the shop.
 - Not held: no valuable internal network, no other tenants, no request reaches a filesystem.
 
 **Attacker goals:**
-- **G1 Get paid.** Send a one-cent payment with a note aimed at the planner or agent, and get the owner or demo role to approve the resulting draft. Variants: pay twice through concurrent approvals or a retry with a fresh sender_batch_id; a refund through a toolkit tool; an execution request over unauthenticated MCP; a larger budget approved from the demo login; a recipient swapped by merging profiles on name or email.
+- **G1 Get paid.** Send a one-cent payment with a note aimed at the planner or agent, and get the owner or demo role to approve the resulting draft. Variants: pay twice through concurrent approvals or a retry with a fresh sender_batch_id; a refund through a PayPal MCP tool; an execution request over unauthenticated MCP; a larger budget approved from the demo login; a recipient swapped by merging profiles on name or email.
 - **G2 Turn the shop into a phishing sender.** Injected note text with a link or a request for details goes to every customer in a campaign; or customer A's data leaks to customer B.
 - **G3 Steal personal data or secrets.** Stored XSS through a payer name; markdown image exfiltration in agent replies; a public demo showing real people; secrets in logs, prompts or errors; an unauthenticated MCP server.
 - **G4 Falsify the proof.** Forged or replayed webhooks that fake conversions or payout successes; spamming simulate to inflate lift; moving people in or out of the holdout; the shop's own payouts counted as purchases.
@@ -129,7 +129,7 @@ Each invariant is an outcome, followed by how to show it holds. Work orders cite
 
 ### Money movement
 
-**C1. One money path.** Value leaves the shop only when an approved campaign snapshot becomes one Payouts batch (C2 to C6). The only other spend is the simulate button buying from the sandbox buyer account (C21). No agent tool, MCP tool, toolkit tool, try-to-break-it scenario, webhook handler or scheduled job can create a payout, order, capture or refund, or change a webhook. Toolkit tools are registered one by one, by name, read-only only. A toolkit upgrade cannot add a tool.
+**C1. One money path.** Value leaves the shop only when an approved campaign snapshot becomes one Payouts batch (C2 to C6). The only other spend is the simulate button buying from the sandbox buyer account (C21). No agent tool, MCP tool, PayPal MCP server tool, try-to-break-it scenario, webhook handler or scheduled job can create a payout, order, capture or refund, or change a webhook. The one exception is reconcile in mend-jobs, which may resend the batch of a campaign whose submission is unknown, from the same approved snapshot and with the same sender_batch_id, so PayPal pays it at most once (C3). Cancelling an unclaimed item returns money to the shop and creates no payment. PayPal reads go through PayPal's hosted MCP server, called by Mend's server, not through the Agent Toolkit (rejected on 24 Oct for its production audit findings). Only four read-only tools can be called: get_order, list_disputes, get_dispute and show_product_details, named one by one in code. Any other name is refused before a token is fetched or a byte is sent, so a tool PayPal adds to its server cannot be reached.
 *Proof:* a test lists every tool registered with the agent and the MCP server and fails on any write tool. An injected note asking for a refund produces no PayPal write call (checked with an HTTP recorder).
 
 **C2. Approval is human, explicit and bound to content.** A batch is sent only for a draft snapshot approved by a principal allowed to approve (C18), in a same-origin request with CSRF protection. The approval records a hash of the canonical snapshot: every recipient, receiver value and type, amount, currency and note. The batch is built from that frozen snapshot, never re-read from live tables. Any edit after approval voids it. The model, agent, MCP client, webhooks and jobs cannot produce an approval; "request execution" only moves a campaign to "awaiting approval".
@@ -182,7 +182,7 @@ Each invariant is an outcome, followed by how to show it holds. Work orders cite
 
 ### Secrets, environment and access
 
-**C16. The public deployment can only reach the PayPal sandbox.** The environment is fixed at startup from deployment config. The process refuses to start unless that environment is sandbox and exactly one credential source is configured. Every outbound PayPal request, including `links` hrefs from PayPal, has its host parsed by the standard URL parser and is refused unless that host equals the sandbox API host. The toolkit is built from the same config value. The CLI scripts apply the same check. Nothing in the console, agent or MCP changes the environment or the credentials.
+**C16. The public deployment can only reach the PayPal sandbox.** The environment is fixed at startup from deployment config. The process refuses to start unless that environment is sandbox and exactly one credential source is configured. Every outbound PayPal request, including `links` hrefs from PayPal, has its host parsed by the standard URL parser and is refused unless that host equals the sandbox API host. The MCP client and the Log in with PayPal client check their hosts against the same fixed list. The CLI scripts apply the same check. Nothing in the console, agent or MCP changes the environment or the credentials.
 *Proof:* starting with live config fails; a request built for the live host is refused.
 
 **C17. Secrets never leave the server.** The PayPal secret, OAuth tokens, model key, sandbox buyer credentials and session secret never appear in a response, the client bundle, logs, the audit log, an error, a model prompt or an MCP result.
@@ -265,3 +265,32 @@ Mend's purchase history now comes from the shop's own order records, and custome
 
 **C28. No payout without a live consent record.** A campaign can include a customer only if a member row exists for them with a recorded consent (wording version, time, client id) that has not been withdrawn. Leaving deletes the member row, removes them from every draft not yet approved, and voids any approval that includes them (C2).
 *Proof:* a draft that names a non-member is refused; a member who leaves between draft and approval is not paid and the approval is voided.
+
+## Amendments 26 Oct 2026
+
+Three things changed in what runs. The engine is now a Render private service (mend-engine) that only mend-web can call, over Render's private network with a shared token; a Render cron job (mend-jobs) runs the scheduled tasks in its own process. The agent reads PayPal through PayPal's hosted MCP server, with Mend's server as the client. That is not the Mend MCP server of design decision 5, which stays off. Customers join and leave with Log in with PayPal. Every invariant number above stands; these say what four of them cover now.
+
+**C16, the exact host list.** Every PayPal URL is parsed with the standard URL parser and refused unless its host equals one of three hosts exactly, each for one use only:
+- `api-m.sandbox.paypal.com`: every server call (OAuth, Payouts, Orders, webhook verification, the Log in with PayPal code swap and userinfo), from mend-web, mend-engine, mend-jobs and the scripts.
+- `www.sandbox.paypal.com`: only the browser redirect to Log in with PayPal's sign-in page. No server request goes there.
+- `mcp.sandbox.paypal.com`: only Mend's MCP client in mend-web, over https on the default port with no userinfo, for both the stream URL and the message endpoint the server names. Redirects are refused, so a reply cannot move a request to another host.
+
+**C17, three more secrets.** The list in C17 now also holds:
+- `MEND_ENGINE_TOKEN`. Held by mend-web and mend-engine only; mend-jobs never calls the engine and does not hold it. Sent only in the `x-mend-engine-token` header, only over plain http to a one-label private host, with redirects refused. The engine compares it in constant time and never logs it, and both services remove it from log lines. Not covered: someone able to read traffic inside Render's private network, where the token travels unencrypted.
+- The MCP access token. Sent only in the Authorization header to `mcp.sandbox.paypal.com`. The model never connects to PayPal and never sees it, and an MCP error carries no token and no PayPal text.
+- The customer's Log in with PayPal token. Held only inside the one callback request that swapped the code for it, sent only to the sandbox userinfo address, never stored, logged or put in an error. Only the email, whether PayPal verified it, and the payer id leave that request.
+
+**C18, the public join routes.** `/api/join/consent`, `/api/join/paypal/start` and `/api/join/paypal/callback` need no session, like the webhook, so they sit outside the role table. These rules guard them instead:
+- A GET of the start route only shows a confirmation page: the shop name, the exact consent wording and one button. It changes nothing and sends nothing to PayPal.
+- Only a POST from that page starts PayPal's sign-in. Its Origin must be exactly this app's origin, its form must hold exactly the expected fields, and its CSRF token must be this browser's, bound to the session or, with no session, to the anonymous id. Another site cannot join or remove a visitor.
+- The sign-in state travels in a cookie signed with HMAC-SHA256 under its own label (HttpOnly, SameSite=Lax, Secure over https, 10 minutes). The callback refuses a missing, edited or expired cookie, or a state that differs from PayPal's, before anything is sent to PayPal.
+- The confirmation page sends CSP frame-ancestors 'none' and X-Frame-Options DENY, so the click cannot be framed. The redirect to PayPal and the callback send Referrer-Policy no-referrer, since the callback URL carries the one-time code.
+- Each route is rate-limited per client address: 20 a minute for start and for the callback, 60 for consent.
+
+**C28, join and leave.**
+- Join records a member only when the consent hash the page showed equals the hash of the current wording. The start route checks it before the redirect and the engine's join task checks it again; a changed wording is refused, never recorded.
+- Leave needs an email PayPal has verified, since an unverified email proves nothing about who owns it; it is refused before any lookup. Leaving deletes the member and, in the same transaction, voids every campaign not yet sent that holds them. This replaces "removes them from every draft not yet approved": the whole campaign is voided rather than edited, and a voided campaign can never be approved or sent (C2).
+*Proof:* the live join, leave and rejoin of 26 Oct: the audit log shows member_left 1 and campaign_voided 1 for the open draft that held the member.
+
+**No Render API key on any service.** A Render API key is account-wide: on a service it could create paid services. The private engine replaced Workflows for this reason, so no service needs one. Only the deploy script on the operator's machine holds it.
+*Proof:* `node scripts/deploy/render.mjs prove`, check "render key" (no service holds the key, under that name or any other) and check "private" (mend-engine has no public URL and its name does not resolve on public DNS).

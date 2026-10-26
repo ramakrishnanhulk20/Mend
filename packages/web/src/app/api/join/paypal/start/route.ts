@@ -18,7 +18,9 @@ const PAGE_HEADERS: Readonly<Record<string, string>> = {
   "content-type": "text/html; charset=utf-8",
   "content-security-policy": `default-src 'none'; form-action 'self' https://${SANDBOX_WEB_HOST}; frame-ancestors 'none'`,
   "x-frame-options": "DENY",
-  "referrer-policy": "no-referrer",
+  // Not no-referrer: under that policy browsers send "Origin: null" on the form POST,
+  // and the same-origin check then refuses the visitor's own click.
+  "referrer-policy": "same-origin",
   "cache-control": "no-store",
 };
 

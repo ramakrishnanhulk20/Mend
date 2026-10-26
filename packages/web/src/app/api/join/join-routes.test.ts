@@ -216,7 +216,7 @@ describe("GET /api/join/paypal/start", () => {
     expect(response.headers.get("content-type")).toBe("text/html; charset=utf-8");
     expect(response.headers.get("content-security-policy")).toBe("default-src 'none'; form-action 'self' https://www.sandbox.paypal.com; frame-ancestors 'none'");
     expect(response.headers.get("x-frame-options")).toBe("DENY");
-    expect(response.headers.get("referrer-policy")).toBe("no-referrer");
+    expect(response.headers.get("referrer-policy")).toBe("same-origin");
     expect(response.headers.get("cache-control")).toBe("no-store");
     expect(response.headers.get("set-cookie")).toMatch(/^__Host-mend_csrf=a1\.[A-Za-z0-9_-]{43}; Path=\/; Max-Age=86400; HttpOnly; SameSite=Lax; Secure$/);
     expect(csrfCookie).toMatch(/^__Host-mend_csrf=a1\./);

@@ -1,6 +1,8 @@
 # Not covered here: the real UCI import and the real model facts. prove_m2, prove_m4b and
 # python -m mend_engine.store_facts run those on the real file; here a small synthetic shop
-# and stand-in facts of the stored shape take their place. No PayPal API is involved.
+# and stand-in facts of the stored shape take their place. No PayPal API is involved, and
+# two seeds running at once against one database are not exercised.
+import json
 import random
 import uuid
 from collections.abc import Iterator
@@ -15,11 +17,13 @@ import pytest
 from psycopg import sql
 
 from mend_engine import prove_m4a, seed_demo, store_facts
+from mend_engine.campaigns.eligibility import quiet_regular_members
 from mend_engine.campaigns.scoring import score_customers
 from mend_engine.config import SANDBOX_API_HOST, Config, ConfigError
 from mend_engine.data.uci import ZIP_NAME
 from mend_engine.db.connect import PGDATA
 from mend_engine.db.migrate import apply_schema
+from mend_engine.paypal.payouts import normalise_email
 from mend_engine.shop.import_orders import REFUNDS_SOURCE_SUFFIX
 
 RECEIVER = "Mend-Receiver@Personal.Example"
@@ -131,7 +135,32 @@ def state(conn: psycopg.Connection) -> tuple:
     ).fetchone()
 
 
-def test_a_fresh_database_gets_the_shop_the_facts_the_40_demo_members_and_the_test_receiver(
+def member_matches(conn: psycopg.Connection) -> dict[uuid.UUID, list[str]]:
+    """Every member, with the shop customers its PayPal email matches through the one email normaliser."""
+    by_email: dict[str, list[str]] = {}
+    for ref, email in conn.execute("select customer_ref, email from shop_customers"):
+        by_email.setdefault(normalise_email(email), []).append(ref)
+    return {member_id: by_email.get(normalise_email(email), []) for member_id, email in conn.execute("select member_id, paypal_email from members")}
+
+
+def receiver_member(conn: psycopg.Connection) -> uuid.UUID:
+    return conn.execute("select member_id from members where paypal_email = %s", (normalise_email(RECEIVER),)).fetchone()[0]
+
+
+def seed_up_to_the_receiver(conn: psycopg.Connection, config: Config):
+    seed_demo.seed_orders(conn)
+    seed_demo.seed_refunds(conn)
+    scores = seed_demo.shop_scores(conn)
+    seed_demo.seed_members(conn, config, scores)
+    seed_demo.seed_receiver(conn, config, scores)
+    return scores
+
+
+def audit_rows(conn: psycopg.Connection) -> int:
+    return conn.execute("select count(*) from audit_log").fetchone()[0]
+
+
+def test_a_fresh_database_gets_the_shop_the_facts_the_40_demo_members_and_the_test_receiver_at_rank_1(
     seeded: tuple, capsys: pytest.CaptureFixture[str]
 ) -> None:
     conn, config, stand = seeded
@@ -144,13 +173,19 @@ def test_a_fresh_database_gets_the_shop_the_facts_the_40_demo_members_and_the_te
     assert len(demo) == 40
     members = dict(conn.execute("select paypal_email, email_verified from members"))
     assert len(members) == 41 and all(members.values())
-    demo_emails = {email for (email,) in conn.execute("select email from shop_customers where customer_ref = any(%s)", (demo,))}
-    receiver = RECEIVER.lower()
-    assert set(members) == demo_emails | {receiver}
-    linked = conn.execute("select customer_ref from shop_customers where email = %s", (receiver,)).fetchall()
-    assert len(linked) == 1 and linked[0][0] not in demo
-    assert conn.execute("select actor from audit_log where action = 'shop_customer_linked_to_sandbox_receiver'").fetchall() == [("seed_demo",)]
-    assert receiver not in capsys.readouterr().out.lower()
+    # The 40 demo customers and one more quiet regular are matched, one member each; the
+    # receiver now matches the most at-risk of them.
+    matched = member_matches(conn)
+    assert all(len(refs) == 1 for refs in matched.values())
+    refs = {found[0] for found in matched.values()}
+    assert len(refs) == 41 and set(demo) < refs
+    ranked = quiet_regular_members(conn, scores, AS_OF)
+    assert ranked[0].member_id == receiver_member(conn)
+    actions = conn.execute("select action, actor from audit_log where actor = 'seed_demo' order by id").fetchall()
+    assert actions == [("shop_customer_linked_to_sandbox_receiver", "seed_demo"), ("sandbox_receiver_moved_first", "seed_demo")]
+    out = capsys.readouterr().out
+    assert "receiver: moved to rank 1 (was rank " in out
+    assert RECEIVER.lower() not in out.lower()
 
 
 def test_a_second_run_changes_nothing(seeded: tuple, capsys: pytest.CaptureFixture[str]) -> None:
@@ -162,8 +197,63 @@ def test_a_second_run_changes_nothing(seeded: tuple, capsys: pytest.CaptureFixtu
     assert state(conn) == before
     assert stand.calls == ["orders", "refunds", "cdnow", "uci"]
     out = capsys.readouterr().out
-    for line in ("orders: already imported", "refunds: already imported", "facts: already stored", "members: 40 demo members (0 new)"):
+    for line in (
+        "orders: already imported",
+        "refunds: already imported",
+        "facts: already stored",
+        "members: 40 demo members (0 new)",
+        "receiver: already first",
+    ):
         assert line in out
+
+
+def test_moving_the_receiver_first_trades_two_order_histories_and_changes_nothing_else(seeded: tuple) -> None:
+    conn, config, stand = seeded
+    scores = seed_up_to_the_receiver(conn, config)
+    receiver = receiver_member(conn)
+    before = quiet_regular_members(conn, scores, AS_OF)
+    was_rank = [candidate.member_id for candidate in before].index(receiver) + 1
+    displaced, receiver_row = before[0], before[was_rank - 1].customer_ref
+    matched_before = member_matches(conn)
+    audit_before = audit_rows(conn)
+
+    assert was_rank > 1
+    assert seed_demo.seed_receiver_first(conn, config, scores) == f"receiver: moved to rank 1 (was rank {was_rank})"
+
+    after = quiet_regular_members(conn, scores, AS_OF)
+    matched = member_matches(conn)
+    assert after[0].member_id == receiver and after[0].customer_ref == displaced.customer_ref
+    assert set(matched) == set(matched_before) and conn.execute("select count(*) from members").fetchone()[0] == len(matched_before)
+    assert sorted(c.member_id for c in after) == sorted(c.member_id for c in before)
+    assert all(len(refs) == 1 for refs in matched.values())
+    assert matched[displaced.member_id] == [receiver_row]
+    assert {m: r for m, r in matched.items() if m not in (receiver, displaced.member_id)} == {
+        m: r for m, r in matched_before.items() if m not in (receiver, displaced.member_id)
+    }
+    [(actor, detail)] = conn.execute("select actor, detail from audit_log where action = 'sandbox_receiver_moved_first'").fetchall()
+    assert actor == "seed_demo" and audit_rows(conn) == audit_before + 1
+    assert detail == {"from_customer_ref": receiver_row, "to_customer_ref": displaced.customer_ref, "was_rank": was_rank}
+    assert "@" not in json.dumps(detail)
+
+    assert seed_demo.seed_receiver_first(conn, config, scores) == "receiver: already first"
+    assert audit_rows(conn) == audit_before + 1 and member_matches(conn) == matched
+
+
+def test_moving_first_is_refused_and_changes_nothing_while_the_receiver_is_not_an_eligible_member(seeded: tuple) -> None:
+    conn, config, stand = seeded
+    seed_demo.seed_orders(conn)
+    seed_demo.seed_refunds(conn)
+    scores = seed_demo.shop_scores(conn)
+    before = state(conn)
+    with pytest.raises(LookupError, match="no member is eligible"):
+        seed_demo.seed_receiver_first(conn, config, scores)
+    assert state(conn) == before
+
+    seed_demo.seed_members(conn, config, scores)
+    before = state(conn)
+    with pytest.raises(LookupError, match="not an eligible member"):
+        seed_demo.seed_receiver_first(conn, config, scores)
+    assert state(conn) == before
 
 
 def test_a_database_without_the_schema_is_refused_and_left_without_it(schema_url: tuple[str, str], monkeypatch: pytest.MonkeyPatch) -> None:

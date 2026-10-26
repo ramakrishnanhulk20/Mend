@@ -9,7 +9,7 @@
  *
  * Run from packages/web: npm run prove:m7b. Prints PASS or FAIL per line and ends with
  * "M7B RESULT: PASS" only if every line passed. Moves real sandbox money: one demo batch
- * of at most 100 cents (PayPal adds its sandbox fee per item) and one 12.50 USD test-card
+ * of 5 items at 200 cents (PayPal adds its sandbox fee per item) and one 12.50 USD test-card
  * purchase into the shop. Always stops the server and the bridge, drops the schemas and
  * releases the database, even on failure. MEND_CSRF_SECRET is generated for this run only.
  */
@@ -32,22 +32,35 @@ const DIST_DIR = ".next-verify";
 const PYTHON = path.join(ENGINE_DIR, ".venv", process.platform === "win32" ? "Scripts/python.exe" : "bin/python");
 // The web config needs a webhook id to load; this proof registers no webhook.
 const UNUSED_WEBHOOK_ID = "M7BPROOFNOWEBHOOK";
-// Every eligible member is a candidate, so the sandbox test receiver can be drawn into
-// the rewarded half; the demo caps keep the batch at 100 cents or less.
+// A demo visitor's default plan: the 10 most at-risk members, half held back, 200 cents to
+// each of the 5 rewarded. The test receiver is moved to rank 1 in this proof's schema, so it
+// is always a candidate and can be drawn into the rewarded half.
 const DEMO_DRAFT = {
   goalText: "Bring back our quiet regulars with a small thank-you",
   asOf: "2026-10-16",
-  budgetMinor: 100,
-  perRecipientMinor: 10,
+  budgetMinor: 1000,
+  perRecipientMinor: 200,
   holdoutShare: "0.50",
-  maxCandidates: 40,
+  maxCandidates: 10,
 };
 // The holdout is a fresh random draw for every draft (C6), so the test receiver is held
 // back about half the time; such drafts are left unapproved and another is drawn.
 const MAX_DRAWS = 12;
 const DRAFTS_PER_DEMO_SESSION = 5;
-const DEMO_TOTAL_CAP_MINOR = 100;
-const DEMO_ITEM_CAP_MINOR = 10;
+const DEMO_ITEMS = 5;
+const DEMO_ITEM_MINOR = 200;
+const DEMO_BATCH_MINOR = 1000;
+// Runs the engine's own seed step on the proof's schema. The process environment wins over
+// the repo's .env, so DATABASE_URL and MEND_TEST_RECEIVER are this run's; the caps come from .env.
+const RECEIVER_FIRST = [
+  "from mend_engine import seed_demo",
+  "from mend_engine.config import load_config",
+  "from mend_engine.db.connect import connect",
+  "config = load_config(str(seed_demo.ENV_PATH) if seed_demo.ENV_PATH.is_file() else None)",
+  "with connect(config) as conn:",
+  "    print(seed_demo.seed_receiver_first(conn, config, seed_demo.shop_scores(conn)), flush=True)",
+].join("\n");
+const RECEIVER_FIRST_LINE = /^receiver: (already first|moved to rank 1 \(was rank \d+\))$/;
 // The UK clock as a POSIX rule: the local pgserver has no time zone database, and a
 // rule worked out in SQL is a check independent of the engine's zoneinfo.
 const LONDON_RULE = "GMT0BST,M3.5.0/1,M10.5.0";
@@ -169,6 +182,27 @@ function build(): void {
     const tail = `${result.stdout}\n${result.stderr}`.trim().split(/\r?\n/).slice(-15).join("\n");
     throw new ProofFailed(`next build failed:\n${tail}`);
   }
+}
+
+/**
+ * The test receiver made rank 1 in the schema databaseUrl points at, by seed_demo's
+ * seed_receiver_first, whatever state the shared schema is in. Returns the step's line.
+ * On failure only the engine's own refusal, or else the error's name, is shown, because
+ * a database error can quote row values.
+ */
+function receiverFirst(env: Record<string, string>): string {
+  const result = spawnSync(PYTHON, ["-c", RECEIVER_FIRST], {
+    cwd: ENGINE_DIR,
+    env: { ...inheritedEnv(), ...env },
+    encoding: "utf8",
+    timeout: 10 * 60 * 1000,
+    windowsHide: true,
+  });
+  const said = (result.stdout ?? "").trim().split(/\r?\n/).at(-1) ?? "";
+  if (result.status === 0 && RECEIVER_FIRST_LINE.test(said)) return said;
+  const last = (result.stderr ?? "").trim().split(/\r?\n/).at(-1) ?? "";
+  const reason = last.startsWith("LookupError: ") ? last : (/^[A-Za-z_.]+/.exec(last)?.[0] ?? "no answer");
+  throw new ProofFailed(`seed_receiver_first did not put the test receiver first (exit ${String(result.status)}): ${reason}`);
 }
 
 async function startBridge(env: Record<string, string>): Promise<string> {
@@ -373,6 +407,15 @@ async function main(): Promise<void> {
 
   // Percent-encoded by hand: libpq, which the engine uses, does not read "+" as a space.
   const schemaUrl = new URL(`${database.url}${database.url.includes("?") ? "&" : "?"}options=${encodeURIComponent(`-c search_path=${schema}`)}`);
+  const movedFirst = receiverFirst({
+    PAYPAL_ENV: "sandbox",
+    PAYPAL_CLIENT_ID: clientId,
+    PAYPAL_CLIENT_SECRET: clientSecret,
+    MEND_DEV: "1",
+    DATABASE_URL: schemaUrl.href,
+    MEND_TEST_RECEIVER: receiver,
+  });
+  note(`${movedFirst} in the proof's schema, so every draft of ${DEMO_DRAFT.maxCandidates} considers the test receiver`);
   const bridgeToken = randomBytes(32).toString("base64url");
   const csrfSecret = randomBytes(32).toString("base64url");
   const bridgeUrl = await startBridge({
@@ -524,13 +567,13 @@ async function main(): Promise<void> {
       /^[A-Z0-9]+$/.test(payoutBatchId) &&
       ledger.rows.length === 1 &&
       ledger.rows[0].payout_batch_id === payoutBatchId &&
-      total > 0 &&
-      total <= DEMO_TOTAL_CAP_MINOR &&
-      items.every((item) => item.amount_minor <= DEMO_ITEM_CAP_MINOR) &&
+      items.length === DEMO_ITEMS &&
+      items.every((item) => item.amount_minor === DEMO_ITEM_MINOR) &&
+      total === DEMO_BATCH_MINOR &&
       items.some((item) => item.receiver_email === receiver),
     "journey: a demo session drafted, viewed (hash shown), approved with that hash, submitted, and PayPal accepted the batch",
   );
-  note(`campaign ${campaignId} on draw ${draws}; batch ${payoutBatchId}: ${items.length} items, ${total} cents in total (cap ${DEMO_TOTAL_CAP_MINOR}), the test receiver among the rewarded`);
+  note(`campaign ${campaignId} on draw ${draws}; batch ${payoutBatchId}: ${items.length} items, ${total} cents in total (expected ${DEMO_ITEMS} items of ${DEMO_ITEM_MINOR} cents), the test receiver among the rewarded`);
   line(
     refusal(wrong, 409, "hash_mismatch") && afterWrong.rows[0]?.status === "draft" && snapshotsAfterWrong.rowCount === 0,
     "wrong hash: approval with a different hash refused with 409",

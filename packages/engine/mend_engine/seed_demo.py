@@ -12,6 +12,8 @@ when it is already done, so a second run changes nothing:
 5. receiver: MEND_TEST_RECEIVER, the sandbox account that can really claim a payout,
    joined as a verified member linked to one more quiet regular, chosen as prove_m4b
    chooses it
+6. receiver first: that member made the most at-risk eligible member, so a default
+   demo draft always considers it (seed_receiver_first)
 
 Reads the UCI zip from packages/engine/.data (downloaded once when missing, checked by
 size and SHA-256). Calls no PayPal API and moves no money. Every shop identity is the
@@ -29,6 +31,7 @@ import psycopg
 from psycopg.types.json import Jsonb
 
 from mend_engine import prove_m4a, prove_m4b, store_facts
+from mend_engine.campaigns.eligibility import quiet_regular_members
 from mend_engine.campaigns.scoring import ScoreSet, score_customers
 from mend_engine.config import Config, ConfigError, load_config
 from mend_engine.data.uci import CACHE_DIR, ZIP_NAME, SourceError, ensure_source
@@ -46,6 +49,9 @@ FACTS = (
     (store_facts.CDNOW_KEY, "cdnow_fact"),
     (store_facts.UCI_KEY, "uci_fact"),
 )
+# shop_customers.email is unique, so one row holds this while the other takes its email.
+# It has no "@", so no member can match it even inside the swap's transaction.
+SWAP_PLACEHOLDER = "seed-demo-swap-in-progress"
 
 
 class SeedRefused(Exception):
@@ -114,6 +120,62 @@ def seed_receiver(conn: psycopg.Connection, config: Config, scores: ScoreSet) ->
     return "receiver: MEND_TEST_RECEIVER is a verified member " + ("linked to one quiet regular" if not linked else "already linked")
 
 
+def seed_receiver_first(conn: psycopg.Connection, config: Config, scores: ScoreSet) -> str:
+    """Make the MEND_TEST_RECEIVER member the most at-risk eligible member.
+
+    The receiver is the one sandbox account that can really claim a payout, so it stands
+    in for the most at-risk quiet regular: a default demo draft takes the 10 most at-risk
+    members, and with the receiver first it is always considered and can land in the
+    rewarded half. The emails on two shop_customers rows trade places in one
+    transaction: the row the first eligible member matches and the row the receiver
+    matches. No member row changes and the member set stays the same; only which order
+    history each of the two members matches. Payouts still go to each member's own
+    PayPal email (C5 restated).
+
+    Ranks with quiet_regular_members at the day scores were computed for. Returns
+    "receiver: already first" and changes nothing when it is; otherwise writes one
+    audit_log row holding from_customer_ref, to_customer_ref and was_rank, never an
+    email. Raises LookupError, changing nothing, when no member is eligible, when the
+    receiver is not an eligible member (a swap would then push the displaced member
+    out of the eligible set), or when either row changed before it could be locked.
+    """
+    receiver = normalise_email(config.test_receiver or "")
+    ranked = quiet_regular_members(conn, scores, scores.as_of)
+    if not ranked:
+        raise LookupError("no member is eligible, so the test receiver cannot be moved first")
+    emails = {member_id: normalise_email(email) for member_id, email in conn.execute("select member_id, paypal_email from members")}
+    at = next((i for i, candidate in enumerate(ranked) if emails.get(candidate.member_id) == receiver), None)
+    if at is None:
+        raise LookupError("the test receiver is not an eligible member; run seed_receiver first")
+    if at == 0:
+        return "receiver: already first"
+    first, mine = ranked[0], ranked[at]
+    with conn.transaction():
+        held = dict(
+            conn.execute(
+                "select customer_ref, email from shop_customers where customer_ref = any(%s) for update",
+                ([first.customer_ref, mine.customer_ref],),
+            )
+        )
+        still_mine = normalise_email(held.get(mine.customer_ref, "")) == receiver
+        still_first = normalise_email(held.get(first.customer_ref, "")) == emails[first.member_id]
+        if not (still_mine and still_first):
+            raise LookupError("a shop record changed while the test receiver was being moved first")
+        update = "update shop_customers set email = %s where customer_ref = %s"
+        conn.execute(update, (SWAP_PLACEHOLDER, mine.customer_ref))
+        conn.execute(update, (held[mine.customer_ref], first.customer_ref))
+        conn.execute(update, (held[first.customer_ref], mine.customer_ref))
+        conn.execute(
+            "insert into audit_log (actor, action, detail) values (%s, %s, %s)",
+            (
+                ACTOR,
+                "sandbox_receiver_moved_first",
+                Jsonb({"from_customer_ref": mine.customer_ref, "to_customer_ref": first.customer_ref, "was_rank": at + 1}),
+            ),
+        )
+    return f"receiver: moved to rank 1 (was rank {at + 1})"
+
+
 def run(config: Config) -> bool:
     """Seed the database config points at, printing one line per step. Raises SeedRefused or ConfigError when it cannot start."""
     if not config.test_receiver:
@@ -128,6 +190,7 @@ def run(config: Config) -> bool:
         scores = shop_scores(conn)
         print(seed_members(conn, config, scores), flush=True)
         print(seed_receiver(conn, config, scores), flush=True)
+        print(seed_receiver_first(conn, config, scores), flush=True)
     return True
 
 

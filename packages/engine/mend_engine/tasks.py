@@ -86,9 +86,9 @@ TASK_NAMES = (
 ROLES = ("owner", "demo")
 # Demo caps, in USD cents. Fixed in code so no setting, request or session can loosen
 # them, and never looser than the owner's caps from config.
-DEMO_ITEM_CAP_MINOR = 10
-DEMO_CAMPAIGN_CAP_MINOR = 100
-DEMO_DAILY_CAP_MINOR = 500
+DEMO_ITEM_CAP_MINOR = 200
+DEMO_CAMPAIGN_CAP_MINOR = 1000
+DEMO_DAILY_CAP_MINOR = 5000
 DEMO_CAMPAIGNS_PER_SESSION_PER_DAY = 5
 # Must match the web app's idle limit (packages/web/src/server/sessions.ts), so a
 # session the web app would refuse is refused here too.
@@ -172,8 +172,8 @@ def draft_campaign(settings: object, actor: object) -> dict:
 
     settings is {"goal_text", "as_of" (YYYY-MM-DD), "budget_minor", "per_recipient_minor",
     "holdout_share" (a string such as "0.30"), "max_candidates"} and nothing else.
-    A demo actor drafts under 100 cents per campaign and 10 per person, at most 5
-    campaigns per session in any 24 hours, and the demo pool of 500 cents per rolling
+    A demo actor drafts under 1000 cents per campaign and 200 per person, at most 5
+    campaigns per session in any 24 hours, and the demo pool of 5000 cents per rolling
     day. The campaign is recorded against the actor's session in campaign_owners in
     the same transaction as the draft. Returns campaign_id and counts; refusals carry
     build_draft's reason, "limit_reached" or "over_demo_daily_cap".
@@ -455,7 +455,7 @@ def draft_limits(actor: object) -> dict:
     as_of is the London day of the shop's latest order (None when there are none),
     the day draft_campaign scores on. campaign_cap_minor and item_cap_minor are the
     caps of the actor's role from the same _role_config draft_campaign uses: the
-    deployment's own for the owner, 100 and 10 cents for demo.
+    deployment's own for the owner, 1000 and 200 cents for demo.
     """
 
     def work(config: Config, conn: psycopg.Connection) -> dict:

@@ -31,10 +31,10 @@ const UNUSED_WEBHOOK_ID = "M7APROOFNOWEBHOOK";
 const DEMO_DRAFT = {
   goalText: "Bring back our quiet regulars with a small thank-you",
   asOf: "2026-10-16",
-  budgetMinor: 100,
-  perRecipientMinor: 10,
+  budgetMinor: 1000,
+  perRecipientMinor: 200,
   holdoutShare: "0.50",
-  maxCandidates: 20,
+  maxCandidates: 10,
 };
 const LEAK_SHAPES = /Traceback|psycopg|select |column|session_id|File "|line \d|\.py/i;
 
@@ -384,21 +384,21 @@ async function main(): Promise<void> {
   line(
     drafted.status === 201 &&
       Number(drafted.body.totalMinor) > 0 &&
-      Number(drafted.body.totalMinor) <= 100 &&
+      Number(drafted.body.totalMinor) <= 1000 &&
       ownerRow.rows[0]?.role === "demo" &&
       ownerRow.rows[0]?.session_id === sha256(firstToken) &&
       amounts.rows.length > 0 &&
-      amounts.rows.every((row) => row.amount_minor <= 10) &&
+      amounts.rows.every((row) => row.amount_minor <= 200) &&
       bridgeLinesAfter === bridgeLinesBefore + 1,
     `draft: a demo session drafted a campaign through the engine task (bridge), under demo caps (${String(drafted.body.rewarded)} rewarded, ${String(drafted.body.totalMinor)} cents)`,
   );
 
   // Demo caps.
   const campaignsBefore = await campaigns();
-  const overCap = await first.send("POST", "/api/campaigns", { body: { ...DEMO_DRAFT, budgetMinor: 101 } });
+  const overCap = await first.send("POST", "/api/campaigns", { body: { ...DEMO_DRAFT, budgetMinor: 1001 } });
   line(
     overCap.status === 422 && genericRefusal(overCap, "budget_over_cap") && (await campaigns()) === campaignsBefore,
-    "demo caps: a demo draft over 100 cents is refused",
+    "demo caps: a demo draft over 1000 cents is refused",
   );
 
   // Isolation.

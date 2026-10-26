@@ -48,8 +48,8 @@ const DIST_DIR = ".next-verify";
 const PYTHON = path.join(ENGINE_DIR, ".venv", process.platform === "win32" ? "Scripts/python.exe" : "bin/python");
 const UNUSED_WEBHOOK_ID = "M6PROOFNOWEBHOOK";
 const GOAL = "bring back my quiet regulars, 50 dollars";
-const DEMO_CAMPAIGN_CAP_MINOR = 100;
-const DEMO_ITEM_CAP_MINOR = 10;
+const DEMO_CAMPAIGN_CAP_MINOR = 1000;
+const DEMO_ITEM_CAP_MINOR = 200;
 const DEMO_DAILY_CLAUDE_CALLS = 40;
 const EVAL_PASS_SHARE = 0.9;
 // Claude Haiku 5.5 list prices in USD per million tokens, for prompts of 100K tokens or
@@ -632,10 +632,10 @@ async function main(): Promise<void> {
       demoPlan.status === 201 &&
       demoPlan.plan?.goal === "read" &&
       demoSettings.budgetMinor === DEMO_CAMPAIGN_CAP_MINOR &&
-      demoChanges.includes("Budget lowered from $50.00 to $1.00, the most one campaign may spend on this account.") &&
+      demoChanges.includes("Budget lowered from $50.00 to $10.00, the most one campaign may spend on this account.") &&
       (await draftsWithinCaps(ownerPlan.campaignId, ownerCampaignCap, ownerItemCap)) &&
       (await draftsWithinCaps(demoPlan.campaignId, DEMO_CAMPAIGN_CAP_MINOR, DEMO_ITEM_CAP_MINOR)),
-    "plan: 'bring back my quiet regulars, 50 dollars' as owner gives budget 5000 cents clamped to the owner cap if needed; as demo it is clamped to 100 cents and the route says so",
+    "plan: 'bring back my quiet regulars, 50 dollars' as owner gives budget 5000 cents clamped to the owner cap if needed; as demo it is clamped to 1000 cents and the route says so",
   );
   note(`owner: budget ${String(ownerSettings.budgetMinor)} cents (owner cap ${ownerCampaignCap}), ${String(ownerPlan.body.rewarded)} rewarded and ${String(ownerPlan.body.heldBack)} held back, changes: ${ownerChanges.join(" ") || "none"}`);
   note(`demo: budget ${String(demoSettings.budgetMinor)} cents, ${String(demoSettings.maxCandidates)} considered, changes said: ${demoChanges.join(" ")}`);

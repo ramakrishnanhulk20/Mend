@@ -233,11 +233,14 @@ describe("every POST route", () => {
     expect(bridge.seen).toEqual([]);
     const answers = await Promise.all(admins.map(async (route) => json(await route.call(request("POST", "/api/x", { session: owner })))));
     expect(answers).toEqual([{ ran: true, outcomes: { "status recorded": 2 }, retrying: 0 }, { ran: true, lookedAt: 0, sent: 0, waiting: 0 }, { deleted: 0 }]);
-    expect(bridge.seen.map((call) => [call.task, call.args])).toEqual([
+    // The three routes run at once, so the bridge may see them in any order.
+    const seen = bridge.seen.map((call) => [call.task, call.args]);
+    expect(seen).toHaveLength(3);
+    expect(seen).toEqual(expect.arrayContaining([
       ["process_events", []],
       ["reconcile", []],
       ["purge", []],
-    ]);
+    ]));
   });
 });
 

@@ -40,10 +40,10 @@ REF_SHAPE = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f
 DEMO_SETTINGS = {
     "goal_text": "Bring back the regulars who have gone quiet",
     "as_of": "2026-10-16",
-    "budget_minor": 100,
-    "per_recipient_minor": 10,
+    "budget_minor": 1000,
+    "per_recipient_minor": 200,
     "holdout_share": "0.50",
-    "max_candidates": 20,
+    "max_candidates": 10,
 }
 
 
@@ -192,22 +192,22 @@ def test_a_demo_draft_stays_under_demo_caps_and_is_recorded_against_its_session(
 
     result = tasks.draft_campaign(DEMO_SETTINGS, demo)
 
-    assert result["ok"] is True and result["total_minor"] <= 100 and result["rewarded"] == 10
+    assert result["ok"] is True and result["total_minor"] <= 1000 and result["rewarded"] == 5
     campaign_id = uuid.UUID(result["campaign_id"])
     amounts = [r[0] for r in conn.execute("select amount_minor from campaign_members where campaign_id = %s and role = 'reward'", (campaign_id,))]
-    assert amounts and all(a <= 10 for a in amounts) and sum(amounts) == result["total_minor"]
+    assert amounts and all(a <= 200 for a in amounts) and sum(amounts) == result["total_minor"]
     assert conn.execute("select role, session_id from campaign_owners where campaign_id = %s", (campaign_id,)).fetchone() == (
         "demo", demo["session"],
     )
     owner = actor(conn, "owner")
     big = tasks.draft_campaign({**DEMO_SETTINGS, "budget_minor": 2000, "per_recipient_minor": 300}, owner)
-    assert big["ok"] is True and big["total_minor"] > 100
+    assert big["ok"] is True and big["total_minor"] > 1000
     assert conn.execute("select role from campaign_owners where campaign_id = %s", (uuid.UUID(big["campaign_id"]),)).fetchone() == ("owner",)
 
 
 @pytest.mark.parametrize(
     ("changes", "code"),
-    [({"budget_minor": 101}, "budget_over_cap"), ({"per_recipient_minor": 11}, "per_recipient_over_cap")],
+    [({"budget_minor": 1001}, "budget_over_cap"), ({"per_recipient_minor": 201}, "per_recipient_over_cap")],
 )
 def test_a_demo_draft_over_the_demo_caps_is_refused_and_stores_nothing(
     conn: psycopg.Connection, paypal: FakePayPal, changes: dict, code: str
@@ -227,11 +227,11 @@ def test_a_demo_session_may_draft_five_campaigns_a_day(conn: psycopg.Connection,
     assert tasks.draft_campaign(DEMO_SETTINGS, actor(conn, "demo"))["ok"] is True
 
 
-def test_the_demo_pool_of_500_cents_a_day_is_shared_by_every_demo_session(conn: psycopg.Connection, paypal: FakePayPal) -> None:
+def test_the_demo_pool_of_5000_cents_a_day_is_shared_by_every_demo_session(conn: psycopg.Connection, paypal: FakePayPal) -> None:
     seed_shop(conn)
-    demo_spend(conn, 450)
+    demo_spend(conn, 4950)
     before = counts(conn)
-    assert tasks.demo_spent_last_24h_minor(conn) == 450
+    assert tasks.demo_spent_last_24h_minor(conn) == 4950
     assert refused(tasks.draft_campaign(DEMO_SETTINGS, actor(conn, "demo")), "over_demo_daily_cap")
     assert counts(conn) == before
     assert tasks.draft_campaign({**DEMO_SETTINGS, "budget_minor": 50}, actor(conn, "demo"))["ok"] is True
@@ -283,7 +283,7 @@ def test_a_demo_actor_approves_and_submits_under_demo_caps(conn: psycopg.Connect
     demo = actor(conn, "demo")
     campaign_id = tasks.draft_campaign(DEMO_SETTINGS, demo)["campaign_id"]
     view = tasks.view_campaign(campaign_id, demo)
-    assert view["ok"] and view["status"] == "draft" and len(view["rows"]) == 20
+    assert view["ok"] and view["status"] == "draft" and len(view["rows"]) == 10
     assert all(set(row) == {"ref", "role", "rank", "amount_minor", "note"} for row in view["rows"])
     assert "@" not in json.dumps(view["rows"])
 
@@ -295,7 +295,7 @@ def test_a_demo_actor_approves_and_submits_under_demo_caps(conn: psycopg.Connect
     sent = tasks.submit_campaign(campaign_id, demo)
     assert (sent["ok"], sent["status"], sent["sent"], sent["payout_batch_id"]) == (True, "submitted", True, "BATCH1")
     [post] = paypal.money_requests()
-    assert all(item["amount"]["value"] == "0.10" for item in json.loads(post.content)["items"])
+    assert all(item["amount"]["value"] == "2.00" for item in json.loads(post.content)["items"])
     again = tasks.submit_campaign(campaign_id, demo)
     assert (again["ok"], again["sent"], len(paypal.money_requests())) == (True, False, 1)
 
@@ -305,7 +305,7 @@ def test_a_demo_submit_that_would_pass_the_demo_pool_is_refused(conn: psycopg.Co
     demo = actor(conn, "demo")
     campaign_id = tasks.draft_campaign(DEMO_SETTINGS, demo)["campaign_id"]
     assert tasks.approve_campaign(campaign_id, demo, tasks.view_campaign(campaign_id, demo)["review_hash"])["ok"]
-    demo_spend(conn, 450)
+    demo_spend(conn, 4950)
 
     assert refused(tasks.submit_campaign(campaign_id, demo), "over_demo_daily_cap")
     assert paypal.money_requests() == []
@@ -324,7 +324,7 @@ def test_simulate_and_results_return_json_safe_answers(conn: psycopg.Connection,
 
     assert order == {"ok": True, "campaign_id": campaign_id, "ref": "R1", "paypal_order_id": "5O190127TN364715T", "paypal_status": "COMPLETED"}
     assert found["ok"] and found["status"] == "submitted" and found["verdict"] == "too early to tell"
-    assert found["rewarded"]["members"] + found["holdout"]["members"] == 20
+    assert found["rewarded"]["members"] + found["holdout"]["members"] == 10
     json.dumps(found, allow_nan=False)
 
 
@@ -573,11 +573,11 @@ def campaign_status(conn: psycopg.Connection, campaign_id: str) -> str:
 
 
 def test_draft_limits_gives_each_role_its_caps_and_the_shops_day(conn: psycopg.Connection, paypal: FakePayPal) -> None:
-    assert tasks.draft_limits(actor(conn, "demo")) == {"ok": True, "as_of": None, "campaign_cap_minor": 100, "item_cap_minor": 10}
+    assert tasks.draft_limits(actor(conn, "demo")) == {"ok": True, "as_of": None, "campaign_cap_minor": 1000, "item_cap_minor": 200}
     seed_shop(conn)
     day = conn.execute(f"select max((ordered_at at time zone '{LONDON_RULE}')::date)::text from shop_orders").fetchone()[0]
 
-    assert tasks.draft_limits(actor(conn, "demo")) == {"ok": True, "as_of": day, "campaign_cap_minor": 100, "item_cap_minor": 10}
+    assert tasks.draft_limits(actor(conn, "demo")) == {"ok": True, "as_of": day, "campaign_cap_minor": 1000, "item_cap_minor": 200}
     assert tasks.draft_limits(actor(conn, "owner")) == {"ok": True, "as_of": day, "campaign_cap_minor": 10000, "item_cap_minor": 1000}
     assert refused(tasks.draft_limits({"role": "demo", "session": "a" * 64}), "forbidden")
     assert refused(tasks.draft_limits(None), "invalid_actor")
@@ -695,7 +695,7 @@ def test_forty_note_context_and_set_note_calls_at_once_on_one_campaign_all_succe
     # locks that deadlocked with these writes: 13 of 38 such calls failed at four at once.
     seed_shop(conn)
     owner = actor(conn, "owner")
-    campaign_id = tasks.draft_campaign(DEMO_SETTINGS, owner)["campaign_id"]
+    campaign_id = tasks.draft_campaign({**DEMO_SETTINGS, "max_candidates": 20}, owner)["campaign_id"]
     refs = [r[0] for r in conn.execute("select ref from campaign_members where campaign_id = %s and role = 'reward'", (uuid.UUID(campaign_id),))]
     calls = [(tasks.note_context, (campaign_id, ref, owner)) for ref in refs * 2] + [
         (tasks.set_note, (campaign_id, ref, f"Thank you for coming back, note {n}.", owner)) for n in (1, 2) for ref in refs

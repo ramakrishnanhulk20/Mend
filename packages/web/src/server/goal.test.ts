@@ -72,7 +72,7 @@ const BASE = "http://127.0.0.1:3000";
 const CAMPAIGN = "0b6c2f8e-6a4e-4c1b-9d2a-7e5f1a3b9c4d";
 const GOAL = "bring back my quiet regulars, 50 dollars";
 const OWNER_LIMITS = { asOf: "2026-10-16", campaignCapMinor: 10_000, itemCapMinor: 1_000 };
-const DEMO_LIMITS = { asOf: "2026-10-16", campaignCapMinor: 100, itemCapMinor: 10 };
+const DEMO_LIMITS = { asOf: "2026-10-16", campaignCapMinor: 1000, itemCapMinor: 200 };
 
 function claudeJson(reading: Record<string, unknown>, stopReason = "end_turn"): () => Response {
   return () =>
@@ -112,7 +112,7 @@ beforeEach(() => {
   state.engine = {
     draft_limits: (args) => {
       const demo = (args[0] as { role: string }).role === "demo";
-      return { ok: true, as_of: "2026-10-16", campaign_cap_minor: demo ? 100 : 10_000, item_cap_minor: demo ? 10 : 1_000 };
+      return { ok: true, as_of: "2026-10-16", campaign_cap_minor: demo ? 1000 : 10_000, item_cap_minor: demo ? 200 : 1_000 };
     },
     draft_campaign: (args) => ({ ok: true, campaign_id: CAMPAIGN, candidates: 20, rewarded: 10, held_back: 10, total_minor: Math.min((args[0] as { budget_minor: number }).budget_minor, 100) }),
   };
@@ -163,10 +163,10 @@ describe("fitPlan", () => {
 
   it("clamps a demo plan to the demo caps and says so", () => {
     const fitted = fitPlan(GOAL, read({ per_recipient_usd: 5 }), {}, DEMO_LIMITS, "demo");
-    expect(fitted.settings).toMatchObject({ budgetMinor: 100, perRecipientMinor: 10, maxCandidates: 20 });
+    expect(fitted.settings).toMatchObject({ budgetMinor: 1000, perRecipientMinor: 200, maxCandidates: 10 });
     expect(fitted.changes).toEqual([
-      "Budget lowered from $50.00 to $1.00, the most one campaign may spend on this account.",
-      "Most per customer lowered from $5.00 to $0.10, the cap per customer on this account.",
+      "Budget lowered from $50.00 to $10.00, the most one campaign may spend on this account.",
+      "Most per customer lowered from $5.00 to $2.00, the cap per customer on this account.",
     ]);
   });
 
@@ -235,14 +235,14 @@ describe("POST /api/campaigns/plan", () => {
     expect(state.hits).toEqual(["draft", "claude_owner"]);
   });
 
-  it("clamps a demo visitor's $50 to 100 cents and says so", async () => {
+  it("clamps a demo visitor's $50 to 1000 cents and says so", async () => {
     state.claudeAnswers.push(claudeJson({ budget_usd: 50, unclear: false, reason: "" }));
     const response = await plan(signIn("demo"), { goalText: GOAL });
     const body = (await response.json()) as { plan: { settings: Record<string, unknown>; changes: string[] } };
     expect(response.status).toBe(201);
-    expect(body.plan.settings).toMatchObject({ budgetMinor: 100, perRecipientMinor: 10, maxCandidates: 20 });
-    expect(body.plan.changes).toContain("Budget lowered from $50.00 to $1.00, the most one campaign may spend on this account.");
-    expect((state.engineCalls.find((call) => call.task === "draft_campaign")?.args[0] as { budget_minor: number }).budget_minor).toBe(100);
+    expect(body.plan.settings).toMatchObject({ budgetMinor: 1000, perRecipientMinor: 200, maxCandidates: 10 });
+    expect(body.plan.changes).toContain("Budget lowered from $50.00 to $10.00, the most one campaign may spend on this account.");
+    expect((state.engineCalls.find((call) => call.task === "draft_campaign")?.args[0] as { budget_minor: number }).budget_minor).toBe(1000);
   });
 
   it("plans from the form with no key, and asks plainly for a budget when the form has none", async () => {

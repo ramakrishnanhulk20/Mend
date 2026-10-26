@@ -26,7 +26,7 @@ export const MIN_CANDIDATES = 2;
 export const MAX_CANDIDATES = 250;
 // Fewer for demo: each rewarded customer costs one Claude call for their note, and a
 // demo session has 40 calls a day.
-export const DEFAULT_CANDIDATES: Readonly<Record<SignedIn["role"], number>> = { owner: 40, demo: 20 };
+export const DEFAULT_CANDIDATES: Readonly<Record<SignedIn["role"], number>> = { owner: 40, demo: 10 };
 const LIMITS_WAIT_MS = 15_000;
 export const DRAFT_WAIT_MS = 20_000;
 

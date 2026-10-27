@@ -1745,15 +1745,30 @@ async function prove() {
       headers[name] = delivered.headers[key];
     }
     const altered = alterOneCharacter(delivered.event.raw);
-    const sentAt = new Date();
-    const response = await fetch(webhookUrl, { method: "POST", headers, body: altered, redirect: "error", signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS) });
-    const ref = /\(ref ([0-9a-f-]{36})\)$/.exec(await response.text())?.[1] ?? "";
-    const record = ref === "" ? null : await waitForLogRecord(workspace.id, services.web.id, new Date(sentAt.getTime() - 30_000), "mend-web's log line for the forgery", (entry) => entry.ref === ref);
-    const forgedRows = rows("select count(*)::int as n from paypal_events where raw = %s", [altered])[0].n;
-    const original = rows("select raw from paypal_events where transmission_id = %s", [delivered.event.transmission_id])[0]?.raw;
+    // mend-web answers a transmission id it already stored with 200 and no write, before asking
+    // PayPal; a fresh id makes the forgery go through PayPal's verification instead.
+    const storedId = delivered.event.transmission_id;
+    const freshId = storedId.slice(0, -1) + (storedId.endsWith("0") ? "1" : "0");
+    const post = async (transmissionId) => {
+      const sentAt = new Date();
+      const response = await fetch(webhookUrl, {
+        method: "POST",
+        headers: { ...headers, "paypal-transmission-id": transmissionId },
+        body: altered,
+        redirect: "error",
+        signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
+      });
+      const ref = /\(ref ([0-9a-f-]{36})\)$/.exec(await response.text())?.[1] ?? "";
+      const record = ref === "" ? null : await waitForLogRecord(workspace.id, services.web.id, new Date(sentAt.getTime() - 30_000), "mend-web's log line for the forgery", (entry) => entry.ref === ref);
+      return { status: response.status, reason: record?.reason ?? record?.outcome ?? "nothing" };
+    };
+    const verified = await post(freshId);
+    const underStoredId = await post(storedId);
+    const forgedRows = rows("select count(*)::int as n from paypal_events where raw = %s or transmission_id = %s", [altered, freshId])[0].n;
+    const original = rows("select raw from paypal_events where transmission_id = %s", [storedId])[0]?.raw;
     line(
-      response.status === 400 && record?.reason === "verify_failure" && forgedRows === 0 && original === delivered.event.raw,
-      `forgery: an altered copy of that delivery sent to the live URL is refused with 400 and stores nothing (answer ${response.status}, mend-web logged ${record?.reason ?? "nothing"})`,
+      verified.status === 400 && verified.reason === "verify_failure" && underStoredId.status === 200 && forgedRows === 0 && original === delivered.event.raw,
+      `forgery: an altered copy of that delivery under a new transmission id is refused by PayPal's verification (answer ${verified.status}, ${verified.reason}); under the stored id it gets ${underStoredId.status} (${underStoredId.reason}) with no PayPal call; neither stored anything and the original is unchanged`,
     );
   });
 

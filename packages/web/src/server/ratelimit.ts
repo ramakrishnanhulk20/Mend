@@ -1,6 +1,8 @@
 /**
  * Rate limits counted in Postgres (C18, C20), on things the caller cannot choose: the
- * client address the platform saw, or a session id this server issued.
+ * client address the platform saw, or a session id this server issued. The webhook,
+ * which anyone can post to, is counted in memory instead (address-limits.ts), so that
+ * traffic nobody has authenticated never reaches the database.
  *
  * The client address is the right-most entry of X-Forwarded-For. On Render, the proxy
  * in front of the app appends the address it received the connection from, so
@@ -41,9 +43,11 @@ const DAY_MS = 24 * HOUR_MS;
 
 // Per-session limits count against a session id this server issued, per-address ones
 // against clientAddress. The "all" limits count every caller together (subject GLOBAL),
-// the global caps C20 asks for on demo approvals, simulates and webhook traffic; the
-// engine's demo pool caps demo spending on top. Where a route takes several, the
-// narrowest is taken first, so a caller stopped there never fills a wider count.
+// the global caps C20 asks for on demo Claude calls, demo approvals and simulates; the
+// engine's demo pool caps demo spending on top. Each shared pool has a per-address share
+// below it, so no one address can take a whole pool (ratelimit.test.ts checks every
+// pair). Where a route takes several, the narrowest is taken first, so a caller stopped
+// there never fills a wider count.
 export const LIMITS = {
   signIn: { bucket: "sign_in", max: 10, windowMs: 15 * 60 * 1000, per: "address" },
   // Each demo session opens a fresh set of per-session counts, so the number one address
@@ -56,6 +60,10 @@ export const LIMITS = {
   demoApprovalsAddress: { bucket: "demo_approvals_address", max: 10, windowMs: HOUR_MS, per: "address" },
   demoApprovals: { bucket: "demo_approvals_all", max: 100, windowMs: HOUR_MS, per: "all" },
   submit: { bucket: "submit", max: 10, windowMs: HOUR_MS, per: "session" },
+  // Demo submits per client address over a rolling day: at the engine's 1000-cent demo
+  // campaign cap, 4 send at most 4000 cents, under the 5000-cent daily demo pool, so one
+  // address always leaves room for the next visitor.
+  demoSubmitsAddress: { bucket: "demo_submits_address", max: 4, windowMs: DAY_MS, per: "address" },
   // Its own count, so pulling rewards back never uses up a session's submits.
   cancelUnclaimed: { bucket: "cancel_unclaimed", max: 10, windowMs: HOUR_MS, per: "session" },
   simulate: { bucket: "simulate", max: 10, windowMs: HOUR_MS, per: "session" },
@@ -78,14 +86,6 @@ export const LIMITS = {
   joinCallback: { bucket: "join_callback", max: 20, windowMs: MINUTE_MS, per: "address" },
   // The public consent words: each read is an engine run, so one address cannot keep the engine busy.
   joinConsent: { bucket: "join_consent", max: 60, windowMs: MINUTE_MS, per: "address" },
-  // PayPal webhook deliveries, counted before the body is read. The address count is
-  // taken first, so one flooding address is stopped there and never fills the shared
-  // count that PayPal's own deliveries also need.
-  webhookAddress: { bucket: "webhook_address", max: 120, windowMs: MINUTE_MS, per: "address" },
-  webhookAll: { bucket: "webhook_all", max: 600, windowMs: MINUTE_MS, per: "all" },
-  // Calls to PayPal's verify API from anywhere in the app. PayPal's rate limits are
-  // shared with Payouts, so traffic nobody has verified yet may spend only this much.
-  paypalVerify: { bucket: "paypal_verify_all", max: 60, windowMs: MINUTE_MS, per: "all" },
 } as const satisfies Record<string, Limit>;
 
 /** The subject for limits that count every caller together. */
@@ -184,15 +184,6 @@ async function claimFirst(client: PoolClient, key: string, subject: string, wind
   return true;
 }
 
-/**
- * True for the first call in windowMs for key and subject, false for each later one
- * until windowMs has passed since the last true, even when calls arrive at once. For
- * records written once a window rather than once a request. Throws a database error.
- */
-export async function firstInWindow(key: string, subject: string, windowMs: number): Promise<boolean> {
-  return underLock(`${FIRST_MARKER}${key}`, subject, (client) => claimFirst(client, key, subject, windowMs));
-}
-
 async function countHit(limit: Limit, subject: string): Promise<{ readonly result: HitResult; readonly firstRefusal: boolean }> {
   return underLock(limit.bucket, subject, async (client) => {
     const sweep = await client.query<{ got: boolean }>("select pg_try_advisory_xact_lock($1) as got", [SWEEP_LOCK]);
@@ -214,9 +205,12 @@ async function countHit(limit: Limit, subject: string): Promise<{ readonly resul
   });
 }
 
-// Best-effort: a tag that cannot be made or a row that cannot be written leaves one log
-// line and never changes the refusal.
-async function recordLimitHit(limit: Limit, subject: string): Promise<void> {
+/**
+ * The audit row for a refusal by limit for subject: the bucket, and the address or
+ * session tag for a per-address or per-session limit. Best-effort: a tag that cannot be
+ * made or a row that cannot be written leaves one log line and never changes the refusal.
+ */
+export async function recordLimitHit(limit: Limit, subject: string): Promise<void> {
   let detail: AuditDetail;
   try {
     if (limit.per === "address") detail = { bucket: limit.bucket, per: limit.per, address_tag: addressTag(subject) };

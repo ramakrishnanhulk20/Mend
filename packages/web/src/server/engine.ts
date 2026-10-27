@@ -298,7 +298,8 @@ export function statusForEngineError(code: string): number {
   if (code === "invalid_input" || code === "invalid_actor") return 400;
   if (code === "forbidden") return 403;
   if (code === "limit_reached" || code === "over_demo_daily_cap" || code === "over_daily_cap") return 429;
-  if (code === "paypal_unavailable") return 503;
+  // busy: another demo send held the spend lock for 10 s; balance_unavailable: PayPal could not report the balance.
+  if (code === "paypal_unavailable" || code === "busy" || code === "balance_unavailable") return 503;
   if (code === "internal") return 500;
   // Every other code is a rule the request broke, such as budget_over_cap.
   return 422;

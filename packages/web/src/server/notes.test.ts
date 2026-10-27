@@ -194,6 +194,17 @@ describe("noteProblem", () => {
     expect(hasLongDigitRun("12_30")).toBe(false);
   });
 
+  it("counts digits through every character that is not a letter or a digit, with no list to miss one", () => {
+    for (const phone of ["Call 415;555;0199", "Ring 415!555!0199 soon", "Try 415?555?0199", 'Dial 415"555"0199', "Call 415&555&0199 today"]) {
+      expect(noteProblem(phone), phone).toBe("has a run of 7 or more digits");
+    }
+    for (const text of ["415+555+0199", "415*555*0199", "415·555·0199", "415 555 0199", "415#555#0199"]) {
+      expect(hasLongDigitRun(text), text).toBe(true);
+    }
+    expect(hasLongDigitRun("Room 12a, bay 34b, row 567")).toBe(false);
+    expect(noteProblem("Thanks for 12 visits since 2024!")).toBeNull();
+  });
+
   it("tidies typographic quotes, dashes and wrapping quotes into plain ASCII", () => {
     expect(tidyNote("\u201cWe\u2019ve missed you \u2014 come back soon\u2026\u201d")).toBe("We've missed you, come back soon...");
   });

@@ -233,6 +233,26 @@ describe("takeHit", () => {
     expect(LIMITS.simulateAddress).toEqual({ bucket: "simulate_address", max: 10, windowMs: HOUR_MS, per: "address" });
   });
 
+  it("leaves every shared pool room that no one address's share can fill", () => {
+    expect(LIMITS.demoSubmitsAddress).toEqual({ bucket: "demo_submits_address", max: 4, windowMs: DAY_MS, per: "address" });
+    // 1000 is the engine's DEMO_CAMPAIGN_CAP_MINOR and 5000 its DEMO_DAILY_CAP_MINOR (tasks.py),
+    // a pool the engine counts over the same rolling 24 hours.
+    expect(LIMITS.demoSubmitsAddress.max * 1000).toBeLessThan(5000);
+    const pairs: readonly (readonly [Limit, Limit])[] = [
+      [LIMITS.claudeDemoAddress, LIMITS.claudeDemoAll],
+      [LIMITS.demoApprovalsAddress, LIMITS.demoApprovals],
+      [LIMITS.simulateAddress, LIMITS.simulates],
+    ];
+    for (const [share, pool] of pairs) {
+      expect([share.per, pool.per], share.bucket).toEqual(["address", "all"]);
+      expect(share.windowMs, share.bucket).toBe(pool.windowMs);
+      expect(share.max, share.bucket).toBeLessThan(pool.max);
+    }
+    // Every pool shared by visitors is in the list above; claude_owner is the owner's alone.
+    const pools = Object.values(LIMITS).filter((limit) => limit.per === "all").map((limit) => limit.bucket);
+    expect(pools.sort()).toEqual([...pairs.map(([, pool]) => pool.bucket), LIMITS.claudeOwner.bucket].sort());
+  });
+
   it("sweeps out rows older than every window", async () => {
     await admin.query("insert into rate_limit_hits (bucket, subject, at) values ('draft', 'old', now() - interval '25 hours')");
     // The sweep lock is database-wide and other test files run at the same time, so a

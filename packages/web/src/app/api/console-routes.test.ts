@@ -3,7 +3,8 @@
 // conflicts, the public summary's cache, runs answering only the session that started
 // them, pulling back unclaimed rewards with the payout states in results, sign-in,
 // demo sessions and sign-out on the audit record in the same transaction as the session
-// write, and each client address's share of demo sessions, demo approvals and simulates.
+// write, each client address's share of demo sessions, demo approvals, demo submits and
+// simulates, and the owner's simulates drawing on no pool demo visitors share.
 // Sessions live in a throwaway Postgres schema; the engine is a fake dev bridge on 127.0.0.1.
 // Does NOT cover: the real engine or PayPal (npm run prove:m7b drives the M7b routes
 // against both; which campaigns a cancel may touch is the engine's own tests), Next.js
@@ -643,6 +644,37 @@ describe("each client address's share", () => {
     expect(await auditSince(before)).toEqual([
       { actor: "web", action: "rate_limit_hit", detail: { bucket: "demo_approvals_address", per: "address", address_tag: addressTag("198.51.100.40") } },
     ]);
+  });
+
+  it("holds one address to 4 demo submits a day across its sessions, and leaves the owner's submits alone", async () => {
+    const { POST } = await import("./campaigns/[id]/submit/route");
+    const before = await lastAuditId();
+    const visits = [await createSession("demo"), await createSession("demo")];
+    const submit = (session: IssuedSession, address: string) => POST(request("POST", "/x", { session, address }), params({ id: CAMPAIGN }));
+    for (let n = 0; n < 4; n += 1) expect((await submit(visits[n % 2], "198.51.100.44")).status).toBe(200);
+    const refused = await submit(visits[0], "198.51.100.44");
+    expect(refused.status).toBe(429);
+    expect(await json(refused)).toMatchObject({ error: "rate_limited" });
+    expect((await submit(visits[1], "198.51.100.45")).status).toBe(200);
+    expect((await submit(await createSession("owner"), "198.51.100.44")).status).toBe(200);
+    expect(bridge.seen.filter((call) => call.task === "submit_campaign")).toHaveLength(6);
+    expect(await auditSince(before)).toEqual([
+      { actor: "web", action: "rate_limit_hit", detail: { bucket: "demo_submits_address", per: "address", address_tag: addressTag("198.51.100.44") } },
+    ]);
+  });
+
+  it("lets the owner simulate while the demo visitors' shared pool is full, and refuses a demo visitor", async () => {
+    const { POST } = await import("./campaigns/[id]/simulate/route");
+    await admin.query("insert into rate_limit_hits (bucket, subject) select 'simulates_all', 'all' from generate_series(1, 100)");
+    try {
+      const simulate = (session: IssuedSession, address: string) => POST(request("POST", "/x", { session, address, body: { ref: "R2" } }), params({ id: CAMPAIGN }));
+      expect((await simulate(await createSession("owner"), "198.51.100.46")).status).toBe(201);
+      const refused = await simulate(await createSession("demo"), "198.51.100.47");
+      expect(refused.status).toBe(429);
+      expect(await json(refused)).toMatchObject({ error: "rate_limited" });
+    } finally {
+      await admin.query("delete from rate_limit_hits where bucket = 'simulates_all'");
+    }
   });
 
   it("holds one address to 10 simulates an hour across its sessions", async () => {

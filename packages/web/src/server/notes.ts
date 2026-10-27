@@ -33,13 +33,14 @@ const STEP_WAIT_MS = 20_000;
 const NOTE_CHARACTERS = /^[A-Za-z0-9 .,!?'"():;&-]+$/;
 // A word, a dot and two or more letters with no space between: "evil.example", "x.co".
 const DOMAIN_LIKE = /[A-Za-z0-9-]\.[A-Za-z]{2,}/;
-const LONG_DIGITS = /[0-9]{7,}/;
-// Phone numbers are written with these between the digit groups, so they are taken out
-// before digits are counted: "(415) 555-0199" and "415,555,0199" count as 4155550199.
-// Covers spaces, dots, dashes, brackets, commas, colons, apostrophes, slashes and
-// underscores, the same set the engine's rule takes out; does not cover digits split by
-// other punctuation or spelled in words.
-const NUMBER_SEPARATORS = /[\s.\-()[\]{},:'/_]/g;
+// A rule rather than a list of separators: every character that is not a letter or a
+// digit, in any script, is taken out before digits are counted, so "(415) 555-0199",
+// "415;555;0199" and "415&555&0199" all count as 4155550199. Letters still split a run,
+// so "12 of 2026" stays two short numbers. Does not cover digits split by letters or
+// spelled in words. Stricter than the engine's rule, so every note this passes also
+// passes the engine's.
+const LONG_DIGITS = /\p{Nd}{7,}/u;
+const NOT_LETTER_OR_DIGIT = /[^\p{L}\p{Nd}]/gu;
 const SANDBOX_CODE = /^\s*(?:POSPYO|ERRPYO|POSPOI|ERRPOI)/i;
 const LETTER_RUN = /[a-z]+/g;
 const PAYMENT_BRANDS: Readonly<Record<string, string>> = { paypal: "PayPal", venmo: "Venmo" };
@@ -61,9 +62,9 @@ function namedBrand(lowered: string): string | null {
   return null;
 }
 
-/** True when text holds 7 or more digits in a row once the separators phone numbers are written with are taken out. */
+/** True when text holds 7 or more digits in a row once every character that is not a letter or a digit is taken out. */
 export function hasLongDigitRun(text: string): boolean {
-  return LONG_DIGITS.test(text.replace(NUMBER_SEPARATORS, ""));
+  return LONG_DIGITS.test(text.replace(NOT_LETTER_OR_DIGIT, ""));
 }
 
 /** Why text may not be sent as a customer's note, or null when it may. Every note this passes also passes the engine's note_problem. */

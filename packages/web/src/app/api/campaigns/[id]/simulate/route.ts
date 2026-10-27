@@ -19,8 +19,9 @@ const BODY = z.strictObject({ ref: z.string().regex(/^R[1-9][0-9]{0,3}$/) });
  * One sandbox return purchase by member {"ref"} of this session's sent campaign (C21):
  * the engine buys from this shop only, with PayPal's public sandbox test card, for a
  * fixed amount, at most 10 per campaign, and labels it simulated by the order id it
- * stored. Same origin and CSRF token required; 10 per session, 10 per client address
- * and 100 across every visitor per hour (C20). Answers 201 with PayPal's order id and
+ * stored. Same origin and CSRF token required; 10 per session and 10 per client address
+ * per hour, and demo simulates 100 across every demo visitor per hour (C20), a pool the
+ * owner's simulates never draw on. Answers 201 with PayPal's order id and
  * status, or 202 with a run id this session alone can poll when PayPal is slow.
  */
 export async function POST(request: Request, context: { params: Promise<{ id: string }> }): Promise<Response> {
@@ -34,7 +35,7 @@ export async function POST(request: Request, context: { params: Promise<{ id: st
     for (const [limit, subject] of [
       [LIMITS.simulate, principal.sessionId],
       [LIMITS.simulateAddress, clientAddress(request.headers)],
-      [LIMITS.simulates, GLOBAL],
+      ...(principal.role === "demo" ? ([[LIMITS.simulates, GLOBAL]] as const) : []),
     ] as const) {
       const hit = await takeHit(limit, subject);
       if (!hit.allowed) return refuse(ROUTE, ref, 429, "rate_limited", { bucket: limit.bucket }, { "retry-after": String(hit.retryAfterSeconds) });

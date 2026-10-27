@@ -29,16 +29,17 @@ SPEC = {
     "PENDING": {"SUCCESS", "UNCLAIMED", "FAILED", "ONHOLD", "BLOCKED"},
     "ONHOLD": {"SUCCESS", "UNCLAIMED", "FAILED", "BLOCKED"},
     "UNCLAIMED": {"SUCCESS", "RETURNED"},
-    "SUCCESS": {"REFUNDED"},
+    "SUCCESS": {"REFUNDED", "REVERSED"},
     "FAILED": set(),
     "BLOCKED": set(),
     "RETURNED": set(),
     "REFUNDED": set(),
+    "REVERSED": set(),
 }
 
 
 def test_every_pair_of_known_statuses_follows_the_table() -> None:
-    assert KNOWN_STATUSES == set(SPEC) and FINAL_STATUSES == {"FAILED", "BLOCKED", "RETURNED", "REFUNDED"}
+    assert KNOWN_STATUSES == set(SPEC) and FINAL_STATUSES == {"FAILED", "BLOCKED", "RETURNED", "REFUNDED", "REVERSED"}
     for before in SPEC:
         for after in SPEC:
             expected = "unchanged" if before == after else ("moved" if after in SPEC[before] else "refused")
@@ -113,6 +114,14 @@ def test_a_verified_success_after_returned_leaves_it_returned(conn: psycopg.Conn
     change = record(conn, "SUCCESS")
     assert (change.decision, change.previous, change.stored) == ("refused", "RETURNED", "RETURNED")
     assert stored(conn) == ("RETURNED", 25)
+
+
+def test_a_success_paypal_reverses_becomes_reversed_and_nothing_moves_it_on(conn: psycopg.Connection) -> None:
+    record(conn, "SUCCESS")
+    change = record(conn, "REVERSED")
+    assert (change.decision, change.previous, change.stored) == ("moved", "SUCCESS", "REVERSED")
+    assert [record(conn, seen).decision for seen in ("SUCCESS", "REFUNDED", "PENDING")] == ["refused"] * 3
+    assert stored(conn) == ("REVERSED", 25)
 
 
 def test_an_unknown_status_is_stored_as_seen_and_a_missing_fee_keeps_the_stored_one(conn: psycopg.Connection) -> None:

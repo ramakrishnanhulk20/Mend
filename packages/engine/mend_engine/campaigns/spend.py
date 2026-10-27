@@ -23,9 +23,9 @@ WINDOW = timedelta(hours=24)
 # takes this same one, so two campaigns cannot both pass on the same headroom.
 DAILY_CAP_LOCK = 7731300002
 # Money that never left the shop (FAILED, BLOCKED) or came back to it (RETURNED,
-# REFUNDED). effective() keeps each of these as it is, so comparing stored text with
-# them in SQL gives the answer effective() would give.
-MONEY_BACK_STATUSES = ("FAILED", "BLOCKED", "RETURNED", "REFUNDED")
+# REFUNDED, REVERSED). effective() keeps each of these as it is, so comparing stored
+# text with them in SQL gives the answer effective() would give.
+MONEY_BACK_STATUSES = ("FAILED", "BLOCKED", "RETURNED", "REFUNDED", "REVERSED")
 # True for a snapshot item ("item", from approved snapshot "s") whose every ledger row
 # holds one of MONEY_BACK_STATUSES, its one parameter. With no row yet, or any other
 # status, it is false and the item counts. Shared so the shop's cap and the demo pool
@@ -68,11 +68,11 @@ def spent_last_24h_minor(conn: psycopg.Connection, now: datetime) -> int:
 
     A campaign reaches submitting when its payout_batches row is written, and its
     amount is the sum of the items in its approved snapshot, exactly what the batch
-    carries, less each item PayPal has since reported FAILED, BLOCKED, RETURNED or
-    REFUNDED. An item PayPal has not reported on yet, or reports as anything else,
-    still counts. A voided campaign counts nothing (CAMPAIGN_VOIDED_SQL). A ledger
-    row stamped later than now also counts, so a caller's clock running behind errs
-    towards counting. Ledger rows with no approved snapshot (the M1 proof payouts)
+    carries, less each item PayPal has since reported FAILED, BLOCKED, RETURNED,
+    REFUNDED or REVERSED. An item PayPal has not reported on yet, or reports as
+    anything else, still counts. A voided campaign counts nothing
+    (CAMPAIGN_VOIDED_SQL). A ledger row stamped later than now also counts, so a
+    caller's clock running behind errs towards counting. Ledger rows with no approved snapshot (the M1 proof payouts)
     are not campaigns and are not counted.
 
     Raises ValueError if now carries no time zone.

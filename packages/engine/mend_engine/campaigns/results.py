@@ -32,7 +32,7 @@ TOO_EARLY = "too early to tell"
 SPENT_STATUSES = ("SUCCESS", "PENDING")
 CLAIMED_STATUSES = ("SUCCESS",)
 UNCLAIMED_STATUSES = ("UNCLAIMED",)
-RETURNED_STATUSES = ("RETURNED", "REFUNDED")
+RETURNED_STATUSES = ("RETURNED", "REFUNDED", "REVERSED")
 FAILED_STATUSES = ("FAILED", "BLOCKED")
 # PayPal returns an unclaimed payout to the shop by itself this long after sending it.
 UNCLAIMED_RETURN_AFTER = timedelta(days=30)
@@ -46,7 +46,8 @@ class PayoutStanding:
     Not realised: unclaimed_minor (UNCLAIMED) has left the shop's balance but waits
     for the customer to claim it, and pending_minor is every item not in another
     bucket, one PayPal has not reported on yet included. returned_minor (RETURNED,
-    REFUNDED) came back to the shop; failed_minor (FAILED, BLOCKED) never left it.
+    REFUNDED, REVERSED) came back to the shop; failed_minor (FAILED, BLOCKED) never
+    left it.
     items counts the snapshot's items and by_status counts them by the status every
     decision reads (effective), so its keys are only ever PayPal's known statuses,
     with an unknown or missing status counted as PENDING. unclaimed_return_by is 30

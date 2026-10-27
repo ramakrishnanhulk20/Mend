@@ -2,7 +2,8 @@
 # the cancel; the webhook path reads real items through the same get_item), the webhook
 # that later confirms a RETURNED item (test_events.py), the task's role checks
 # (test_tasks.py), and two whole cancel runs racing on one campaign (the row lock
-# is shown holding while PayPal answers, from a second connection).
+# is shown holding while PayPal answers, from a second connection), and a failure row
+# older than an hour (the audit log cannot be backdated).
 import uuid
 from collections.abc import Callable, Iterator
 
@@ -12,12 +13,12 @@ import psycopg
 import pytest
 from psycopg import sql
 
-from mend_engine.campaigns.cancel import CancelReport, cancel_unclaimed
+from mend_engine.campaigns.cancel import CancelIncomplete, CancelReport, cancel_unclaimed
 from mend_engine.config import SANDBOX_API_HOST, Config
 from mend_engine.db.connect import PGDATA
 from mend_engine.db.migrate import apply_schema
 from mend_engine.events.payout_status import record_item_status
-from mend_engine.paypal.http import PayPalError, PayPalHttp, PayPalUnreachable
+from mend_engine.paypal.http import PayPalError, PayPalHttp
 from mend_engine.paypal.payouts import BatchSnapshot, PayoutItemSpec, canonical_json, snapshot_hash
 
 CONFIG = Config(
@@ -251,25 +252,40 @@ def test_a_limit_asks_paypal_about_at_most_that_many_items(conn: psycopg.Connect
 
 
 @pytest.mark.parametrize(
-    ("answer", "raised", "status"),
-    [
-        (httpx.Response(500, json={"name": "INTERNAL_SERVER_ERROR"}), PayPalError, 500),
-        (httpx.ConnectError("down"), PayPalUnreachable, None),
-    ],
+    ("answer", "status"),
+    [(httpx.Response(500, json={"name": "INTERNAL_SERVER_ERROR"}), 500), (httpx.ConnectError("down"), None)],
     ids=["500", "unreachable"],
 )
-def test_a_5xx_or_no_answer_stops_the_run_and_later_items_are_untouched(
-    conn: psycopg.Connection, answer: object, raised: type, status: int | None
+def test_an_item_paypal_cannot_answer_for_blocks_nothing_and_rests_for_an_hour_on_its_own(
+    conn: psycopg.Connection, answer: object, status: int | None
 ) -> None:
+    # The reviewer's repro: ITEM1 answers every cancel the way UML2RFT82W3HL does live.
     campaign_id = sent_campaign(conn)
     paypal = FakePayPal({"ITEM1": answer})
 
-    with pytest.raises(raised) as caught:
+    with pytest.raises(CancelIncomplete) as caught:
+        cancel_unclaimed(conn, paypal.http(), campaign_id)
+    again = cancel_unclaimed(conn, paypal.http(), campaign_id)
+
+    assert isinstance(caught.value, PayPalError) and caught.value.status == status
+    assert caught.value.report == CancelReport(cancelled=1, returned_minor=200, still_unclaimed=1, not_cancellable=0, failed=1)
+    assert again == CancelReport(cancelled=0, returned_minor=0, still_unclaimed=1, not_cancellable=0)
+    assert paypal.cancels == ["ITEM1", "ITEM2"]
+    assert (statuses(conn)["ITEM1"], statuses(conn)["ITEM2"]) == ("UNCLAIMED", "RETURNED")
+    assert [action for _, action, _ in audit(conn)] == ["payout_item_cancel_failed", "payout_item_cancelled"]
+
+
+def test_two_items_in_a_row_paypal_cannot_answer_for_stop_the_run_and_later_items_are_untouched(conn: psycopg.Connection) -> None:
+    campaign_id = sent_campaign(conn)
+    conn.execute("update payout_items set status = 'UNCLAIMED' where payout_item_id = 'ITEM3'")
+    paypal = FakePayPal({"ITEM1": httpx.Response(503, json={"name": "SERVICE_UNAVAILABLE"}), "ITEM2": httpx.ConnectError("down")})
+
+    with pytest.raises(CancelIncomplete) as caught:
         cancel_unclaimed(conn, paypal.http(), campaign_id)
 
-    assert caught.value.status == status and paypal.cancels == ["ITEM1"]
-    assert (statuses(conn)["ITEM1"], statuses(conn)["ITEM2"]) == ("UNCLAIMED", "UNCLAIMED")
-    assert [action for _, action, _ in audit(conn)] == ["payout_item_cancel_failed"]
+    assert caught.value.status is None and caught.value.report == CancelReport(0, 0, 3, 0, failed=2)
+    assert paypal.cancels == ["ITEM1", "ITEM2"] and statuses(conn)["ITEM3"] == "UNCLAIMED"
+    assert [action for _, action, _ in audit(conn)] == ["payout_item_cancel_failed"] * 2
 
 
 def test_a_second_run_cancels_nothing(conn: psycopg.Connection) -> None:

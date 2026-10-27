@@ -22,7 +22,7 @@ from datetime import datetime
 import psycopg
 from psycopg.types.json import Jsonb
 
-from mend_engine.campaigns.attribution import attribute_purchase, simulated_order_for, utc_time
+from mend_engine.campaigns.attribution import SimulatedMatch, attribute_purchase, simulated_order_for, utc_time
 from mend_engine.campaigns.simulate import read_order
 from mend_engine.events.payout_status import ItemConflict, as_seen, record_item_status
 from mend_engine.money import MoneyError, to_minor
@@ -297,27 +297,38 @@ def _capture_event(conn: psycopg.Connection, http: PayPalHttp, transmission_id: 
         order = read_order(http, order_id)
     except PayPalError as exc:
         return _Retry({**detail, **_error_detail(exc)})
+    return _decide_with(conn, transmission_id, event_type, detail, lambda: record_simulated_purchase(conn, match, order_id, order))
+
+
+def record_simulated_purchase(conn: psycopg.Connection, match: SimulatedMatch, order_id: str, order: dict) -> tuple[str, dict]:
+    """Attribute PayPal's answer for one simulated order: the one path the capture webhook and the refresh job both use (C8, C10).
+
+    match is simulated_order_for's row for order_id, and order is read_order's
+    answer for order_id. Attributes the purchase as simulated, through
+    attribute_purchase, only when PayPal says the order and its one capture are
+    COMPLETED for the custom_id this server set. Returns ("purchase recorded",
+    {amount_minor, role, simulated, attribution_id}) or ("purchase refused", {reason,
+    and amount_minor, role and simulated when PayPal confirmed a completed
+    purchase}); every reason is a fixed text, never PayPal's. Writes the
+    attributions row and its audit row inside the caller's transaction, when there is one.
+    """
     reading = _completed_purchase(order, order_id, match.simulated_order_id)
     if isinstance(reading, str):
-        return _decide(conn, transmission_id, event_type, "purchase refused", {**detail, "reason": reading})
+        return "purchase refused", {"reason": reading}
     purchased_at, amount_minor = reading
-
-    def apply() -> tuple[str, dict]:
-        result = attribute_purchase(
-            conn,
-            campaign_id=match.campaign_id,
-            ref=match.ref,
-            purchased_at=purchased_at,
-            amount_minor=amount_minor,
-            simulated=True,
-            source_order=order_id,
-        )
-        extra = {"amount_minor": amount_minor, "role": result.role, "simulated": True}
-        if not result.recorded:
-            return "purchase refused", {**extra, "reason": result.reason}
-        return "purchase recorded", {**extra, "attribution_id": result.attribution_id}
-
-    return _decide_with(conn, transmission_id, event_type, detail, apply)
+    result = attribute_purchase(
+        conn,
+        campaign_id=match.campaign_id,
+        ref=match.ref,
+        purchased_at=purchased_at,
+        amount_minor=amount_minor,
+        simulated=True,
+        source_order=order_id,
+    )
+    extra = {"amount_minor": amount_minor, "role": result.role, "simulated": True}
+    if not result.recorded:
+        return "purchase refused", {**extra, "reason": result.reason}
+    return "purchase recorded", {**extra, "attribution_id": result.attribution_id}
 
 
 def _completed_purchase(order: dict, order_id: str, simulated_order_id: uuid.UUID) -> tuple[datetime, int] | str:

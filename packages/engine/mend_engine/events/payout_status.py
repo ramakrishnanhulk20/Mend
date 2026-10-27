@@ -1,10 +1,10 @@
 """The payout item state machine: a stored status only ever moves forward (C10).
 
 PayPal's item statuses and where each may go next, from RD-BRIEF section 4.
-FAILED, BLOCKED, RETURNED and REFUNDED are final. A status PayPal sends that is
-not one of these is stored as seen but counts as PENDING for every decision, so it
-can never stand in for SUCCESS, and a stale or reordered answer can never undo a
-final one.
+FAILED, BLOCKED, RETURNED, REFUNDED and REVERSED are final. A status PayPal sends
+that is not one of these is stored as seen but counts as PENDING for every
+decision, so it can never stand in for SUCCESS, and a stale or reordered answer can
+never undo a final one.
 """
 
 from __future__ import annotations
@@ -23,11 +23,14 @@ _NEXT: dict[str, frozenset[str]] = {
     "PENDING": frozenset({"SUCCESS", "UNCLAIMED", "FAILED", "ONHOLD", "BLOCKED"}),
     "ONHOLD": frozenset({"SUCCESS", "UNCLAIMED", "FAILED", "BLOCKED"}),
     "UNCLAIMED": frozenset({"SUCCESS", "RETURNED"}),
-    "SUCCESS": frozenset({"REFUNDED"}),
+    # REVERSED is in PayPal's item status list. The brief says PayPal documents it
+    # only for web uploads, so it is taken as a final money-back state after SUCCESS.
+    "SUCCESS": frozenset({"REFUNDED", "REVERSED"}),
     "FAILED": frozenset(),
     "BLOCKED": frozenset(),
     "RETURNED": frozenset(),
     "REFUNDED": frozenset(),
+    "REVERSED": frozenset(),
 }
 KNOWN_STATUSES = frozenset(_NEXT)
 FINAL_STATUSES = frozenset(status for status, onward in _NEXT.items() if not onward)

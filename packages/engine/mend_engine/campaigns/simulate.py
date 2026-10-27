@@ -6,7 +6,8 @@ and a card source, so PayPal captures it at once with no buyer login (the M0
 probe's path). The row in simulated_orders is written before PayPal is called and
 its order id is stored from PayPal's answer; only that stored id ever marks a
 purchase as simulated (C8). Nothing is attributed here: the purchase counts only
-when PayPal's verified capture webhook arrives and a re-read says COMPLETED.
+when a re-read of the order from PayPal says COMPLETED, prompted by the verified
+capture webhook or, if none has recorded it after 15 minutes, by the refresh job.
 """
 
 from __future__ import annotations

@@ -117,6 +117,15 @@ def test_items_whose_money_never_left_or_came_back_stop_counting_and_unreported_
     assert spent_last_24h_minor(conn, now) == 500 + 600 + 700
 
 
+def test_a_reversed_item_stops_counting_under_the_daily_cap(conn: psycopg.Connection) -> None:
+    now = database_now(conn)
+    sender_batch_id = reached_submitting(conn, [100, 200], now - timedelta(hours=1))
+    item_status(conn, sender_batch_id, "R1", "SUCCESS")
+    assert spent_last_24h_minor(conn, now) == 300
+    item_status(conn, sender_batch_id, "R1", "REVERSED")
+    assert "REVERSED" in MONEY_BACK_STATUSES and spent_last_24h_minor(conn, now) == 200
+
+
 def test_a_campaign_voided_after_reaching_submitting_counts_nothing(conn: psycopg.Connection) -> None:
     now = database_now(conn)
     reached_submitting(conn, [100], now - timedelta(hours=1))

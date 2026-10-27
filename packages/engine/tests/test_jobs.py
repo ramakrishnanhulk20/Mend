@@ -1,12 +1,15 @@
 # Not covered here: process_events and reconcile against real PayPal answers (test_events.py,
 # test_reconcile.py and prove_m5 cover them), the cancel job and the refresh job against
-# PayPal's real cancel and item answers (the M7e-1 live probe covers the cancel call, and
-# the webhook path reads real items through the same get_item), a failure row older than
-# an hour (the audit log cannot be backdated), and the cron schedule on Render: the live
-# proof (node scripts/deploy/render.mjs prove) checks that mend-jobs has run.
+# PayPal's real cancel, item, batch and order answers (the M7e-1 live probe covers the
+# cancel call; the batch and order shapes follow PayPal's published samples, which
+# test_events.py and prove_m5 read live through the same get_batch and read_order), a
+# failure row older than an hour (the audit log cannot be backdated), and the cron
+# schedule on Render: the live proof (node scripts/deploy/render.mjs prove) checks that
+# mend-jobs has run.
 import json
 import uuid
 from collections.abc import Iterator
+from datetime import datetime, timedelta, timezone
 from urllib.parse import parse_qsl, quote, urlencode, urlsplit, urlunsplit
 
 import httpx
@@ -20,8 +23,10 @@ from mend_engine.config import SANDBOX_API_HOST, Config
 from mend_engine.db.connect import PGDATA
 from mend_engine.db.migrate import apply_schema
 from mend_engine.paypal.http import PayPalHttp
+from mend_engine.campaigns.simulate import ORDERS_PATH
 from mend_engine.paypal.payouts import (
     PAYOUT_ITEM_PATH,
+    PAYOUTS_PATH,
     BatchSnapshot,
     PayoutItemSpec,
     canonical_json,
@@ -119,7 +124,8 @@ class JobsPayPal:
     A read of one item names the item's batch and sender_item_id as the ledger holds
     them, and the status reads holds for it: the ledger's own status when it holds
     none, an HTTP error when it holds a number. An item in elsewhere is placed in
-    another batch.
+    another batch. A read of a batch or an order is answered from batches or orders
+    by its id: PayPal's answer, or an HTTP error when it is a number.
     """
 
     def __init__(self, conn: psycopg.Connection) -> None:
@@ -129,6 +135,10 @@ class JobsPayPal:
         self.failing: dict[str, int] = {}
         self.reads: dict[str, str | int] = {}
         self.elsewhere: set[str] = set()
+        self.batches: dict[str, dict | int] = {}
+        self.batch_reads: list[str] = []
+        self.orders: dict[str, dict | int] = {}
+        self.order_reads: list[str] = []
 
     def __call__(self, request: httpx.Request) -> httpx.Response:
         path = request.url.path
@@ -140,7 +150,14 @@ class JobsPayPal:
             if item_id in self.failing:
                 return httpx.Response(self.failing[item_id], json={"name": "ITEM_INCORRECT_STATUS"})
             return httpx.Response(200, json={"payout_item_id": item_id, "transaction_status": "RETURNED"})
-        assert request.method == "GET" and path.startswith(PAYOUT_ITEM_PATH + "/"), "the jobs only cancel and read items"
+        for prefix, answers, seen in ((PAYOUTS_PATH, self.batches, self.batch_reads), (ORDERS_PATH, self.orders, self.order_reads)):
+            if request.method == "GET" and path.startswith(prefix + "/"):
+                seen.append(path.split("/")[-1])
+                found = answers[seen[-1]]
+                if isinstance(found, int):
+                    return httpx.Response(found, json={"name": "INTERNAL_SERVER_ERROR"})
+                return httpx.Response(200, json=found)
+        assert request.method == "GET" and path.startswith(PAYOUT_ITEM_PATH + "/"), "the jobs only cancel and read items, batches and orders"
         item_id = path.split("/")[-1]
         self.read.append(item_id)
         status = self.reads.get(item_id)
@@ -244,7 +261,7 @@ def test_the_cancel_job_asks_about_at_most_50_items_a_run_oldest_batches_first(
     assert printed(capsys) == [answer(campaigns=11, cancelled=50, returned_minor=5000), answer(campaigns=1, cancelled=3, returned_minor=300)]
 
 
-def test_campaigns_paypal_will_not_cancel_rest_for_an_hour_and_never_block_a_newer_one(
+def test_items_paypal_will_not_cancel_rest_for_an_hour_and_never_block_a_newer_one(
     database: psycopg.Connection, paypal: JobsPayPal, capsys: pytest.CaptureFixture[str]
 ) -> None:
     # The reviewer's repro: 48 rewards PayPal refuses to cancel and still reports UNCLAIMED fill
@@ -267,23 +284,39 @@ def test_campaigns_paypal_will_not_cancel_rest_for_an_hour_and_never_block_a_new
     assert sorted(paypal.read) == sorted(stuck) and sorted(paypal.asked) == sorted(stuck + newer)
 
 
-def test_a_paypal_error_on_one_campaign_is_logged_and_the_cancel_job_goes_on_to_the_next(
+def test_an_item_paypal_cannot_answer_for_is_logged_holds_up_nothing_and_is_not_asked_again_within_the_hour(
     database: psycopg.Connection, paypal: JobsPayPal, capsys: pytest.CaptureFixture[str]
 ) -> None:
+    # The reviewer's repro: N1 answers 500 to every cancel, as UML2RFT82W3HL does live.
     broken_id, broken = sent_campaign(database, "demo", 30, 2)
     _, fine = sent_campaign(database, "demo", 20, 2)
     paypal.failing[broken[0]] = 500
 
     assert jobs.main(["cancel_demo_unclaimed"]) == 0
+    assert jobs.main(["cancel_demo_unclaimed"]) == 0
 
     out, err = capsys.readouterr()
-    assert [json.loads(line) for line in out.splitlines()] == [answer(campaigns=2, cancelled=2, returned_minor=200, failed=1)]
-    assert paypal.asked == [broken[0], *fine]
-    assert (statuses(database, broken), statuses(database, fine)) == ({"UNCLAIMED"}, {"RETURNED"})
+    assert [json.loads(line) for line in out.splitlines()] == [answer(campaigns=2, cancelled=3, returned_minor=300, failed=1), answer()]
+    assert paypal.asked == [*broken, *fine]
+    assert (statuses(database, broken[:1]), statuses(database, broken[1:] + fine)) == ({"UNCLAIMED"}, {"RETURNED"})
     logged = [json.loads(line) for line in err.splitlines() if line.startswith("{")]
     assert [(entry["error"], entry["campaign_id"]) for entry in logged if entry.get("outcome") == "failed"] == [
         ("paypal_unavailable", str(broken_id))
     ]
+
+
+def test_an_item_paypal_will_not_cancel_rests_alone_and_the_rest_of_its_campaign_is_asked_the_next_run(
+    database: psycopg.Connection, paypal: JobsPayPal, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _, ids = sent_campaign(database, "demo", 30, 55)
+    in_order = sorted(ids)
+    paypal.failing[in_order[0]] = 422
+
+    assert jobs.main(["cancel_demo_unclaimed"]) == 0
+    assert jobs.main(["cancel_demo_unclaimed"]) == 0
+
+    assert paypal.asked == in_order
+    assert printed(capsys) == [answer(campaigns=1, cancelled=49, returned_minor=4900, not_cancellable=1), answer(campaigns=1, cancelled=5, returned_minor=500)]
 
 
 def test_any_error_on_one_campaign_is_logged_scrubbed_and_the_cancel_job_goes_on_to_the_next(
@@ -337,7 +370,10 @@ def set_status(conn: psycopg.Connection, item_id: str, status: str) -> None:
 
 def refreshed(**counts: object) -> dict:
     """The refresh job's printed line: every count 0 unless given."""
-    zero = {"items": 0, "moved": 0, "unchanged": 0, "refused": 0, "failed": 0}
+    zero = {
+        "items": 0, "moved": 0, "unchanged": 0, "refused": 0, "failed": 0,
+        "batches": 0, "restored": 0, "skipped": 0, "orders": 0, "purchases": 0,
+    }
     return {"job": "refresh_items", "ok": True, "ran": True, **zero, **counts}
 
 
@@ -367,6 +403,19 @@ def test_the_refresh_job_rereads_unsettled_items_left_alone_15_minutes_and_recor
         ("refresh", {"payout_item_id": ids[1], "from": "ONHOLD", "to": "UNCLAIMED"}),
         ("refresh", {"payout_item_id": ids[3], "from": "PROCESSING_LATER", "to": "FAILED"}),
     ]
+
+
+def test_a_reversed_item_is_settled_and_never_read_again(
+    database: psycopg.Connection, paypal: JobsPayPal, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _, ids = sent_campaign(database, "owner", 60, 2)
+    set_status(database, ids[0], "REVERSED")
+    set_status(database, ids[1], "PENDING")
+    left_alone(database, ids, 20)
+
+    assert jobs.main(["refresh_items"]) == 0
+
+    assert paypal.read == ids[1:] and printed(capsys) == [refreshed(items=1, unchanged=1)]
 
 
 def test_the_refresh_job_reads_at_most_50_items_a_run_least_recently_heard_of_first(
@@ -444,3 +493,224 @@ def test_the_refresh_job_does_nothing_while_another_run_holds_its_lock(
         database.execute("select pg_advisory_unlock(%s)", (jobs.REFRESH_LOCK,))
     assert printed(capsys) == [refreshed(ran=False)]
     assert paypal.read == []
+
+
+def lost_rows(conn: psycopg.Connection, ids: list[str]) -> None:
+    """The ledger never got these items' rows: the webhook that would have written them was lost."""
+    conn.execute("delete from payout_items where payout_item_id = any(%s)", (ids,))
+
+
+def held_batch(conn: psycopg.Connection, paypal: JobsPayPal, campaign_id: uuid.UUID, ids: list[str]) -> tuple[str, dict]:
+    """PayPal holds the campaign's batch with ids as its items, R1 first, all UNCLAIMED. Returns the payout_batch_id and the answer."""
+    sender_batch_id, payout_batch_id = conn.execute(
+        "select sender_batch_id, payout_batch_id from payout_batches where campaign_id = %s", (str(campaign_id),)
+    ).fetchone()
+    held = {
+        "batch_header": {"payout_batch_id": payout_batch_id, "batch_status": "SUCCESS", "sender_batch_header": {"sender_batch_id": sender_batch_id}},
+        "items": [
+            {
+                "payout_item_id": item_id,
+                "transaction_status": "UNCLAIMED",
+                "payout_batch_id": payout_batch_id,
+                "payout_item_fee": {"currency": "USD", "value": "0.25"},
+                "payout_item": {"sender_item_id": f"R{n}", "receiver": f"m{n}@shop.example"},
+            }
+            for n, item_id in enumerate(ids, start=1)
+        ],
+    }
+    paypal.batches[payout_batch_id] = held
+    return payout_batch_id, held
+
+
+def logged(err: str, outcome: str) -> list[dict]:
+    return [entry for entry in (json.loads(line) for line in err.splitlines() if line.startswith("{")) if entry.get("outcome") == outcome]
+
+
+def test_a_batch_whose_item_rows_were_lost_is_read_back_and_its_unclaimed_rewards_are_then_cancelled(
+    database: psycopg.Connection, paypal: JobsPayPal, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # The reviewer's repro: only a webhook would have written these rows, and it never came.
+    campaign_id, ids = sent_campaign(database, "demo", 60, 3)
+    sender_batch_id = database.execute("select sender_batch_id from payout_batches where campaign_id = %s", (str(campaign_id),)).fetchone()[0]
+    lost_rows(database, ids)
+    payout_batch_id, _ = held_batch(database, paypal, campaign_id, ids)
+
+    assert jobs.main(["refresh_items"]) == 0
+    assert database.execute(
+        "select payout_item_id, sender_item_id, status, fee_minor from payout_items order by payout_item_id"
+    ).fetchall() == [(item_id, f"R{n}", "UNCLAIMED", 25) for n, item_id in enumerate(ids, start=1)]
+    assert jobs.main(["cancel_demo_unclaimed"]) == 0
+
+    assert printed(capsys) == [refreshed(batches=1, restored=3), answer(campaigns=1, cancelled=3, returned_minor=300)]
+    assert paypal.batch_reads == [payout_batch_id] and paypal.asked == ids and statuses(database, ids) == {"RETURNED"}
+    assert database.execute("select action, detail from audit_log where actor = 'refresh' order by id").fetchall() == [
+        *[("payout_item_restored", {"payout_item_id": item_id, "sender_batch_id": sender_batch_id, "status": "UNCLAIMED"}) for item_id in ids],
+        ("payout_batch_reread", {"sender_batch_id": sender_batch_id, "outcome": "read", "restored": 3, "moved": 0, "skipped": 0}),
+    ]
+
+
+def test_a_batch_read_records_only_items_of_our_batch_that_the_frozen_snapshot_names(
+    database: psycopg.Connection, paypal: JobsPayPal, capsys: pytest.CaptureFixture[str]
+) -> None:
+    campaign_id, ids = sent_campaign(database, "owner", 60, 6)
+    _, stored_elsewhere = sent_campaign(database, "owner", 60, 1)
+    wrong_id, wrong_ids = sent_campaign(database, "owner", 50, 2)
+    lost_rows(database, ids + wrong_ids)
+    _, held = held_batch(database, paypal, campaign_id, ids)
+    entries = held["items"]
+    # PayPal's own sample leaves payout_batch_id off some items, so its absence is not a refusal.
+    del entries[0]["payout_batch_id"]
+    entries[1]["payout_batch_id"] = "BSOMEONEELSE"
+    entries[2]["payout_item"]["sender_item_id"] = "R99"
+    entries[4]["payout_item"]["sender_item_id"] = "R4"
+    entries[5]["payout_item_id"] = stored_elsewhere[0]
+    entries.append({**entries[0], "payout_item_id": "not-an-id", "payout_item": {"sender_item_id": "R5"}})
+    _, wrong = held_batch(database, paypal, wrong_id, wrong_ids)
+    wrong["batch_header"]["sender_batch_header"]["sender_batch_id"] = "mend-someone-else"
+
+    assert jobs.main(["refresh_items"]) == 0
+
+    assert [row[0] for row in database.execute("select payout_item_id from payout_items order by payout_item_id")] == sorted(
+        [ids[0], stored_elsewhere[0]]
+    )
+    out, err = capsys.readouterr()
+    assert [json.loads(line) for line in out.splitlines()] == [refreshed(batches=2, restored=1, skipped=6, failed=1)]
+    assert [(entry["payout_item_id"], entry["reason"]) for entry in logged(err, "skipped")] == [
+        (ids[1], "the item names another batch"),
+        (ids[2], "the sender_item_id is not in the frozen snapshot"),
+        (ids[3], "the sender_item_id appears more than once in PayPal's answer"),
+        (ids[4], "the sender_item_id appears more than once in PayPal's answer"),
+        (stored_elsewhere[0], "the item is stored under another batch"),
+        (None, "the payout_item_id is malformed"),
+    ]
+    [failed] = logged(err, "failed")
+    wrong_sender = database.execute("select sender_batch_id from payout_batches where campaign_id = %s", (str(wrong_id),)).fetchone()[0]
+    assert (failed["error"], failed["sender_batch_id"]) == ("not_ours", wrong_sender)
+    assert database.execute("select count(*) from payout_items i join payout_batches b using (sender_batch_id) where b.campaign_id = %s", (str(wrong_id),)).fetchone()[0] == 0
+
+
+def test_batch_reads_take_at_most_10_a_run_oldest_first_and_one_paypal_cannot_answer_goes_to_the_back(
+    database: psycopg.Connection, paypal: JobsPayPal, capsys: pytest.CaptureFixture[str]
+) -> None:
+    held = []
+    for n in range(12):
+        campaign_id, ids = sent_campaign(database, "owner", 100 - n, 1)
+        lost_rows(database, ids)
+        held.append(held_batch(database, paypal, campaign_id, ids)[0])
+    young_id, young = sent_campaign(database, "owner", 14, 1)
+    lost_rows(database, young)
+    held_batch(database, paypal, young_id, young)
+    paypal.batches[held[0]] = 500
+
+    assert jobs.main(["refresh_items"]) == 0
+    assert paypal.batch_reads == held[:10]
+    assert jobs.main(["refresh_items"]) == 0
+    assert paypal.batch_reads[10:] == held[10:]
+    assert printed(capsys) == [refreshed(batches=10, restored=9, failed=1), refreshed(batches=2, restored=2)]
+
+
+def sent_with_member(conn: psycopg.Connection) -> uuid.UUID:
+    """A campaign whose rewarded member is R1, sent a day ago, so a purchase an hour ago is in its window."""
+    campaign_id = conn.execute(
+        "insert into campaigns (shop_name, goal_text, as_of, budget_minor, per_recipient_minor, holdout_share, status) "
+        "values ('Shop', 'goal', '2026-10-16', 1000, 100, 0.5, 'draft') returning campaign_id"
+    ).fetchone()[0]
+    conn.execute(
+        "insert into campaign_members (campaign_id, ref, role, rank, score, amount_minor, note) values (%s, 'R1', 'reward', 1, 0.1, 100, 'Thanks')",
+        (campaign_id,),
+    )
+    for step in ("approved", "submitting", "submitted"):
+        conn.execute("update campaigns set status = %s where campaign_id = %s", (step, campaign_id))
+    conn.execute(
+        "insert into campaign_status_moves (campaign_id, from_status, to_status, moved_at) "
+        "values (%s, 'submitting', 'submitted', now() - interval '1 day')",
+        (campaign_id,),
+    )
+    return campaign_id
+
+
+def simulated(conn: psycopg.Connection, paypal: JobsPayPal, campaign_id: uuid.UUID, order_id: str | None, minutes_ago: int) -> None:
+    """A purchase the simulate button made as R1 minutes_ago, which PayPal holds as COMPLETED an hour ago, by its order id."""
+    simulated_order_id = uuid.uuid4()
+    conn.execute(
+        "insert into simulated_orders (simulated_order_id, paypal_order_id, campaign_id, ref, created_at) "
+        "values (%s, %s, %s, 'R1', now() - make_interval(mins => %s))",
+        (simulated_order_id, order_id, campaign_id, minutes_ago),
+    )
+    if order_id is None:
+        return
+    when = (datetime.now(timezone.utc) - timedelta(hours=1)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    paypal.orders[order_id] = {
+        "id": order_id,
+        "status": "COMPLETED",
+        "payment_source": {"card": {"name": "Test Buyer", "last_digits": "1111"}},
+        "purchase_units": [
+            {
+                "custom_id": str(simulated_order_id),
+                "payments": {
+                    "captures": [{"id": "CAP1", "status": "COMPLETED", "amount": {"currency_code": "USD", "value": "12.50"}, "create_time": when}]
+                },
+            }
+        ],
+    }
+
+
+def test_a_simulated_order_with_no_purchase_is_read_after_15_minutes_and_recorded_as_the_capture_webhook_would(
+    database: psycopg.Connection, paypal: JobsPayPal, capsys: pytest.CaptureFixture[str]
+) -> None:
+    campaign_id = sent_with_member(database)
+    simulated(database, paypal, campaign_id, "SIMLOST1", 20)
+    simulated(database, paypal, campaign_id, "SIMYOUNG1", 10)
+    simulated(database, paypal, campaign_id, "SIMKNOWN1", 20)
+    # PayPal's answer to the create was lost, so there is no order id to read.
+    simulated(database, paypal, campaign_id, None, 20)
+    database.execute(
+        "insert into attributions (campaign_id, ref, role, purchased_at, amount_minor, simulated, source_order) "
+        "values (%s, 'R1', 'reward', now(), 1250, true, 'SIMKNOWN1')",
+        (campaign_id,),
+    )
+
+    assert jobs.main(["refresh_items"]) == 0
+
+    assert paypal.order_reads == ["SIMLOST1"]
+    assert printed(capsys) == [refreshed(orders=1, purchases=1)]
+    assert database.execute(
+        "select ref, role, amount_minor, simulated from attributions where source_order = 'SIMLOST1'"
+    ).fetchall() == [("R1", "reward", 1250, True)]
+    # The capture webhook arriving late meets the same record through the same path, and adds nothing.
+    transmission_id = str(uuid.uuid4())
+    body = {"id": "WH-1", "event_type": "PAYMENT.CAPTURE.COMPLETED", "resource": {"supplementary_data": {"related_ids": {"order_id": "SIMLOST1"}}}}
+    database.execute(
+        "insert into paypal_events (transmission_id, event_id, event_type, received_at, purge_after, raw) "
+        "values (%s, 'WH-1', 'PAYMENT.CAPTURE.COMPLETED', now(), now() + interval '48 hours', %s)",
+        (transmission_id, json.dumps(body)),
+    )
+    assert jobs.main(["process_events"]) == 0
+    assert database.execute("select outcome, detail ->> 'reason' from event_outcomes where transmission_id = %s", (transmission_id,)).fetchone() == (
+        "purchase refused", "the purchase is already attributed",
+    )
+    assert database.execute("select count(*) from attributions where source_order = 'SIMLOST1'").fetchone()[0] == 1
+
+
+def test_at_most_10_orders_are_read_a_run_and_one_paypal_does_not_complete_or_cannot_answer_goes_to_the_back(
+    database: psycopg.Connection, paypal: JobsPayPal, capsys: pytest.CaptureFixture[str]
+) -> None:
+    campaign_id = sent_with_member(database)
+    orders = [f"SIM{n:02d}" for n in range(12)]
+    for n, order_id in enumerate(orders):
+        simulated(database, paypal, campaign_id, order_id, 40 - n)
+    paypal.orders[orders[0]] = 500
+    paypal.orders[orders[1]]["status"] = "APPROVED"
+
+    assert jobs.main(["refresh_items"]) == 0
+    assert paypal.order_reads == orders[:10]
+    assert jobs.main(["refresh_items"]) == 0
+    assert paypal.order_reads[10:] == orders[10:]
+
+    assert printed(capsys) == [refreshed(orders=10, purchases=8, failed=1), refreshed(orders=2, purchases=2)]
+    assert sorted(row[0] for row in database.execute("select source_order from attributions")) == orders[2:]
+    assert database.execute(
+        "select detail ->> 'outcome', detail ->> 'reason' from audit_log where action = 'simulated_order_reread' "
+        "and detail ->> 'paypal_order_id' = any(%s) order by id",
+        (orders[:2],),
+    ).fetchall() == [("failed", None), ("purchase refused", "PayPal does not say the order is COMPLETED")]

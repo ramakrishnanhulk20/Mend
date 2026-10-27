@@ -192,6 +192,26 @@ def test_the_payouts_block_puts_each_item_in_its_bucket_at_its_approved_amount(c
     assert (result.rewarded.members, result.holdout.members, result.verdict) == (10, 2, TOO_EARLY)
 
 
+def test_a_reversed_item_counts_as_money_back_and_not_as_spend(conn: psycopg.Connection) -> None:
+    campaign_id = campaign(conn, 2, 2, sent_days_ago=1)
+    items = (PayoutItemSpec("m1@shop.example", 100, "Thanks", "R1"), PayoutItemSpec("m2@shop.example", 200, "Thanks", "R2"))
+    snap = BatchSnapshot(str(campaign_id), "USD", "A thank-you", items)
+    conn.execute(
+        "insert into approved_snapshots values (%s, %s, %s, now(), 'owner')", (campaign_id, snapshot_hash(snap), canonical_json(snap))
+    )
+    conn.execute(
+        "insert into payout_batches (sender_batch_id, campaign_id, snapshot_hash, payout_batch_id, status) "
+        "values ('mend-v', %s, 'h', 'BATCHV', 'created')",
+        (str(campaign_id),),
+    )
+    conn.execute("insert into payout_items values ('ITEM1', 'mend-v', 'R1', 'SUCCESS', 25, now()), ('ITEM2', 'mend-v', 'R2', 'REVERSED', 25, now())")
+
+    result = campaign_results(conn, campaign_id)
+
+    assert (result.payouts.by_status, result.payouts.returned_minor, result.payouts.pending_minor) == ({"SUCCESS": 1, "REVERSED": 1}, 200, 0)
+    assert result.spend_minor == 100
+
+
 def test_the_payouts_block_is_empty_before_a_batch_and_has_no_return_date_when_nothing_waits(conn: psycopg.Connection) -> None:
     campaign_id = campaign(conn, 2, 2, sent_days_ago=None)
     items = (PayoutItemSpec("m1@shop.example", 100, "Thanks", "R1"), PayoutItemSpec("m2@shop.example", 200, "Thanks", "R2"))

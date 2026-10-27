@@ -32,6 +32,7 @@ from dataclasses import replace
 from datetime import date, datetime, time, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
+from time import monotonic, sleep
 from urllib.parse import urlsplit
 
 import psycopg
@@ -53,7 +54,7 @@ from mend_engine.campaigns.eligibility import REGULAR_MIN_DAYS, SILENT_MIN_DAYS
 from mend_engine.campaigns.reconcile import reconcile as reconcile_campaigns
 from mend_engine.campaigns.results import ArmResults, PayoutStanding, campaign_results
 from mend_engine.campaigns.scoring import SHOP_ZONE, ScoreSet, score_customers
-from mend_engine.campaigns.spend import ITEM_CAME_BACK_SQL, MONEY_BACK_STATUSES, WINDOW, CapExceeded
+from mend_engine.campaigns.spend import CAMPAIGN_VOIDED_SQL, ITEM_CAME_BACK_SQL, MONEY_BACK_STATUSES, WINDOW, CapExceeded
 from mend_engine.campaigns.submission import submit
 from mend_engine.config import Config, ConfigError, load_config
 from mend_engine.db.connect import connect
@@ -118,6 +119,13 @@ SESSION_IDLE = timedelta(hours=2)
 # or both be a session's second send of the day.
 DRAFT_LOCK_CLASS = 773131
 DEMO_SPEND_LOCK = 7731300005
+# A demo send that cannot take the spend lock in this long answers "busy" (C20): a
+# send stuck on a slow PayPal must not hold every other visitor's send for ever.
+DEMO_SPEND_WAIT_SECONDS = 10.0
+DEMO_SPEND_POLL_SECONDS = 0.2
+# Module-level so tests can replace the wait without a real 10 second pause.
+_sleep = sleep
+_monotonic = monotonic
 
 MAX_LOG_DETAIL_CHARS = 4000
 MAX_QUIET_REGULARS = 50
@@ -333,15 +341,17 @@ def approve_campaign(campaign_id: object, actor: object, presented_hash: object)
 def submit_campaign(campaign_id: object, actor: object) -> dict:
     """Send the actor's approved campaign as its one Payouts batch (C1, C3).
 
-    A demo session may send at most 2 campaigns in any 24 hours, and its batch must
-    also fit the demo pool; demo submissions take one lock so two cannot both use
-    the same headroom or the same allowance. A demo send past either is refused,
-    "limit_reached" or "over_demo_daily_cap", before anything is sent. Calling it
-    again never sends a second batch, so a campaign already in the ledger is not
-    held to the 2 a day: sent is True only for the call that sent it. For either
-    role, a send the shop's PayPal balance cannot cover with the floor left over is
-    refused "low_balance", or "balance_unavailable" when the balance cannot be
-    read; the campaign stays approved and can be sent later.
+    A demo session may send at most 2 campaigns in any 24 hours, not counting
+    voided ones, and its batch must also fit the demo pool; demo submissions take
+    one lock so two cannot both use the same headroom or the same allowance. A demo
+    send past either is refused, "limit_reached" or "over_demo_daily_cap", before
+    anything is sent. A demo send that cannot take that lock within 10 seconds is
+    refused "busy" with nothing read or sent. Calling it again never sends a second
+    batch, so a campaign already in the ledger is not held to the 2 a day: sent is
+    True only for the call that sent it. For either role, a send the shop's PayPal
+    balance cannot cover with the floor left over is refused "low_balance", or
+    "balance_unavailable" when the balance cannot be read; the campaign stays
+    approved and can be sent later.
     """
 
     def work(config: Config, conn: psycopg.Connection) -> dict:
@@ -353,7 +363,8 @@ def submit_campaign(campaign_id: object, actor: object) -> dict:
                 if role != "demo":
                     result = submit(conn, http, cid, role_config)
                 else:
-                    conn.execute("select pg_advisory_lock(%s)", (DEMO_SPEND_LOCK,))
+                    if not _take_demo_spend_lock(conn):
+                        raise _Refused("busy", f"another demo send held the demo spend lock for {DEMO_SPEND_WAIT_SECONDS:g} seconds")
                     try:
                         in_ledger = conn.execute(
                             "select 1 from payout_batches where campaign_id = %s", (str(cid),)
@@ -1043,15 +1054,16 @@ def demo_spent_last_24h_minor(conn: psycopg.Connection) -> int:
     """Cents in every demo-created campaign that reached submitting in the last 24 hours.
 
     Counted the way spend.spent_last_24h_minor counts the shop's own cap, limited to
-    campaigns a demo session created: an item PayPal reports FAILED, BLOCKED,
-    RETURNED or REFUNDED stops counting, one with no status yet still counts.
+    campaigns a demo session created: a voided campaign counts nothing, an item
+    PayPal reports FAILED, BLOCKED, RETURNED or REFUNDED stops counting, one with no
+    status yet still counts.
     """
     row = conn.execute(
         "select coalesce(sum((item ->> 'amount_minor')::bigint), 0) "
         "from approved_snapshots s join campaign_owners o on o.campaign_id = s.campaign_id and o.role = 'demo' "
         "cross join lateral jsonb_array_elements(s.canonical_json::jsonb -> 'items') item "
         "where exists (select 1 from payout_batches b where b.campaign_id = s.campaign_id::text and b.created_at > now() - %s) "
-        "and not " + ITEM_CAME_BACK_SQL,
+        "and not " + CAMPAIGN_VOIDED_SQL + " and not " + ITEM_CAME_BACK_SQL,
         (WINDOW, list(MONEY_BACK_STATUSES)),
     ).fetchone()
     return int(row[0])
@@ -1070,15 +1082,33 @@ def _check_demo_submits(conn: psycopg.Connection, session: str) -> None:
     """Refuse once this demo session's campaigns hold DEMO_SUBMITS_PER_SESSION_PER_DAY batches written in the last 24 hours.
 
     A campaign counts from the moment its payout_batches row is written, the same
-    moment the shop's cap and the demo pool start counting it.
+    moment the shop's cap and the demo pool start counting it, and stops counting
+    when it is voided, as it does for them.
     """
     sent = conn.execute(
-        "select count(*) from campaign_owners o where o.role = 'demo' and o.session_id = %s and exists "
-        "(select 1 from payout_batches b where b.campaign_id = o.campaign_id::text and b.created_at > now() - %s)",
+        "select count(*) from campaign_owners s where s.role = 'demo' and s.session_id = %s and exists "
+        "(select 1 from payout_batches b where b.campaign_id = s.campaign_id::text and b.created_at > now() - %s) "
+        "and not " + CAMPAIGN_VOIDED_SQL,
         (session, WINDOW),
     ).fetchone()[0]
     if sent >= DEMO_SUBMITS_PER_SESSION_PER_DAY:
         raise _Refused("limit_reached", f"a demo session may send {DEMO_SUBMITS_PER_SESSION_PER_DAY} campaigns a day")
+
+
+def _take_demo_spend_lock(conn: psycopg.Connection) -> bool:
+    """Take DEMO_SPEND_LOCK for this connection's session, trying for up to DEMO_SPEND_WAIT_SECONDS.
+
+    True once it is held; the caller must release it. False when another
+    connection held it the whole time, with nothing held.
+    """
+    deadline = _monotonic() + DEMO_SPEND_WAIT_SECONDS
+    while True:
+        if conn.execute("select pg_try_advisory_lock(%s)", (DEMO_SPEND_LOCK,)).fetchone()[0]:
+            return True
+        left = deadline - _monotonic()
+        if left <= 0:
+            return False
+        _sleep(min(DEMO_SPEND_POLL_SECONDS, left))
 
 
 def _approver(role: str, session: str) -> str:

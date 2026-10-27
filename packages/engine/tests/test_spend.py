@@ -117,6 +117,18 @@ def test_items_whose_money_never_left_or_came_back_stop_counting_and_unreported_
     assert spent_last_24h_minor(conn, now) == 500 + 600 + 700
 
 
+def test_a_campaign_voided_after_reaching_submitting_counts_nothing(conn: psycopg.Connection) -> None:
+    now = database_now(conn)
+    reached_submitting(conn, [100], now - timedelta(hours=1))
+    refused = reached_submitting(conn, [400, 500], now - timedelta(hours=1))
+    campaign_id = uuid.UUID(conn.execute("select campaign_id from payout_batches where sender_batch_id = %s", (refused,)).fetchone()[0])
+    conn.execute("update campaigns set status = 'submitting' where campaign_id = %s", (campaign_id,))
+    assert spent_last_24h_minor(conn, now) == 1000
+    # PayPal refused the batch with nothing ambiguous, the one way a sent campaign is voided.
+    conn.execute("update campaigns set status = 'voided' where campaign_id = %s", (campaign_id,))
+    assert spent_last_24h_minor(conn, now) == 100
+
+
 def test_a_returned_item_frees_its_amount_under_the_daily_cap(conn: psycopg.Connection) -> None:
     now = database_now(conn)
     sender_batch_id = reached_submitting(conn, [600, 400], now - timedelta(hours=1))

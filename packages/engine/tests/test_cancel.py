@@ -1,4 +1,5 @@
-# Not covered here: PayPal's real cancel answer (the M7e-1 live probe), the webhook
+# Not covered here: PayPal's real cancel and item answers (the M7e-1 live probe covers
+# the cancel; the webhook path reads real items through the same get_item), the webhook
 # that later confirms a RETURNED item (test_events.py), the task's role checks
 # (test_tasks.py), and two whole cancel runs racing on one campaign (the row lock
 # is shown holding while PayPal answers, from a second connection).
@@ -86,17 +87,30 @@ def sent_campaign(conn: psycopg.Connection) -> uuid.UUID:
 
 
 class FakePayPal:
-    """Answers each cancel from answers by item id, RETURNED by default, and records the item ids asked about."""
+    """Answers each cancel from answers by item id, RETURNED by default, and records the item ids asked about.
 
-    def __init__(self, answers: dict[str, object] | None = None, on_cancel: Callable[[str], None] | None = None) -> None:
+    A read of one item ("ITEMn", sender_item_id "Rn" in batch mend-c, BATCHC) is
+    answered from reads: a status, or a ready response; UNCLAIMED by default.
+    """
+
+    def __init__(
+        self,
+        answers: dict[str, object] | None = None,
+        on_cancel: Callable[[str], None] | None = None,
+        reads: dict[str, object] | None = None,
+    ) -> None:
         self.answers = answers or {}
         self.on_cancel = on_cancel
+        self.reads = reads or {}
         self.cancels: list[str] = []
+        self.read: list[str] = []
 
     def __call__(self, request: httpx.Request) -> httpx.Response:
         if request.url.path == "/v1/oauth2/token":
             return httpx.Response(200, json={"access_token": "tok", "expires_in": 32000})
-        assert request.method == "POST" and request.url.path.endswith("/cancel"), "a cancel run only ever cancels"
+        if request.method == "GET":
+            return self._read(request.url.path.split("/")[-1])
+        assert request.method == "POST" and request.url.path.endswith("/cancel"), "a cancel run only cancels and reads items"
         item_id = request.url.path.split("/")[-2]
         self.cancels.append(item_id)
         if self.on_cancel:
@@ -112,6 +126,23 @@ class FakePayPal:
                 "payout_item_id": item_id,
                 "transaction_status": "RETURNED",
                 "payout_item": {"receiver": "m1@shop.example", "recipient_name": {"full_name": "Maya R."}},
+            },
+        )
+
+    def _read(self, item_id: str) -> httpx.Response:
+        self.read.append(item_id)
+        answer = self.reads.get(item_id, "UNCLAIMED")
+        if isinstance(answer, httpx.Response):
+            return answer
+        return httpx.Response(
+            200,
+            json={
+                "payout_item_id": item_id,
+                "payout_batch_id": "BATCHC",
+                "sender_batch_id": "mend-c",
+                "transaction_status": answer,
+                "payout_item_fee": {"currency": "USD", "value": "0.25"},
+                "payout_item": {"sender_item_id": "R" + item_id[4:], "receiver": "m1@shop.example", "recipient_name": {"full_name": "Maya R."}},
             },
         )
 
@@ -164,8 +195,59 @@ def test_a_4xx_for_one_item_counts_it_as_not_cancellable_and_the_next_is_still_c
     assert paypal.cancels == ["ITEM1", "ITEM2"]
     assert (statuses(conn)["ITEM1"], statuses(conn)["ITEM2"]) == ("UNCLAIMED", "RETURNED")
     assert audit(conn)[0] == (
-        "cancel", "payout_item_cancel_failed", {"payout_item_id": "ITEM1", "http_status": 422, "name": "ITEM_INCORRECT_STATUS", "debug_id": "dbg7"},
+        "cancel",
+        "payout_item_cancel_failed",
+        {"payout_item_id": "ITEM1", "http_status": 422, "name": "ITEM_INCORRECT_STATUS", "debug_id": "dbg7", "status_now": "UNCLAIMED"},
     )
+
+
+def test_a_4xx_cancel_is_followed_by_a_read_and_paypals_real_status_is_recorded(conn: psycopg.Connection) -> None:
+    campaign_id = sent_campaign(conn)
+    # The customer claimed R1 a moment before the cancel reached PayPal.
+    paypal = FakePayPal({"ITEM1": httpx.Response(422, json={"name": "ITEM_INCORRECT_STATUS"})}, reads={"ITEM1": "SUCCESS"})
+
+    report = cancel_unclaimed(conn, paypal.http(), campaign_id)
+
+    assert report == CancelReport(cancelled=1, returned_minor=200, still_unclaimed=0, not_cancellable=1)
+    assert paypal.read == ["ITEM1"]
+    assert conn.execute("select status, fee_minor from payout_items where payout_item_id = 'ITEM1'").fetchone() == ("SUCCESS", 25)
+    assert audit(conn)[0][2]["status_now"] == "SUCCESS"
+
+
+def test_a_read_after_a_4xx_that_fails_or_names_another_batch_records_nothing_and_the_run_goes_on(conn: psycopg.Connection) -> None:
+    campaign_id = sent_campaign(conn)
+    elsewhere = httpx.Response(
+        200,
+        json={
+            "payout_item_id": "ITEM1", "payout_batch_id": "BATCHC", "sender_batch_id": "mend-other",
+            "transaction_status": "SUCCESS", "payout_item": {"sender_item_id": "R1"},
+        },
+    )
+    refused = httpx.Response(400, json={"name": "ITEM_CANCELLATION_FAILED"})
+    paypal = FakePayPal(
+        {"ITEM1": refused, "ITEM2": refused},
+        reads={"ITEM1": elsewhere, "ITEM2": httpx.Response(500, json={"name": "INTERNAL_SERVER_ERROR"})},
+    )
+
+    report = cancel_unclaimed(conn, paypal.http(), campaign_id)
+
+    assert report == CancelReport(cancelled=0, returned_minor=0, still_unclaimed=2, not_cancellable=2)
+    assert paypal.read == ["ITEM1", "ITEM2"] and (statuses(conn)["ITEM1"], statuses(conn)["ITEM2"]) == ("UNCLAIMED", "UNCLAIMED")
+    assert [detail["status_now"] for _, _, detail in audit(conn)] == [None, None]
+
+
+def test_a_limit_asks_paypal_about_at_most_that_many_items(conn: psycopg.Connection) -> None:
+    campaign_id = sent_campaign(conn)
+    paypal = FakePayPal()
+
+    report = cancel_unclaimed(conn, paypal.http(), campaign_id, limit=1)
+
+    assert report == CancelReport(cancelled=1, returned_minor=100, still_unclaimed=1, not_cancellable=0)
+    assert paypal.cancels == ["ITEM1"]
+    for bad in (0, -1, True, 1.5, "1"):
+        with pytest.raises(ValueError):
+            cancel_unclaimed(conn, paypal.http(), campaign_id, limit=bad)  # type: ignore[arg-type]
+    assert paypal.cancels == ["ITEM1"]
 
 
 @pytest.mark.parametrize(

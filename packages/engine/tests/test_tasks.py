@@ -3,9 +3,11 @@
 # the real model facts (python -m mend_engine.store_facts computes and stores them),
 # the task server that runs these tasks on Render (test_task_server.py), and two demo
 # drafts, or two demo submits, from one session racing on separate connections (the
-# session lock and the demo spend lock are exercised only in sequence).
+# session lock is exercised only in sequence, the demo spend lock only against a
+# connection that holds it).
 import hashlib
 import json
+import math
 import random
 import re
 import secrets
@@ -50,7 +52,8 @@ DEMO_SETTINGS = {
 class FakePayPal:
     """Answers the token, balance, Payouts create, item cancel and Orders create calls, and records every other request.
 
-    Each batch created gets the next id, BATCH1 first. A cancel is answered RETURNED,
+    Each batch created gets the next id, BATCH1 first, unless create_status is not
+    201, when PayPal refuses the batch with that status. A cancel is answered RETURNED,
     or with cancel_status when that is not 200. balance is the USD available balance
     as PayPal writes it, or an HTTP status to fail the balance read with.
     """
@@ -58,6 +61,7 @@ class FakePayPal:
     def __init__(self) -> None:
         self.requests: list[httpx.Request] = []
         self.cancel_status = 200
+        self.create_status = 201
         self.batches = 0
         self.balance: str | int = "5033.32"
 
@@ -72,6 +76,8 @@ class FakePayPal:
             return httpx.Response(200, json={"balances": [{"currency": "USD", "available_balance": money}]})
         body = json.loads(request.content) if request.content else {}
         if request.method == "POST" and request.url.path == payouts.PAYOUTS_PATH:
+            if self.create_status != 201:
+                return httpx.Response(self.create_status, json={"name": "VALIDATION_ERROR"})
             self.batches += 1
             sender_batch_id = body["sender_batch_header"]["sender_batch_id"]
             return httpx.Response(
@@ -395,6 +401,86 @@ def test_a_demo_session_may_send_two_campaigns_a_day_while_other_sessions_and_th
     owner = actor(conn, "owner")
     assert [tasks.submit_campaign(approved_campaign(owner), owner)["sent"] for _ in range(3)] == [True, True, True]
     assert len(paypal.money_requests()) == 6
+
+
+def test_campaigns_paypal_refused_and_voided_use_none_of_a_demo_sessions_sends_or_the_demo_pool(
+    conn: psycopg.Connection, paypal: FakePayPal
+) -> None:
+    seed_shop(conn)
+    demo = actor(conn, "demo")
+    first, second, third = (approved_campaign(demo) for _ in range(3))
+    paypal.create_status = 422
+    assert [tasks.submit_campaign(cid, demo)["status"] for cid in (first, second)] == ["voided", "voided"]
+    assert conn.execute("select count(*) from payout_batches").fetchone() == (2,)
+
+    assert tasks.demo_spent_last_24h_minor(conn) == 0
+    paypal.create_status = 201
+    assert tasks.submit_campaign(third, demo)["sent"] is True
+    assert tasks.demo_spent_last_24h_minor(conn) == 1000
+
+
+def test_one_address_at_its_demo_send_limit_cannot_take_the_whole_demo_pool() -> None:
+    # 4 is the website's per-address demo_submits_address limit (LIMITS in
+    # packages/web/src/server/ratelimit.ts): one address sending that many campaigns at the
+    # demo campaign cap must still leave part of the shared pool for every other visitor.
+    assert 4 * tasks.DEMO_CAMPAIGN_CAP_MINOR < tasks.DEMO_DAILY_CAP_MINOR
+
+
+@pytest.fixture
+def spend_lock_held(server_url: str) -> Iterator[psycopg.Connection]:
+    """Another connection holding the demo spend lock, let go after 20 real seconds at the latest.
+
+    Without the deadline, a submit that waits on the lock with no limit would hang the
+    suite instead of failing.
+    """
+    holder = psycopg.connect(server_url, autocommit=True)
+    holder.execute("select pg_advisory_lock(%s)", (tasks.DEMO_SPEND_LOCK,))
+    deadline = threading.Timer(20, holder.close)
+    deadline.start()
+    try:
+        yield holder
+    finally:
+        deadline.cancel()
+        holder.close()
+
+
+def fake_wait(monkeypatch: pytest.MonkeyPatch, on_sleep: object = None) -> list[float]:
+    """Replaces the spend lock's clock and pause with ones that take no real time. Returns the pauses taken."""
+    slept: list[float] = []
+
+    def sleep(seconds: float) -> None:
+        slept.append(seconds)
+        if callable(on_sleep):
+            on_sleep(len(slept))
+
+    monkeypatch.setattr(tasks, "_sleep", sleep, raising=False)
+    monkeypatch.setattr(tasks, "_monotonic", lambda: sum(slept), raising=False)
+    return slept
+
+
+def test_a_demo_submit_that_cannot_take_the_spend_lock_within_10_seconds_answers_busy_and_sends_nothing(
+    conn: psycopg.Connection, paypal: FakePayPal, spend_lock_held: psycopg.Connection, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    seed_shop(conn)
+    demo = actor(conn, "demo")
+    campaign_id = approved_campaign(demo)
+    slept = fake_wait(monkeypatch)
+
+    assert refused(tasks.submit_campaign(campaign_id, demo), "busy")
+    assert math.isclose(sum(slept), 10) and len(slept) > 1
+    assert paypal.requests == [] and campaign_status(conn, campaign_id) == "approved"
+
+
+def test_a_demo_submit_waits_for_the_spend_lock_and_sends_once_it_is_free(
+    conn: psycopg.Connection, paypal: FakePayPal, spend_lock_held: psycopg.Connection, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    seed_shop(conn)
+    demo = actor(conn, "demo")
+    campaign_id = approved_campaign(demo)
+    slept = fake_wait(monkeypatch, lambda pauses: pauses == 3 and spend_lock_held.close())
+
+    assert tasks.submit_campaign(campaign_id, demo)["sent"] is True
+    assert len(slept) == 3 and len(paypal.money_requests()) == 1
 
 
 def test_submit_campaign_refuses_a_low_or_unreadable_balance_and_the_campaign_stays_approved(

@@ -40,10 +40,6 @@ RETRY_BACKOFF_SECONDS = (2, 5)
 REFUSAL_STATUSES = (400, 422)
 
 _LONG_DIGIT_RUN = re.compile(r"[0-9]{7,}")
-# What people put between the groups of a phone number: "(415) 555-0199", "415.555.0199",
-# "415,555,0199", "415/555/0199", "415_555_0199". The web app's note rule
-# (packages/web/src/server/notes.ts) is meant to remove the same set.
-_DIGIT_GROUP_SEPARATORS = re.compile(r"[ .,:'()\[\]{}/_-]")
 _LETTER_RUN = re.compile(r"[a-z]+", re.ASCII)
 # A word, a dot and two or more letters with no space between, such as "evil.example"
 # or "x.co": the same pattern the web app's note rule uses.
@@ -201,12 +197,12 @@ def _text_problem(text: object, max_chars: int) -> str | None:
 
     Allows printable ASCII only. Covers links and domain-like words, markup (any "<"
     or ">"), email addresses, long numbers such as phone or card numbers (7 or more
-    digits in a row once spaces, dots, commas, colons, apostrophes, slashes,
-    underscores, dashes and brackets are removed), control characters, sandbox test
-    codes and the names PayPal and Venmo in any case or spacing. Does not cover
-    persuasive wording, lookalike spellings such as "PayPaI", or digits split by
-    other marks such as "415*555*0199"; the owner reads every note at approval for
-    that. A full date such as "10/16/2026" counts as a long number, as "16.10.2026" did already.
+    digits in a row once every character that is not a letter or a digit is removed,
+    so "415*555*0199" counts as one run), control characters, sandbox test codes and
+    the names PayPal and Venmo in any case or spacing. Does not cover persuasive
+    wording, lookalike spellings such as "PayPaI", or digits split by letters such as
+    "415x555x0199"; the owner reads every note at approval for that. A full date such
+    as "10/16/2026" counts as a long number, as "16.10.2026" did already.
     """
     if type(text) is not str:
         return "is not text"
@@ -225,7 +221,10 @@ def _text_problem(text: object, max_chars: int) -> str | None:
         return "looks like a link"
     if "@" in text:
         return "contains @"
-    if _LONG_DIGIT_RUN.search(_DIGIT_GROUP_SEPARATORS.sub("", text)):
+    # A rule, not a list of separators: str.isalnum keeps Unicode letters and numbers and
+    # nothing else. The web app's note rule (packages/web/src/server/notes.ts) is meant
+    # to keep the same characters.
+    if _LONG_DIGIT_RUN.search("".join(ch for ch in text if ch.isalnum())):
         return "has a run of 7 or more digits"
     if text.lstrip().upper().startswith(SANDBOX_TRIGGER_PREFIXES):
         return "starts with a PayPal sandbox test code"
@@ -268,9 +267,9 @@ def validate_snapshot(snapshot: BatchSnapshot, config: Config) -> None:
     per-item cap; a total above the campaign cap; a currency other than USD; a
     malformed receiver, campaign id or sender_item_id; a note or subject that is
     empty, too long, non-ASCII, has a control character, "<" or ">", "http", "www.",
-    a domain-like word, "@", a run of 7 or more digits once spaces, dots, commas,
-    colons, apostrophes, slashes, underscores, dashes and brackets are removed,
-    starts with a sandbox test code, or names PayPal or Venmo.
+    a domain-like word, "@", a run of 7 or more digits once every character that is
+    not a letter or a digit is removed, starts with a sandbox test code, or names
+    PayPal or Venmo.
     """
     if not isinstance(snapshot, BatchSnapshot):
         raise SnapshotRefused("not a BatchSnapshot")

@@ -4,7 +4,9 @@ A campaign counts from the moment it reaches submitting, which is when its row i
 the payout_batches ledger is written, for the total of its frozen snapshot. Counting
 from that moment rather than from PayPal's answer means a batch whose outcome is
 unknown still counts, so the cap errs towards spending less. An item stops counting
-only once PayPal reports that its money never left the shop or came back to it.
+only once PayPal reports that its money never left the shop or came back to it, and
+a whole campaign only once it is voided, which happens only when nothing could have
+been sent.
 """
 
 from __future__ import annotations
@@ -33,6 +35,13 @@ ITEM_CAME_BACK_SQL = (
     "join payout_batches b on b.sender_batch_id = i.sender_batch_id "
     "where b.campaign_id = s.campaign_id::text and i.sender_item_id = item ->> 'sender_item_id'), false)"
 )
+# True when the campaign of row "s" (any row with a campaign_id) is voided. The status
+# guard lets a campaign be voided only before it is sent, or from submitting when PayPal
+# cannot hold a batch for it (a refusal with nothing ambiguous, a snapshot the payout
+# rules refuse, a member who left before the first send), so no money of a voided
+# campaign ever left. With no campaigns row it is false and the campaign counts. Shared so the
+# shop's cap, the demo pool and a demo session's sends leave out the same campaigns.
+CAMPAIGN_VOIDED_SQL = "exists (select 1 from campaigns c where c.campaign_id = s.campaign_id and c.status = 'voided')"
 
 
 class CapExceeded(ValueError):
@@ -61,9 +70,10 @@ def spent_last_24h_minor(conn: psycopg.Connection, now: datetime) -> int:
     amount is the sum of the items in its approved snapshot, exactly what the batch
     carries, less each item PayPal has since reported FAILED, BLOCKED, RETURNED or
     REFUNDED. An item PayPal has not reported on yet, or reports as anything else,
-    still counts. A ledger row stamped later than now also counts, so a caller's
-    clock running behind errs towards counting. Ledger rows with no approved
-    snapshot (the M1 proof payouts) are not campaigns and are not counted.
+    still counts. A voided campaign counts nothing (CAMPAIGN_VOIDED_SQL). A ledger
+    row stamped later than now also counts, so a caller's clock running behind errs
+    towards counting. Ledger rows with no approved snapshot (the M1 proof payouts)
+    are not campaigns and are not counted.
 
     Raises ValueError if now carries no time zone.
     """
@@ -73,7 +83,7 @@ def spent_last_24h_minor(conn: psycopg.Connection, now: datetime) -> int:
         "select coalesce(sum((item ->> 'amount_minor')::bigint), 0) "
         "from approved_snapshots s cross join lateral jsonb_array_elements(s.canonical_json::jsonb -> 'items') item "
         "where exists (select 1 from payout_batches b where b.campaign_id = s.campaign_id::text and b.created_at > %s) "
-        "and not " + ITEM_CAME_BACK_SQL,
+        "and not " + CAMPAIGN_VOIDED_SQL + " and not " + ITEM_CAME_BACK_SQL,
         (now - WINDOW, list(MONEY_BACK_STATUSES)),
     ).fetchone()
     return int(row[0])

@@ -1,6 +1,7 @@
 # Not covered here: real PayPal answers (prove_m1 does that live), the daily cap,
 # per-customer limits against purchase history, and ledger or approval races.
 import json
+import string
 from dataclasses import replace
 
 import httpx
@@ -196,6 +197,12 @@ def test_the_note_rule_names_why_paypal_or_venmo_is_refused_and_passes_ordinary_
 )
 def test_a_phone_number_split_by_separators_is_refused(note: str, problem: str | None) -> None:
     assert payouts.note_problem(note, 400) == problem
+
+
+# "<", ">" and "@" are refused by earlier rules, as markup and as an address.
+@pytest.mark.parametrize("mark", [*(ch for ch in string.punctuation if ch not in "<>@"), " * ", " ~ ", "  "])
+def test_digits_split_by_any_mark_that_is_not_a_letter_or_a_digit_count_as_one_run(mark: str) -> None:
+    assert payouts.note_problem(f"Call 415{mark}555{mark}0199 today", 400) == "has a run of 7 or more digits"
 
 
 class PayPalScript:

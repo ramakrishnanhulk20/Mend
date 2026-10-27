@@ -1479,6 +1479,9 @@ async function prove() {
   const engineUrl = engineAddress(services.engine);
   const webhookUrl = webhookUrlFor(origin);
   const connection = await connectionInfo(db.id);
+  // This machine's address changes from day to day; pin it before the first database read.
+  await ensureExternalAccess(db, []);
+  await waitForExternalConnection(connection.external);
   const envs = {};
   for (const key of Object.keys(SERVICES)) envs[key] = await serviceEnv(services[key].id);
   // The proof reads mend-db with the services' own credentials, over the external host.
@@ -1746,7 +1749,7 @@ async function prove() {
     }
     const altered = alterOneCharacter(delivered.event.raw);
     // mend-web answers a transmission id it already stored with 200 and no write, before asking
-    // PayPal; a fresh id makes the forgery go through PayPal's verification instead.
+    // PayPal; a fresh id makes the forgery go through Mend's own signature check instead.
     const storedId = delivered.event.transmission_id;
     const freshId = storedId.slice(0, -1) + (storedId.endsWith("0") ? "1" : "0");
     const post = async (transmissionId) => {
@@ -1768,7 +1771,7 @@ async function prove() {
     const original = rows("select raw from paypal_events where transmission_id = %s", [storedId])[0]?.raw;
     line(
       verified.status === 400 && verified.reason === "verify_failure" && underStoredId.status === 200 && forgedRows === 0 && original === delivered.event.raw,
-      `forgery: an altered copy of that delivery under a new transmission id is refused by PayPal's verification (answer ${verified.status}, ${verified.reason}); under the stored id it gets ${underStoredId.status} (${underStoredId.reason}) with no PayPal call; neither stored anything and the original is unchanged`,
+      `forgery: an altered copy of that delivery under a new transmission id is refused by Mend's signature check against PayPal's certificate (answer ${verified.status}, ${verified.reason}); under the stored id it gets ${underStoredId.status} (${underStoredId.reason}) with no PayPal call; neither stored anything and the original is unchanged`,
     );
   });
 

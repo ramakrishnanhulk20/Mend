@@ -428,3 +428,9 @@ create table if not exists run_owners (
     task text not null,
     created_at timestamptz not null default now()
 );
+
+-- PayPal webhook certificate addresses that have verified a genuine delivery, written
+-- only by the web app after a signature checks out (C9, C20). A restarted app reads the
+-- ones verified in the last 400 days, so PayPal's certificate never waits behind the
+-- download budget that unauthenticated traffic shares.
+create table if not exists paypal_certs (url text primary key, last_verified_at timestamptz not null default now());

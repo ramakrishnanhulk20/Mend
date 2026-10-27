@@ -14,6 +14,7 @@ import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vites
 import { ENGINE_DIR, SCHEMA_PATH, type DevDatabase } from "../../scripts/dev-database";
 import { closeDatabase } from "./db";
 import { addressTag, clientAddress, GLOBAL, LIMITS, sessionTag, takeHit, UNKNOWN_ADDRESS, type Limit } from "./ratelimit";
+import { CERTIFICATE_LIMITS } from "./webhook-signature";
 
 // dev_url applies the schema to the shared public schema, and two of those running at
 // once can deadlock (schema.sql takes its lock after its first table locks), so this
@@ -251,6 +252,12 @@ describe("takeHit", () => {
     // Every pool shared by visitors is in the list above; claude_owner is the owner's alone.
     const pools = Object.values(LIMITS).filter((limit) => limit.per === "all").map((limit) => limit.bucket);
     expect(pools.sort()).toEqual([...pairs.map(([, pool]) => pool.bucket), LIMITS.claudeOwner.bucket].sort());
+    // Certificate downloads are counted in memory (webhook-signature.ts), outside LIMITS.
+    const { address: share, all: pool } = CERTIFICATE_LIMITS;
+    expect([share.per, pool.per]).toEqual(["address", "all"]);
+    expect(share.windowMs).toBe(pool.windowMs);
+    expect([share.max, pool.max]).toEqual([2, 10]);
+    expect(share.max).toBeLessThan(pool.max);
   });
 
   it("sweeps out rows older than every window", async () => {

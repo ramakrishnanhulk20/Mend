@@ -21,7 +21,9 @@
  * before a byte of the body is read or any database query runs, and the body is read
  * only up to the size cap. A forged delivery spends no PayPal API call. One that passes
  * the header, body, time and certificate address checks still costs one database read,
- * the stored-id lookup, which the in-memory counts bound. Does not cover a flood spread
+ * the stored-id lookup, which the in-memory counts bound, and the certificate downloads
+ * it causes come out of its sender's own share (webhook-signature.ts), never out of
+ * PayPal's known certificate. Does not cover a flood spread
  * over many addresses under the shared count: that delays real deliveries (PayPal
  * retries anything not answered 2xx, and the jobs cron re-reads PayPal).
  */
@@ -179,7 +181,7 @@ export async function verifyDelivery(rawBody: string, headers: Headers): Promise
   if (delivery === null || bodyBytes(rawBody) > MAX_BODY_BYTES || "problem" in readEvent(rawBody)) {
     return "rejected";
   }
-  const verdict = await deliverySignatures().check(delivery, rawBody, loadConfig().webhookId);
+  const verdict = await deliverySignatures().check(delivery, rawBody, loadConfig().webhookId, clientAddress(headers));
   return verdict.ok ? "verified" : "rejected";
 }
 
@@ -332,14 +334,17 @@ export async function receiveDelivery(request: Request): Promise<DeliveryResult>
  * header gets 400; text that is not one JSON event object, has a repeated key at any
  * depth, or nests deeper than 64 gets 400; a transmission time more than 5 minutes
  * ahead or more than 3 days old gets 400; an algorithm other than SHA256withRSA or a
- * certificate address off PayPal's sandbox certificate path gets 400 (verify_failure)
- * before any query; a transmission id already stored gets 200 with no signature check
- * and no write; a signature that does not check out, including a certificate that
- * cannot be fetched or does not chain to a trusted root, gets 400 (verify_failure, with
- * the failing check in the log) and nothing is stored; so does a new certificate address
- * once the app's certificate downloads for the minute are used up (certificate_budget).
- * A verified delivery is inserted once, keyed on transmission id (event id is unique
- * too), and the engine is then asked to process events without waiting; a replay gets
+ * certificate address that is not exactly
+ * https://api.sandbox.paypal.com/v1/notifications/certs/CERT-<id> gets 400
+ * (verify_failure) before any query; a transmission id already stored gets 200 with no
+ * signature check and no write; a signature that does not check out, including a
+ * certificate that cannot be fetched or does not chain to a trusted root, gets 400
+ * (verify_failure, with the failing check in the log) and nothing is stored; so does a
+ * certificate address not yet known good once this client address has caused 2
+ * certificate downloads this minute or the app 10 (certificate_budget). A verified
+ * delivery records its certificate address (webhook-signature.ts), is inserted once,
+ * keyed on transmission id (event id is unique too), and the engine is then asked to
+ * process events without waiting; a replay gets
  * 200, stores nothing new and asks nothing. A database failure or a missing webhook id
  * setting gets 503 with nothing stored, so PayPal retries.
  *
@@ -382,7 +387,7 @@ export async function handleDelivery(rawBody: string, headers: Headers): Promise
       return await answer(200, ref, sender, { outcome: "duplicate", reason: "transmission_stored", ...seen });
     }
 
-    const verdict = await deliverySignatures().check(delivery, rawBody, loadConfig().webhookId);
+    const verdict = await deliverySignatures().check(delivery, rawBody, loadConfig().webhookId, sender.address);
     if (!verdict.ok) {
       const reason = verdict.problem === "certificate_budget" ? "certificate_budget" : "verify_failure";
       return await answer(400, ref, sender, { outcome: "refused", reason, check: verdict.problem, ...seen });

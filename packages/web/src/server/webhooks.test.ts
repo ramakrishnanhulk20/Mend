@@ -4,8 +4,10 @@
 // chain (__fixtures__/test-chain.ts), trusted through the signature checker's injectable
 // anchors. It checks that nothing calls PayPal's API, the in-memory counts taken before
 // any query, the streamed body cap, replays answered without a signature check, the
-// reviewer's flood repro, and the first rejection per reason and address each minute on
-// the audit record with the address tag in the log line. Does NOT cover: PayPal's real
+// reviewers' flood repros, each sender's share of the certificate downloads, PayPal's
+// certificate address remembered in the real paypal_certs table across a restart (a fresh
+// checker over the same database), and the first rejection per reason and address each
+// minute on the audit record with the address tag in the log line. Does NOT cover: PayPal's real
 // certificate (webhook-signature.test.ts checks its chain) or a real PayPal signature and
 // delivery timing (render.mjs prove "delivery" does), Render's proxy really writing the
 // client address (ratelimit.test.ts names that gap), a flood spread across many
@@ -171,6 +173,11 @@ function lastLog(): Record<string, unknown> {
   return all[all.length - 1];
 }
 
+async function rememberedCerts(): Promise<string[]> {
+  const { rows } = await admin.query<{ url: string }>("select url from paypal_certs order by url");
+  return rows.map((row) => row.url);
+}
+
 async function lastAuditId(): Promise<number> {
   const { rows } = await admin.query<{ id: number }>("select coalesce(max(id), 0)::int as id from audit_log");
   return rows[0].id;
@@ -219,7 +226,7 @@ afterAll(async () => {
 });
 
 beforeEach(async () => {
-  await admin.query("truncate paypal_events");
+  await admin.query("truncate paypal_events, paypal_certs");
   webhookLimits.clear();
   webhookRejections.clear();
   signing.checker = trusting();
@@ -523,23 +530,110 @@ describe("the signature check", () => {
 });
 
 describe("the certificate download budget", () => {
-  it("refuses a new certificate address once 10 downloads were made this minute, with 400, reason certificate_budget and its own audit row", async () => {
+  // A delivery from address under a certificate address the test network answers 404.
+  function underNewCertificate(certUrl: string, address: string, options: DeliveryOptions = {}): Promise<Response> {
+    const delivery = signedDelivery(payoutItemEvent(), options);
+    delivery.headers.set("paypal-cert-url", certUrl);
+    return POST(routeRequest(delivery.body, delivery.headers, address));
+  }
+
+  // Ten first-time certificate addresses from ten senders, which fills the process's 10 a minute.
+  async function fillTheCap(label: string): Promise<void> {
+    for (let index = 0; index < 10; index += 1) {
+      expect((await underNewCertificate(`${CERT_URL}-${label}-${index}`, `203.0.113.${20 + index}`)).status).toBe(400);
+      expect(lastLog()).toMatchObject({ check: "cert_fetch" });
+    }
+    expect((await underNewCertificate(`${CERT_URL}-${label}-10`, "203.0.113.40")).status).toBe(400);
+    expect(lastLog()).toMatchObject({ reason: "certificate_budget" });
+  }
+
+  it("refuses a third new certificate address from one client address this minute, with 400, reason certificate_budget and its own audit row, while another address still downloads", async () => {
     const before = await lastAuditId();
-    const underNewAddress = (index: number) => {
-      const delivery = signedDelivery(payoutItemEvent());
-      delivery.headers.set("paypal-cert-url", `${CERT_URL}-new-${index}`);
-      return POST(routeRequest(delivery.body, delivery.headers, "198.51.100.70"));
-    };
-    for (let index = 0; index < 10; index += 1) expect((await underNewAddress(index)).status).toBe(400);
+    for (let index = 0; index < 2; index += 1) expect((await underNewCertificate(`${CERT_URL}-new-${index}`, "198.51.100.70")).status).toBe(400);
     expect(lastLog()).toMatchObject({ outcome: "refused", reason: "verify_failure", check: "cert_fetch" });
-    const refused = await underNewAddress(10);
+    const refused = await underNewCertificate(`${CERT_URL}-new-2`, "198.51.100.70");
     expect(refused.status).toBe(400);
     expect(await refused.text()).toMatch(/^refused \(ref [0-9a-f-]{36}\)$/);
     expect(lastLog()).toMatchObject({ outcome: "refused", reason: "certificate_budget", check: "certificate_budget" });
-    expect(network.certFetches).toBe(10);
-    const row = (reason: string) => ({ actor: "web", action: "webhook_rejected", detail: { reason, status: 400, address_tag: addressTag("198.51.100.70") } });
-    expect(await auditSince(before)).toEqual([row("verify_failure"), row("certificate_budget")]);
+    expect(network.certFetches).toBe(2);
+    expect((await underNewCertificate(`${CERT_URL}-new-3`, "198.51.100.71")).status).toBe(400);
+    expect(lastLog()).toMatchObject({ check: "cert_fetch" });
+    expect(network.certFetches).toBe(3);
+    const row = (reason: string, address: string) => ({ actor: "web", action: "webhook_rejected", detail: { reason, status: 400, address_tag: addressTag(address) } });
+    expect(await auditSince(before)).toEqual([row("verify_failure", "198.51.100.70"), row("certificate_budget", "198.51.100.70"), row("verify_failure", "198.51.100.71")]);
     expect(await rowCount()).toBe(0);
+  });
+
+  it("answers a genuine delivery 200 after 10 forged ones from one address named PayPal's certificate with a query (the reviewer's round 3 repro)", async () => {
+    for (let i = 0; i < 10; i += 1) {
+      expect((await underNewCertificate(`${CERT_URL}?n=${i}`, "203.0.113.9", { forged: true })).status).toBe(400);
+    }
+    const genuine = signedDelivery(payoutItemEvent());
+    expect((await POST(routeRequest(genuine.body, genuine.headers, "198.51.100.8"))).status).toBe(200);
+    expect(await rowCount()).toBe(1);
+    expect(network.certFetches).toBe(1);
+    expect(logs().filter((entry) => entry.check === "cert_url")).toHaveLength(10);
+    expect(await rememberedCerts()).toEqual([CERT_URL]);
+  });
+
+  it("answers a genuine delivery 200 after 10 forged ones from one address under 10 new certificate addresses, of which it downloaded 2", async () => {
+    for (let i = 0; i < 10; i += 1) {
+      expect((await underNewCertificate(`${CERT_URL}-forged-${i}`, "203.0.113.9", { forged: true })).status).toBe(400);
+    }
+    const genuine = signedDelivery(payoutItemEvent());
+    expect((await POST(routeRequest(genuine.body, genuine.headers, "198.51.100.8"))).status).toBe(200);
+    expect(await rowCount()).toBe(1);
+    expect(network.certFetches).toBe(3);
+    expect(await rememberedCerts()).toEqual([CERT_URL]);
+  });
+
+  it("remembers PayPal's certificate across a restart: a fresh checker over the same database verifies it after 10 first-time addresses from 10 senders filled the cap", async () => {
+    const first = signedDelivery(payoutItemEvent());
+    expect((await POST(routeRequest(first.body, first.headers, "198.51.100.8"))).status).toBe(200);
+    expect(await rememberedCerts()).toEqual([CERT_URL]);
+    signing.checker = trusting();
+    await fillTheCap("first");
+    const fetched = network.certFetches;
+    const genuine = signedDelivery(payoutItemEvent());
+    expect((await POST(routeRequest(genuine.body, genuine.headers, "198.51.100.8"))).status).toBe(200);
+    expect(network.certFetches).toBe(fetched + 1);
+    expect(await rowCount()).toBe(2);
+  });
+
+  it("forgets a certificate address last verified more than 400 days ago", async () => {
+    await admin.query("insert into paypal_certs (url, last_verified_at) values ($1, now() - interval '401 days')", [CERT_URL]);
+    await fillTheCap("stale");
+    const stale = signedDelivery(payoutItemEvent());
+    expect((await POST(routeRequest(stale.body, stale.headers, "198.51.100.8"))).status).toBe(400);
+    expect(lastLog()).toMatchObject({ reason: "certificate_budget" });
+
+    await admin.query("update paypal_certs set last_verified_at = now() - interval '399 days'");
+    signing.checker = trusting();
+    await fillTheCap("recent");
+    const recent = signedDelivery(payoutItemEvent());
+    expect((await POST(routeRequest(recent.body, recent.headers, "198.51.100.8"))).status).toBe(200);
+  });
+
+  it("records the time each certificate address last verified a delivery, in one row, and answers the same when the table cannot be read or written", async () => {
+    await admin.query("insert into paypal_certs (url, last_verified_at) values ($1, now() - interval '10 days')", [CERT_URL]);
+    const delivery = signedDelivery(payoutItemEvent());
+    expect((await handleDelivery(delivery.body, delivery.headers)).status).toBe(200);
+    const { rows } = await admin.query("select url, last_verified_at > now() - interval '1 minute' as fresh from paypal_certs");
+    expect(rows).toEqual([{ url: CERT_URL, fresh: true }]);
+
+    signing.checker = trusting();
+    await admin.query("alter table paypal_certs rename to paypal_certs_away");
+    try {
+      const unrecorded = signedDelivery(payoutItemEvent());
+      expect((await handleDelivery(unrecorded.body, unrecorded.headers)).status).toBe(200);
+    } finally {
+      await admin.query("alter table paypal_certs_away rename to paypal_certs");
+    }
+    expect(logs().filter((entry) => entry.outcome === "certs_not_recalled" || entry.outcome === "cert_not_recorded")).toEqual([
+      expect.objectContaining({ kind: "webhook", outcome: "certs_not_recalled", code: "42P01" }),
+      expect.objectContaining({ kind: "webhook", outcome: "cert_not_recorded", code: "42P01" }),
+    ]);
+    expect(await rowCount()).toBe(2);
   });
 });
 

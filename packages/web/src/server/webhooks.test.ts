@@ -1,81 +1,71 @@
 // Covers the webhook route, handleDelivery and verifyDelivery against a real Postgres
-// schema (the engine's schema.sql in a throwaway schema) and a fake PayPal verify
-// endpoint that only says SUCCESS for the exact bytes it signed, including the three
-// rate limits, the streamed body cap, replays answered without PayPal, and the first
-// rejection per reason and address each minute on the audit record with the address
-// tag in the log line. Does NOT cover: PayPal's real verdicts, real
-// signatures or delivery timing (the live proof, npm run prove:m1b, does), Render's
-// proxy really writing the client address (ratelimit.test.ts names that gap), a flood
-// spread across many addresses beyond the global count, or the engine itself: the
-// engine client is replaced by a stand-in that records what it was asked
-// (engine.test.ts covers it).
-import { createHash, randomUUID } from "node:crypto";
+// schema (the engine's schema.sql in a throwaway schema) with deliveries really signed
+// over transmission id, time, webhook id and the body's CRC-32 by a throwaway certificate
+// chain (__fixtures__/test-chain.ts), trusted through the signature checker's injectable
+// anchors. It checks that nothing calls PayPal's API, the in-memory counts taken before
+// any query, the streamed body cap, replays answered without a signature check, the
+// reviewer's flood repro, and the first rejection per reason and address each minute on
+// the audit record with the address tag in the log line. Does NOT cover: PayPal's real
+// certificate (webhook-signature.test.ts checks its chain) or a real PayPal signature and
+// delivery timing (render.mjs prove "delivery" does), Render's proxy really writing the
+// client address (ratelimit.test.ts names that gap), a flood spread across many
+// addresses beyond the shared count, or the engine itself: the engine client is replaced
+// by a stand-in that records what it was asked (engine.test.ts covers it).
+import { randomUUID, sign } from "node:crypto";
 import { readFileSync } from "node:fs";
+import { crc32 } from "node:zlib";
 import pg from "pg";
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { holdDevDatabase, SCHEMA_PATH, type DevDatabase } from "../../scripts/dev-database";
 import { POST } from "../app/api/webhooks/paypal/route";
-import { closeDatabase } from "./db";
+import { testChain } from "./__fixtures__/test-chain";
+import { webhookLimits, webhookRejections } from "./address-limits";
+import { closeDatabase, database } from "./db";
 import { runTask } from "./engine";
 import { addressTag } from "./ratelimit";
-import {
-  handleDelivery,
-  MAX_BODY_BYTES,
-  parseTransmissionTime,
-  refuseDeclaredLength,
-  VerificationUnavailable,
-  verifyDelivery,
-} from "./webhooks";
+import { SignatureChecker } from "./webhook-signature";
+import { handleDelivery, MAX_BODY_BYTES, parseTransmissionTime, refuseDeclaredLength, verifyDelivery } from "./webhooks";
 
 const WEBHOOK_ID = "TESTWEBHOOK1";
 const SECRET = "fake-client-secret-for-webhook-tests";
-const TOKEN = "A21AAfakeTokenForWebhookTests";
-const VERIFY_PATH = "/v1/notifications/verify-webhook-signature";
-const CERT_URL = "https://api.sandbox.paypal.com/v1/notifications/certs/CERT-360caa42-fca2a594-a5cafa77";
+const CERT_URL = "https://api.sandbox.paypal.com/v1/notifications/certs/CERT-360caa42-fca2a594-bf9ab596";
 const GENERIC_BODY = /^(ok|refused|too large|too many requests|try again later) \(ref [0-9a-f-]{36}\)$/;
 const RUN_ID = "brn-6f1c1d3e-2b9a-4f0e-9a51-3c1d2e4f5a6b";
 const ROUTE_URL = "http://127.0.0.1:3000/api/webhooks/paypal";
 const CHUNK_BYTES = 16 * 1024;
 
+const signing = vi.hoisted(() => ({ checker: null as unknown }));
+
 vi.mock("./engine", () => ({ runTask: vi.fn() }));
 vi.mock("@/server/webhooks", async () => await import("./webhooks"));
+vi.mock("./webhook-signature", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("./webhook-signature")>();
+  return { ...actual, deliverySignatures: () => signing.checker };
+});
 const asked = vi.mocked(runTask);
+const chain = testChain();
 
-type Mode = "honest" | "failure" | "server_error" | "timeout" | "garbage";
-
-const paypal = {
-  mode: "honest" as Mode,
-  signed: new Map<string, { body: string; certUrl: string }>(),
-  verifyRequests: [] as string[],
-};
-
-function signatureFor(transmissionId: string, body: string): string {
-  return createHash("sha256").update(`${transmissionId}|${body}|${WEBHOOK_ID}`).digest("base64");
+function trusting(anchors: readonly string[] = [chain.root.pem]): SignatureChecker {
+  return new SignatureChecker({ anchors, intermediates: [chain.intermediate.pem] });
 }
 
-// Plays PayPal: SUCCESS only when the spliced event text is byte for byte what was
-// signed, with the certificate URL it was signed under.
-async function fakePayPal(url: URL, init: RequestInit): Promise<Response> {
-  if (url.pathname === "/v1/oauth2/token") {
-    return Response.json({ access_token: TOKEN, expires_in: 32_400 });
+// The network as the app sees it: PayPal's certificate address serves the test leaf, any
+// other certificate path is a download answered 404, and any other request (PayPal's API
+// above all) is recorded and answered 404.
+const network = {
+  certificate: (() => new Response(chain.leaf.pem)) as () => Response | Promise<Response>,
+  certFetches: 0,
+  otherRequests: [] as string[],
+};
+
+async function fakeNetwork(input: string | URL | Request): Promise<Response> {
+  const url = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
+  if (url.startsWith("https://api.sandbox.paypal.com/v1/notifications/certs/")) {
+    network.certFetches += 1;
+    return url === CERT_URL ? network.certificate() : new Response("not found", { status: 404 });
   }
-  if (url.pathname !== VERIFY_PATH) return new Response("not found", { status: 404 });
-  const raw = String(init.body);
-  paypal.verifyRequests.push(raw);
-  if (paypal.mode === "timeout") throw new DOMException("The operation was aborted due to timeout", "TimeoutError");
-  if (paypal.mode === "server_error") {
-    return Response.json({ name: "INTERNAL_SERVICE_ERROR", debug_id: "f00dfeed1234" }, { status: 500 });
-  }
-  if (paypal.mode === "garbage") return new Response("<html>gateway</html>", { status: 200 });
-  const request = JSON.parse(raw) as Record<string, string>;
-  const marker = ',"webhook_event":';
-  const event = raw.slice(raw.indexOf(marker) + marker.length, -1);
-  const genuine =
-    request.webhook_id === WEBHOOK_ID &&
-    paypal.signed.get(request.transmission_id)?.body === event &&
-    paypal.signed.get(request.transmission_id)?.certUrl === request.cert_url &&
-    request.transmission_sig === signatureFor(request.transmission_id, event);
-  return Response.json({ verification_status: genuine && paypal.mode === "honest" ? "SUCCESS" : "FAILURE" });
+  network.otherRequests.push(url);
+  return new Response("not found", { status: 404 });
 }
 
 function payoutItemEvent(extra: Record<string, unknown> = {}): Record<string, unknown> {
@@ -96,17 +86,23 @@ function paypalTime(ms: number): string {
   return new Date(ms).toISOString().replace(/\.\d{3}Z$/, "Z");
 }
 
-function signedDelivery(event: Record<string, unknown> | string, options: { sentAt?: number; transmissionId?: string } = {}) {
+type DeliveryOptions = { sentAt?: number; transmissionId?: string; webhookId?: string; forged?: boolean };
+
+// Headers PayPal would send, signed with the test leaf's key over the documented text;
+// forged signs with a key no certificate vouches for.
+function signedDelivery(event: Record<string, unknown> | string, options: DeliveryOptions = {}) {
   const body = typeof event === "string" ? event : JSON.stringify(event);
   const transmissionId = options.transmissionId ?? randomUUID();
-  paypal.signed.set(transmissionId, { body, certUrl: CERT_URL });
+  const time = paypalTime(options.sentAt ?? Date.now());
+  const text = `${transmissionId}|${time}|${options.webhookId ?? WEBHOOK_ID}|${crc32(Buffer.from(body, "utf8"))}`;
+  const key = options.forged ? chain.stranger.keys.privateKey : chain.leafKeys.privateKey;
   const headers = new Headers({
     "content-type": "application/json",
     "paypal-auth-algo": "SHA256withRSA",
     "paypal-cert-url": CERT_URL,
     "paypal-transmission-id": transmissionId,
-    "paypal-transmission-sig": signatureFor(transmissionId, body),
-    "paypal-transmission-time": paypalTime(options.sentAt ?? Date.now()),
+    "paypal-transmission-sig": sign("sha256", Buffer.from(text, "utf8"), key).toString("base64"),
+    "paypal-transmission-time": time,
   });
   return { body, headers, transmissionId };
 }
@@ -140,6 +136,20 @@ function meteredBody(bytes: Buffer) {
     { highWaterMark: 0 },
   );
   return { stream, meter };
+}
+
+// Every query and connection the app's pool is asked for while work runs.
+async function databaseCalls(work: () => Promise<void>): Promise<number> {
+  const pool = database();
+  const query = vi.spyOn(pool, "query");
+  const connect = vi.spyOn(pool, "connect");
+  try {
+    await work();
+    return query.mock.calls.length + connect.mock.calls.length;
+  } finally {
+    query.mockRestore();
+    connect.mockRestore();
+  }
 }
 
 let dev: DevDatabase;
@@ -194,7 +204,7 @@ beforeAll(async () => {
   vi.stubEnv("PAYPAL_WEBHOOK_ID", WEBHOOK_ID);
   vi.stubEnv("DATABASE_URL", url.href);
   vi.stubEnv("MEND_CSRF_SECRET", "csrf-secret-for-webhook-tests-0123456789");
-  vi.stubGlobal("fetch", fakePayPal);
+  vi.stubGlobal("fetch", fakeNetwork);
 });
 
 afterAll(async () => {
@@ -210,9 +220,12 @@ afterAll(async () => {
 
 beforeEach(async () => {
   await admin.query("truncate paypal_events");
-  await admin.query("delete from rate_limit_hits");
-  paypal.mode = "honest";
-  paypal.verifyRequests = [];
+  webhookLimits.clear();
+  webhookRejections.clear();
+  signing.checker = trusting();
+  network.certificate = () => new Response(chain.leaf.pem);
+  network.certFetches = 0;
+  network.otherRequests = [];
   logLines = [];
   asked.mockReset();
   asked.mockResolvedValue(RUN_ID);
@@ -224,7 +237,7 @@ beforeEach(async () => {
     vi.restoreAllMocks();
     const everything = logLines.join("");
     expect(everything).not.toContain(SECRET);
-    expect(everything).not.toContain(TOKEN);
+    expect(network.otherRequests).toEqual([]);
   };
 });
 
@@ -251,6 +264,16 @@ describe("a verified delivery", () => {
     expect(lastLog()).toMatchObject({ outcome: "stored", status: 200, transmission_id: delivery.transmissionId });
   });
 
+  it("is checked in the app: PayPal's API is never called, and one certificate download serves many deliveries", async () => {
+    for (let n = 0; n < 3; n += 1) {
+      const delivery = signedDelivery(payoutItemEvent());
+      expect((await handleDelivery(delivery.body, delivery.headers)).status).toBe(200);
+    }
+    expect(network.certFetches).toBe(1);
+    expect(network.otherRequests).toEqual([]);
+    expect(await rowCount()).toBe(3);
+  });
+
   it("is verified on its exact bytes, so odd formatting PayPal signed still passes", async () => {
     const body = `{\n  "id" : "WH-FMT-${randomUUID()}",\t"event_type":"PAYMENT.PAYOUTSBATCH.SUCCESS",\n  "summary":"caf\\u00e9 é 1.0e2",\n  "resource":{"batch_header":{"payout_batch_id":"DF6DLUL2WXLZ6"}}\n}`;
     const delivery = signedDelivery(body);
@@ -265,16 +288,18 @@ describe("a verified delivery", () => {
     const reserialised = JSON.stringify(JSON.parse(body));
     const result = await handleDelivery(reserialised, delivery.headers);
     expect(result.status).toBe(400);
+    expect(lastLog()).toMatchObject({ reason: "verify_failure", check: "signature" });
     expect(await rowCount()).toBe(0);
   });
 
-  it("sends PayPal our configured webhook id, never one from the request", async () => {
-    const delivery = signedDelivery(payoutItemEvent({ webhook_id: "ATTACKERWEBHOOK" }));
-    delivery.headers.set("paypal-webhook-id", "ATTACKERWEBHOOK");
-    await handleDelivery(delivery.body, delivery.headers);
-    const sent = JSON.parse(paypal.verifyRequests[0]) as { webhook_id: string; webhook_event: Record<string, unknown> };
-    expect(sent.webhook_id).toBe(WEBHOOK_ID);
-    expect(sent.webhook_event.webhook_id).toBe("ATTACKERWEBHOOK");
+  it("must be signed over our configured webhook id, never one the request names", async () => {
+    const event = payoutItemEvent({ webhook_id: "ATTACKERWEBHOOK" });
+    const theirs = signedDelivery(event, { webhookId: "ATTACKERWEBHOOK" });
+    theirs.headers.set("paypal-webhook-id", "ATTACKERWEBHOOK");
+    expect((await handleDelivery(theirs.body, theirs.headers)).status).toBe(400);
+    expect(lastLog()).toMatchObject({ reason: "verify_failure", check: "signature" });
+    const ours = signedDelivery(event);
+    expect((await handleDelivery(ours.body, ours.headers)).status).toBe(200);
   });
 });
 
@@ -289,18 +314,28 @@ describe("replays", () => {
     expect(lastLog()).toMatchObject({ outcome: "duplicate" });
   });
 
-  it("a stored transmission id is answered 200 without asking PayPal or writing, whatever the body says", async () => {
+  it("a stored transmission id is answered 200 without a signature check or a write, whatever the body says", async () => {
     const delivery = signedDelivery(payoutItemEvent());
     expect((await handleDelivery(delivery.body, delivery.headers)).status).toBe(200);
-    expect(paypal.verifyRequests).toHaveLength(1);
     const { rows: before } = await admin.query("select * from paypal_events");
     for (const body of [delivery.body, JSON.stringify(payoutItemEvent())]) {
       const replay = await handleDelivery(body, delivery.headers);
       expect(replay.status).toBe(200);
       expect(lastLog()).toMatchObject({ outcome: "duplicate", reason: "transmission_stored", transmission_id: delivery.transmissionId });
     }
-    expect(paypal.verifyRequests).toHaveLength(1);
     expect((await admin.query("select * from paypal_events")).rows).toEqual(before);
+  });
+
+  it("answers an altered copy as the live forgery check expects: 400 verify_failure under a fresh id, 200 under the stored one", async () => {
+    const delivery = signedDelivery(payoutItemEvent());
+    expect((await handleDelivery(delivery.body, delivery.headers)).status).toBe(200);
+    const altered = delivery.body.replace('"SUCCESS"', '"SUCCESX"');
+    const fresh = new Headers(delivery.headers);
+    fresh.set("paypal-transmission-id", randomUUID());
+    expect((await handleDelivery(altered, fresh)).status).toBe(400);
+    expect(lastLog()).toMatchObject({ outcome: "refused", reason: "verify_failure" });
+    expect((await handleDelivery(altered, delivery.headers)).status).toBe(200);
+    expect(await rowCount()).toBe(1);
   });
 
   it("the same event under a new transmission id stores nothing new", async () => {
@@ -313,13 +348,13 @@ describe("replays", () => {
   });
 });
 
-describe("refusals before PayPal is asked", () => {
+describe("refusals before the signature is checked", () => {
   async function expectRefused(body: string, headers: Headers, status: number, reason: string): Promise<void> {
     const result = await handleDelivery(body, headers);
     expect(result.status).toBe(status);
     expect(result.body).toMatch(GENERIC_BODY);
     expect(lastLog()).toMatchObject({ outcome: "refused", reason });
-    expect(paypal.verifyRequests).toHaveLength(0);
+    expect(network.certFetches).toBe(0);
     expect(await rowCount()).toBe(0);
   }
 
@@ -359,7 +394,7 @@ describe("refusals before PayPal is asked", () => {
 
   it.each([
     ["paypal-transmission-id", "a".repeat(51)],
-    ["paypal-transmission-sig", "s".repeat(501)],
+    ["paypal-transmission-sig", "s".repeat(701)],
     ["paypal-auth-algo", "SHA256-withRSA"],
     ["paypal-cert-url", "https://evil.example/cert with space"],
   ])("a malformed %s header gets 400", async (name, value) => {
@@ -372,6 +407,32 @@ describe("refusals before PayPal is asked", () => {
     const delivery = signedDelivery(payoutItemEvent());
     delivery.headers.append("paypal-transmission-id", randomUUID());
     await expectRefused(delivery.body, delivery.headers, 400, "missing_header");
+  });
+
+  it("leaves room in the signature header for a 4096-bit key's 684 characters", async () => {
+    const delivery = signedDelivery(payoutItemEvent());
+    delivery.headers.set("paypal-transmission-sig", "A".repeat(684));
+    expect((await handleDelivery(delivery.body, delivery.headers)).status).toBe(400);
+    expect(lastLog()).toMatchObject({ outcome: "refused", reason: "verify_failure", check: "signature" });
+  });
+
+  it.each([
+    ["paypal-auth-algo", "SHA1withRSA", "auth_algo"],
+    ["paypal-cert-url", "https://evil.example/v1/notifications/certs/CERT-1", "cert_url"],
+    ["paypal-cert-url", "https://api.sandbox.paypal.com:8443/v1/notifications/certs/CERT-1", "cert_url"],
+    ["paypal-cert-url", "https://api.sandbox.paypal.com/v1/oauth2/token", "cert_url"],
+  ])("a %s of %s gets 400 before any query or download", async (name, value, check) => {
+    const delivery = signedDelivery(payoutItemEvent());
+    delivery.headers.set(name, value);
+    // The first rejection writes this reason's audit row for the address; the next is free.
+    expect((await handleDelivery(delivery.body, delivery.headers)).status).toBe(400);
+    const calls = await databaseCalls(async () => {
+      expect((await handleDelivery(delivery.body, delivery.headers)).status).toBe(400);
+    });
+    expect(calls).toBe(0);
+    expect(lastLog()).toMatchObject({ outcome: "refused", reason: "verify_failure", check });
+    expect(network.certFetches).toBe(0);
+    expect(await rowCount()).toBe(0);
   });
 
   it.each([
@@ -421,17 +482,16 @@ describe("refusals before PayPal is asked", () => {
   });
 });
 
-describe("PayPal's verdict", () => {
-  it("FAILURE gets 400 and stores nothing", async () => {
-    paypal.mode = "failure";
-    const delivery = signedDelivery(payoutItemEvent());
+describe("the signature check", () => {
+  it("refuses a signature no trusted certificate made with 400, storing nothing", async () => {
+    const delivery = signedDelivery(payoutItemEvent(), { forged: true });
     const result = await handleDelivery(delivery.body, delivery.headers);
     expect(result.status).toBe(400);
-    expect(lastLog()).toMatchObject({ outcome: "refused", reason: "verify_failure" });
+    expect(lastLog()).toMatchObject({ outcome: "refused", reason: "verify_failure", check: "signature" });
     expect(await rowCount()).toBe(0);
   });
 
-  it("an altered body with the original headers gets 400 and stores nothing", async () => {
+  it("refuses an altered body with the original headers with 400, storing nothing", async () => {
     const delivery = signedDelivery(payoutItemEvent());
     const altered = delivery.body.replace('"SUCCESS"', '"SUCCESX"');
     expect(altered).not.toBe(delivery.body);
@@ -439,33 +499,47 @@ describe("PayPal's verdict", () => {
     expect(await rowCount()).toBe(0);
   });
 
-  it("a cert URL on another host gets 400 and stores nothing", async () => {
+  it("refuses a certificate that does not chain to a trusted root with 400", async () => {
+    signing.checker = trusting([chain.stranger.pem]);
     const delivery = signedDelivery(payoutItemEvent());
-    delivery.headers.set("paypal-cert-url", "https://evil.example/cert.pem");
     expect((await handleDelivery(delivery.body, delivery.headers)).status).toBe(400);
+    expect(lastLog()).toMatchObject({ reason: "verify_failure", check: "cert_chain" });
     expect(await rowCount()).toBe(0);
   });
 
   it.each([
-    ["a verify timeout", "timeout" as const],
-    ["a PayPal server error", "server_error" as const],
-    ["an answer that is not a verdict", "garbage" as const],
-  ])("%s gets 503 and stores nothing, so PayPal retries", async (_label, mode) => {
-    paypal.mode = mode;
+    ["a certificate address that answers an error", () => new Response("down", { status: 503 }), "cert_fetch"],
+    ["a certificate download that fails", () => Promise.reject(new TypeError("fetch failed")), "cert_fetch"],
+    ["a certificate address that serves something else", () => new Response("<html>gateway</html>"), "cert_chain"],
+  ])("answers %s with 400 and no call to PayPal's API, storing nothing", async (_label, answer, check) => {
+    network.certificate = answer;
     const delivery = signedDelivery(payoutItemEvent());
     const result = await handleDelivery(delivery.body, delivery.headers);
-    expect(result.status).toBe(503);
-    expect(result.body).toMatch(/^try again later \(ref [0-9a-f-]{36}\)$/);
-    expect(lastLog()).toMatchObject({ outcome: "unavailable", reason: "verify_error" });
+    expect(result.status).toBe(400);
+    expect(result.body).toMatch(/^refused \(ref [0-9a-f-]{36}\)$/);
+    expect(lastLog()).toMatchObject({ outcome: "refused", reason: "verify_failure", check });
     expect(await rowCount()).toBe(0);
   });
+});
 
-  it("keeps PayPal's debug id in the log and out of the answer", async () => {
-    paypal.mode = "server_error";
-    const delivery = signedDelivery(payoutItemEvent());
-    const result = await handleDelivery(delivery.body, delivery.headers);
-    expect(result.body).not.toContain("f00dfeed1234");
-    expect(lastLog()).toMatchObject({ debug_id: "f00dfeed1234" });
+describe("the certificate download budget", () => {
+  it("refuses a new certificate address once 10 downloads were made this minute, with 400, reason certificate_budget and its own audit row", async () => {
+    const before = await lastAuditId();
+    const underNewAddress = (index: number) => {
+      const delivery = signedDelivery(payoutItemEvent());
+      delivery.headers.set("paypal-cert-url", `${CERT_URL}-new-${index}`);
+      return POST(routeRequest(delivery.body, delivery.headers, "198.51.100.70"));
+    };
+    for (let index = 0; index < 10; index += 1) expect((await underNewAddress(index)).status).toBe(400);
+    expect(lastLog()).toMatchObject({ outcome: "refused", reason: "verify_failure", check: "cert_fetch" });
+    const refused = await underNewAddress(10);
+    expect(refused.status).toBe(400);
+    expect(await refused.text()).toMatch(/^refused \(ref [0-9a-f-]{36}\)$/);
+    expect(lastLog()).toMatchObject({ outcome: "refused", reason: "certificate_budget", check: "certificate_budget" });
+    expect(network.certFetches).toBe(10);
+    const row = (reason: string) => ({ actor: "web", action: "webhook_rejected", detail: { reason, status: 400, address_tag: addressTag("198.51.100.70") } });
+    expect(await auditSince(before)).toEqual([row("verify_failure"), row("certificate_budget")]);
+    expect(await rowCount()).toBe(0);
   });
 });
 
@@ -512,12 +586,15 @@ describe("asking the engine to process events", () => {
     await handleDelivery(delivery.body, delivery.headers);
     await vi.waitFor(() => expect(asked).toHaveBeenCalledTimes(1));
     expect((await handleDelivery(delivery.body, delivery.headers)).status).toBe(200);
-    paypal.mode = "failure";
-    const forged = signedDelivery(payoutItemEvent());
+    const forged = signedDelivery(payoutItemEvent(), { forged: true });
     expect((await handleDelivery(forged.body, forged.headers)).status).toBe(400);
-    paypal.mode = "server_error";
-    const unverified = signedDelivery(payoutItemEvent());
-    expect((await handleDelivery(unverified.body, unverified.headers)).status).toBe(503);
+    await admin.query("alter table paypal_events rename to paypal_events_away");
+    try {
+      const unstored = signedDelivery(payoutItemEvent());
+      expect((await handleDelivery(unstored.body, unstored.headers)).status).toBe(503);
+    } finally {
+      await admin.query("alter table paypal_events_away rename to paypal_events");
+    }
     await new Promise((resolve) => setTimeout(resolve, 50));
     expect(asked).toHaveBeenCalledTimes(1);
   });
@@ -543,7 +620,19 @@ describe("asking the engine to process events", () => {
 describe("what a flood can spend", () => {
   const JSON_ONLY = new Headers({ "content-type": "application/json" });
 
-  it("lets 120 deliveries a minute through from one address and answers the 121st 429 without reading it or asking PayPal", async () => {
+  it("answers 60 forged deliveries from one address 400, then a genuine one from another address 200 (the reviewer's repro)", async () => {
+    for (let n = 0; n < 60; n += 1) {
+      const forged = signedDelivery(payoutItemEvent(), { forged: true });
+      expect((await POST(routeRequest(forged.body, forged.headers, "203.0.113.9"))).status).toBe(400);
+    }
+    const genuine = signedDelivery(payoutItemEvent());
+    expect((await POST(routeRequest(genuine.body, genuine.headers, "198.51.100.8"))).status).toBe(200);
+    expect(await rowCount()).toBe(1);
+    expect(network.certFetches).toBe(1);
+  });
+
+  it("lets 120 deliveries a minute through from one address and answers the next 429 from memory, without reading it or any query", async () => {
+    const before = await lastAuditId();
     for (let n = 0; n < 120; n += 1) {
       expect((await POST(routeRequest("{}", JSON_ONLY, "198.51.100.7"))).status).toBe(400);
     }
@@ -556,37 +645,42 @@ describe("what a flood can spend", () => {
     expect(wait > 0 && wait <= 60).toBe(true);
     expect(request.bodyUsed).toBe(false);
     expect(lastLog()).toMatchObject({ outcome: "refused", reason: "rate_limited", bucket: "webhook_address" });
-    expect(paypal.verifyRequests).toHaveLength(0);
+
+    const later = routeRequest(genuine.body, genuine.headers, "198.51.100.7");
+    const calls = await databaseCalls(async () => {
+      for (let n = 0; n < 10; n += 1) expect((await POST(later.clone())).status).toBe(429);
+    });
+    expect(calls).toBe(0);
+    expect(network.certFetches).toBe(0);
+    expect(await auditSince(before)).toEqual([
+      { actor: "web", action: "webhook_rejected", detail: { reason: "missing_header", status: 400, address_tag: addressTag("198.51.100.7") } },
+      { actor: "web", action: "rate_limit_hit", detail: { bucket: "webhook_address", per: "address", address_tag: addressTag("198.51.100.7") } },
+    ]);
 
     expect((await POST(routeRequest(genuine.body, genuine.headers, "198.51.100.8"))).status).toBe(200);
     expect(await rowCount()).toBe(1);
   });
 
+  it("counts and refuses with the database's rate-limit table gone, because the counts live in memory", async () => {
+    await admin.query("alter table rate_limit_hits rename to rate_limit_hits_away");
+    try {
+      for (let n = 0; n < 120; n += 1) expect((await POST(routeRequest("{}", JSON_ONLY, "198.51.100.9"))).status).toBe(400);
+      expect((await POST(routeRequest("{}", JSON_ONLY, "198.51.100.9"))).status).toBe(429);
+      const genuine = signedDelivery(payoutItemEvent());
+      expect((await POST(routeRequest(genuine.body, genuine.headers, "198.51.100.10"))).status).toBe(200);
+    } finally {
+      await admin.query("alter table rate_limit_hits_away rename to rate_limit_hits");
+    }
+  });
+
   it("answers 429 to every address once 600 deliveries came in within a minute", async () => {
-    await admin.query("insert into rate_limit_hits (bucket, subject) select 'webhook_all', 'all' from generate_series(1, 600)");
+    for (let n = 0; n < 600; n += 1) webhookLimits.take(`10.0.${Math.floor(n / 200)}.${n % 200}`);
     const genuine = signedDelivery(payoutItemEvent());
     const response = await POST(routeRequest(genuine.body, genuine.headers, "203.0.113.9"));
     expect(response.status).toBe(429);
     expect(lastLog()).toMatchObject({ outcome: "refused", reason: "rate_limited", bucket: "webhook_all" });
-    expect(paypal.verifyRequests).toHaveLength(0);
+    expect(network.certFetches).toBe(0);
     expect(await rowCount()).toBe(0);
-  });
-
-  it("asks PayPal to verify at most 60 times a minute: the 61st delivery that needs it gets 429 and no call", async () => {
-    for (let n = 0; n < 60; n += 1) {
-      const delivery = signedDelivery(payoutItemEvent());
-      expect((await handleDelivery(delivery.body, delivery.headers)).status).toBe(200);
-    }
-    expect(paypal.verifyRequests).toHaveLength(60);
-    const late = signedDelivery(payoutItemEvent());
-    const result = await handleDelivery(late.body, late.headers);
-    expect(result.status).toBe(429);
-    expect(result.body).toMatch(GENERIC_BODY);
-    expect(result.retryAfterSeconds !== undefined && result.retryAfterSeconds > 0 && result.retryAfterSeconds <= 60).toBe(true);
-    expect(lastLog()).toMatchObject({ outcome: "refused", reason: "rate_limited", bucket: "paypal_verify_all", transmission_id: late.transmissionId });
-    await expect(verifyDelivery(late.body, late.headers)).rejects.toMatchObject({ name: "VerifyLimitReached" });
-    expect(paypal.verifyRequests).toHaveLength(60);
-    expect(await rowCount()).toBe(60);
   });
 
   it("reads a body sent without Content-Length only up to the cap, then answers 413", async () => {
@@ -599,7 +693,7 @@ describe("what a flood can spend", () => {
     expect(meter.given).toBeLessThanOrEqual(MAX_BODY_BYTES + CHUNK_BYTES);
     expect(meter.cancelled).toBe(true);
     expect(lastLog()).toMatchObject({ outcome: "refused", reason: "oversize_stream" });
-    expect(paypal.verifyRequests).toHaveLength(0);
+    expect(network.certFetches).toBe(0);
   });
 
   it("reads a streamed body of exactly the cap whole, so the bytes PayPal signed are the bytes stored", async () => {
@@ -623,19 +717,19 @@ describe("verifyDelivery", () => {
     expect(await verifyDelivery(`${delivery.body} `, delivery.headers)).toBe("rejected");
   });
 
-  it("rejects without asking PayPal when a header is missing or the body has duplicate keys", async () => {
+  it("rejects without any download when a header is missing or the body has duplicate keys", async () => {
     const delivery = signedDelivery(payoutItemEvent());
     const headers = new Headers(delivery.headers);
     headers.delete("paypal-transmission-sig");
     expect(await verifyDelivery(delivery.body, headers)).toBe("rejected");
     expect(await verifyDelivery('{"id":"a","id":"b","event_type":"X"}', delivery.headers)).toBe("rejected");
-    expect(paypal.verifyRequests).toHaveLength(0);
+    expect(network.certFetches).toBe(0);
   });
 
-  it("throws VerificationUnavailable when PayPal does not answer", async () => {
-    paypal.mode = "timeout";
+  it("says rejected, without throwing, when the certificate cannot be downloaded", async () => {
+    network.certificate = () => Promise.reject(new DOMException("The operation was aborted due to timeout", "TimeoutError"));
     const delivery = signedDelivery(payoutItemEvent());
-    await expect(verifyDelivery(delivery.body, delivery.headers)).rejects.toThrow(VerificationUnavailable);
+    expect(await verifyDelivery(delivery.body, delivery.headers)).toBe("rejected");
   });
 });
 
@@ -664,10 +758,28 @@ describe("rejections on the audit record", () => {
     const row = (reason: string, address: string) => ({ actor: "web", action: "webhook_rejected", detail: { reason, status: 400, address_tag: addressTag(address) } });
     expect(await auditSince(before)).toEqual([row("missing_header", "198.51.100.60"), row("syntax", "198.51.100.60"), row("missing_header", "198.51.100.61")]);
 
-    await admin.query("update rate_limit_hits set at = at - interval '61 seconds'");
-    expect((await POST(routeRequest("{}", JSON_ONLY, "198.51.100.60"))).status).toBe(400);
+    vi.useFakeTimers({ toFake: ["Date"] });
+    try {
+      vi.setSystemTime(Date.now() + 61_000);
+      expect((await POST(routeRequest("{}", JSON_ONLY, "198.51.100.60"))).status).toBe(400);
+    } finally {
+      vi.useRealTimers();
+    }
     expect((await auditSince(before)).at(-1)).toEqual(row("missing_header", "198.51.100.60"));
     expect(await auditSince(before)).toHaveLength(4);
+  });
+
+  it("decides in memory: with the database's rate-limit table gone, three rejections from one address leave one row", async () => {
+    const before = await lastAuditId();
+    await admin.query("alter table rate_limit_hits rename to rate_limit_hits_away");
+    try {
+      for (let n = 0; n < 3; n += 1) expect((await POST(routeRequest("{}", JSON_ONLY, "198.51.100.63"))).status).toBe(400);
+    } finally {
+      await admin.query("alter table rate_limit_hits_away rename to rate_limit_hits");
+    }
+    expect(await auditSince(before)).toEqual([
+      { actor: "web", action: "webhook_rejected", detail: { reason: "missing_header", status: 400, address_tag: addressTag("198.51.100.63") } },
+    ]);
   });
 
   it("answers a rejection the same when its audit row cannot be written, with one log line saying so", async () => {

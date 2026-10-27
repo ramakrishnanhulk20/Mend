@@ -11,6 +11,7 @@ import psycopg
 import pytest
 from psycopg import sql
 
+from mend_engine.campaigns import spend
 from mend_engine.campaigns.spend import (
     DAILY_CAP_LOCK,
     MONEY_BACK_STATUSES,
@@ -167,6 +168,51 @@ def test_check_daily_cap_refuses_an_amount_that_is_not_whole_cents(conn: psycopg
 def test_now_must_carry_a_time_zone(conn: psycopg.Connection) -> None:
     with pytest.raises(ValueError):
         spent_last_24h_minor(conn, datetime(2026, 10, 20, 12, 0))
+
+
+def claimed_again(conn: psycopg.Connection, sender_batch_id: str) -> uuid.UUID:
+    """The campaign of sender_batch_id moved into submitting now, as a reconcile resend moves it."""
+    campaign_id = uuid.UUID(conn.execute("select campaign_id from payout_batches where sender_batch_id = %s", (sender_batch_id,)).fetchone()[0])
+    conn.execute("update campaigns set status = 'submitting' where campaign_id = %s", (campaign_id,))
+    return campaign_id
+
+
+def test_a_campaign_counts_from_its_latest_move_into_submitting_not_its_first_ledger_claim(conn: psycopg.Connection) -> None:
+    now = database_now(conn)
+    resent = reached_submitting(conn, [300], now - timedelta(hours=25))
+    reached_submitting(conn, [50], now - timedelta(hours=25))
+    assert spent_last_24h_minor(conn, now) == 0
+    # A resend 25 hours after the first claim can still take money out, so it counts again from now.
+    claimed_again(conn, resent)
+    assert spent_last_24h_minor(conn, database_now(conn)) == 300
+
+
+def test_the_demo_pool_counts_demo_campaigns_only_from_their_latest_claim_less_voided_and_returned_money(conn: psycopg.Connection) -> None:
+    def owned(sender_batch_id: str, role: str) -> uuid.UUID:
+        campaign_id = uuid.UUID(conn.execute("select campaign_id from payout_batches where sender_batch_id = %s", (sender_batch_id,)).fetchone()[0])
+        conn.execute("insert into campaign_owners values (%s, %s, %s)", (campaign_id, role, "e" * 64))
+        return campaign_id
+
+    now = database_now(conn)
+    recent = reached_submitting(conn, [100, 200], now - timedelta(hours=23))
+    owned(recent, "demo")
+    item_status(conn, recent, "R2", "RETURNED")
+    owned(reached_submitting(conn, [400], now - timedelta(hours=1)), "owner")
+    old = reached_submitting(conn, [800], now - timedelta(hours=25))
+    owned(old, "demo")
+    voided = owned(reached_submitting(conn, [1600], now - timedelta(hours=1)), "demo")
+    for step in ("submitting", "voided"):
+        conn.execute("update campaigns set status = %s where campaign_id = %s", (step, voided))
+
+    assert spend.demo_spent_last_24h_minor(conn) == 100
+    claimed_again(conn, old)
+    assert spend.demo_spent_last_24h_minor(conn) == 900
+
+
+def test_the_demo_pool_and_its_lock_are_the_ones_tasks_uses() -> None:
+    from mend_engine import tasks
+
+    assert (spend.DEMO_DAILY_CAP_MINOR, spend.DEMO_SPEND_LOCK) == (tasks.DEMO_DAILY_CAP_MINOR, tasks.DEMO_SPEND_LOCK)
 
 
 def test_the_daily_cap_lock_needs_a_transaction_and_holds_until_it_ends(conn: psycopg.Connection, server_url: str) -> None:

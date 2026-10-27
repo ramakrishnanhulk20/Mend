@@ -1,7 +1,8 @@
 """Joining and leaving the shop's thank-you list, and matching a member to the shop's records.
 
 A member row holds only what the customer gave through Log in with PayPal plus the
-consent they agreed to. It is the only source of a payout receiver (C5 restated):
+consent they agreed to, or, for a demo stand-in a script joined, a synthetic address
+marked source 'seed'. It is the only source of a payout receiver (C5 restated):
 the shop's order records are used to decide who to thank, never where money goes.
 Leaving takes effect at once: every campaign that has not been sent yet and
 includes the member is voided in the same transaction that deletes them (C28).
@@ -25,16 +26,21 @@ from mend_engine.paypal.payouts import EMAIL_SHAPE, MAX_RECEIVER_CHARS, Snapshot
 # Nothing has left the shop for a campaign in these states, so a member leaving voids it.
 VOIDABLE_STATUSES = ("draft", "awaiting_approval", "approved")
 LEFT_REASON = "a member left"
+REPLACED_REASON = "an unverified member was replaced"
 ACTOR = "member"
+# members.source: a person who joined through Log in with PayPal, or a demo stand-in no person agreed to (C23, C28).
+SOURCE_LOGIN = "paypal_login"
+SOURCE_SEED = "seed"
 
 # PayPal's payer ids are short upper-case codes; the exact shape is confirmed from a
 # real userinfo response later, so this accepts letters and digits only.
 _PAYER_ID = re.compile(r"[A-Za-z0-9]{1,64}", re.ASCII)
 _CLIENT_ID = re.compile(r"[A-Za-z0-9_-]{1,200}", re.ASCII)
+_ACTOR_NAME = re.compile(r"[a-z][a-z0-9_]{0,39}", re.ASCII)
 
 _INSERT_MEMBER = (
     "insert into members (paypal_email, paypal_payer_id, email_verified, consent_version, "
-    "consent_text_sha256, client_id) values (%s, %s, %s, %s, %s, %s) "
+    "consent_text_sha256, client_id, source) values (%s, %s, %s, %s, %s, %s, %s) "
     "on conflict do nothing returning member_id"
 )
 _INSERT_AUDIT = "insert into audit_log (actor, action, detail) values (%s, %s, %s)"
@@ -69,12 +75,17 @@ def join_member(
     email_verified: bool,
     shop_name: str,
     client_id: str,
+    actor: str = ACTOR,
 ) -> uuid.UUID:
     """Record a customer's consent to the thank-you list and return their member id.
 
     Stores the email after normalise_email, the consent version and the hash of the
-    consent text for shop_name. Writes one audit_log row with the member id and
-    consent version when a member is created.
+    consent text for shop_name. actor is who is joining and is written on every
+    audit row: "member" for a person signing in through Log in with PayPal, whose row
+    gets source 'paypal_login', or a script's own name (seed_demo, prove_m4a), whose
+    row gets source 'seed', a demo stand-in no person agreed to. Writes one
+    audit_log row "member_joined" with the member id and consent version when a
+    member is created.
 
     Joining again with the same email returns the same member id. When the stored
     email is unverified and this call's is verified, the member is upgraded in one
@@ -82,13 +93,22 @@ def join_member(
     hash replace the earlier ones (the verified owner is consenting now, the first
     consent came from someone PayPal had not verified), a missing payer id is filled
     from this call, and one audit_log row "member_email_verified" holds the member
-    id and consent version. A verified member is never downgraded. Every other
-    repeat join changes nothing and writes no audit row.
+    id and consent version. If that unverified row holds a payer id other than this
+    call's, it is not upgraded but replaced in the same way leaving removes a member,
+    by a new verified row carrying this call's payer id, with one audit_log row
+    "member_replaced_unverified" holding only the two member ids. A verified repeat
+    join of a member whose consent record is not the current wording records the
+    current one (version, text hash, client id and time), with one audit_log row
+    "member_reconsented" holding the member id and consent version; an unverified
+    sign-in never does. A verified member is never downgraded. A script joining
+    again over a person's row returns it and changes nothing. Every other repeat
+    join changes nothing and writes no audit row.
 
     Raises MembershipRefused for an email PayPal could not be paid at, a malformed
-    payer id or client id, an email_verified that is not a bool, a bad shop name, or
-    an email or payer id that already belongs to a different member (a PayPal
-    account is never silently moved to another email or the reverse). Nothing is
+    payer id, client id or actor, an email_verified that is not a bool, a bad shop
+    name, an email or payer id that already belongs to a different member (a PayPal
+    account is never silently moved to another email or the reverse), or a person
+    joining on an email a stand-in holds ("identity_conflict" for both). Nothing is
     written when it raises.
     """
     email = _checked_email(paypal_email)
@@ -98,6 +118,10 @@ def join_member(
         raise MembershipRefused("bad_input", "email_verified must be true or false")
     if type(client_id) is not str or not _CLIENT_ID.fullmatch(client_id):
         raise MembershipRefused("bad_input", "client id is malformed")
+    if type(actor) is not str or not _ACTOR_NAME.fullmatch(actor):
+        raise MembershipRefused("bad_input", "actor is malformed")
+    # Only a person signing in makes a real member; any other caller makes a stand-in, so an unknown actor fails closed.
+    source = SOURCE_LOGIN if actor == ACTOR else SOURCE_SEED
     try:
         digest = consent_hash(consent_text_for(shop_name))
     except ValueError as exc:
@@ -105,23 +129,40 @@ def join_member(
 
     with conn.transaction():
         row = conn.execute(
-            _INSERT_MEMBER, (email, paypal_payer_id, email_verified, CONSENT_VERSION, digest, client_id)
+            _INSERT_MEMBER, (email, paypal_payer_id, email_verified, CONSENT_VERSION, digest, client_id, source)
         ).fetchone()
         if row is not None:
             member_id = row[0]
             conn.execute(
                 _INSERT_AUDIT,
-                (ACTOR, "member_joined", Jsonb({"member_id": str(member_id), "consent_version": CONSENT_VERSION})),
+                (actor, "member_joined", Jsonb({"member_id": str(member_id), "consent_version": CONSENT_VERSION})),
             )
             return member_id
         # Locked until commit, so two verified joins at once upgrade the member and write its audit row only once.
         existing = conn.execute(
-            "select member_id, paypal_email, paypal_payer_id, email_verified from members "
-            "where paypal_email = %s or paypal_payer_id = %s for update",
+            "select member_id, paypal_email, paypal_payer_id, email_verified, source, consent_version, consent_text_sha256 "
+            "from members where paypal_email = %s or paypal_payer_id = %s for update",
             (email, paypal_payer_id),
         ).fetchall()
         if len(existing) == 1:
-            member_id, stored_email, stored_payer_id, stored_verified = existing[0]
+            member_id, stored_email, stored_payer_id, stored_verified, stored_source, *consent_row = existing[0]
+            stored_consent = tuple(consent_row)
+            if stored_email == email and stored_source != source:
+                if source == SOURCE_LOGIN:
+                    raise MembershipRefused("identity_conflict", "this email belongs to a demo stand-in, never to a sign-in")
+                return member_id
+            if stored_email == email and email_verified and not stored_verified and stored_payer_id not in (None, paypal_payer_id):
+                # An unverified row proves nothing about who owns the email, so the verified owner's sign-in takes its place (C28).
+                voided = _remove(conn, member_id, REPLACED_REASON)
+                replacement = conn.execute(
+                    _INSERT_MEMBER, (email, paypal_payer_id, True, CONSENT_VERSION, digest, client_id, source)
+                ).fetchone()[0]
+                conn.execute(
+                    _INSERT_AUDIT,
+                    (actor, "member_replaced_unverified", Jsonb({"member_id": str(replacement), "replaced_member_id": str(member_id)})),
+                )
+                _audit_voided(conn, actor, voided, REPLACED_REASON)
+                return replacement
             if stored_email == email and (paypal_payer_id is None or stored_payer_id in (None, paypal_payer_id)):
                 if email_verified and not stored_verified:
                     conn.execute(
@@ -133,10 +174,21 @@ def join_member(
                     conn.execute(
                         _INSERT_AUDIT,
                         (
-                            ACTOR,
+                            actor,
                             "member_email_verified",
                             Jsonb({"member_id": str(member_id), "consent_version": CONSENT_VERSION}),
                         ),
+                    )
+                elif email_verified and stored_consent != (CONSENT_VERSION, digest):
+                    # The verified owner has just been shown and agreed to the current wording, so it replaces the earlier one.
+                    conn.execute(
+                        "update members set consent_version = %s, consent_text_sha256 = %s, client_id = %s, joined_at = now() "
+                        "where member_id = %s",
+                        (CONSENT_VERSION, digest, client_id, member_id),
+                    )
+                    conn.execute(
+                        _INSERT_AUDIT,
+                        (actor, "member_reconsented", Jsonb({"member_id": str(member_id), "consent_version": CONSENT_VERSION})),
                     )
                 return member_id
     raise MembershipRefused("identity_conflict", "this email or PayPal account already belongs to a different member")
@@ -164,28 +216,36 @@ def leave_member(conn: psycopg.Connection, member_id: uuid.UUID) -> LeaveResult:
         found = conn.execute("select 1 from members where member_id = %s for update", (member_id,)).fetchone()
         if found is None:
             return LeaveResult(removed=False, voided_campaigns=())
-        voided = tuple(
-            row[0]
-            for row in conn.execute(
-                "update campaigns set status = 'voided', void_reason = %s "
-                "where status = any(%s) and campaign_id in "
-                "(select campaign_id from campaign_members where member_id = %s) "
-                "returning campaign_id",
-                (LEFT_REASON, list(VOIDABLE_STATUSES), member_id),
-            )
-        )
-        conn.execute(
-            "delete from campaign_members where member_id = %s and campaign_id = any(%s)",
-            (member_id, list(voided)),
-        )
-        conn.execute("delete from members where member_id = %s", (member_id,))
+        voided = _remove(conn, member_id, LEFT_REASON)
         conn.execute(_INSERT_AUDIT, (ACTOR, "member_left", Jsonb({"member_id": str(member_id)})))
-        for campaign_id in voided:
-            conn.execute(
-                _INSERT_AUDIT,
-                (ACTOR, "campaign_voided", Jsonb({"campaign_id": str(campaign_id), "reason": LEFT_REASON})),
-            )
+        _audit_voided(conn, ACTOR, voided, LEFT_REASON)
     return LeaveResult(removed=True, voided_campaigns=voided)
+
+
+def _remove(conn: psycopg.Connection, member_id: uuid.UUID, reason: str) -> tuple[uuid.UUID, ...]:
+    """Void every unsent campaign holding a member already locked by the caller, then delete the member.
+
+    Runs inside the caller's transaction and writes no audit row. Rows in campaigns
+    already past approval keep their place with member_id set to null by the foreign key.
+    """
+    voided = tuple(
+        row[0]
+        for row in conn.execute(
+            "update campaigns set status = 'voided', void_reason = %s "
+            "where status = any(%s) and campaign_id in "
+            "(select campaign_id from campaign_members where member_id = %s) "
+            "returning campaign_id",
+            (reason, list(VOIDABLE_STATUSES), member_id),
+        )
+    )
+    conn.execute("delete from campaign_members where member_id = %s and campaign_id = any(%s)", (member_id, list(voided)))
+    conn.execute("delete from members where member_id = %s", (member_id,))
+    return voided
+
+
+def _audit_voided(conn: psycopg.Connection, actor: str, voided: tuple[uuid.UUID, ...], reason: str) -> None:
+    for campaign_id in voided:
+        conn.execute(_INSERT_AUDIT, (actor, "campaign_voided", Jsonb({"campaign_id": str(campaign_id), "reason": reason})))
 
 
 def customer_refs_by_email(conn: psycopg.Connection) -> dict[str, str]:

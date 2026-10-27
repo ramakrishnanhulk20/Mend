@@ -79,3 +79,15 @@ def test_an_explicit_now_is_used_and_must_carry_a_time_zone(conn: psycopg.Connec
     assert kept(conn) == ["new-1h"] and purges(conn) == []
     assert purge_paypal_events(conn, datetime.now(timezone.utc) + timedelta(hours=48)) == 1
     assert kept(conn) == []
+
+
+def test_run_owner_rows_older_than_24_hours_are_deleted_and_younger_ones_kept(conn: psycopg.Connection) -> None:
+    for run_id, hours in (("trn-old", 25), ("trn-day", 24.01), ("trn-young", 23)):
+        conn.execute(
+            "insert into run_owners (run_id, session_id_hash, task, created_at) values (%s, %s, 'results', now() - make_interval(secs => %s))",
+            (run_id, "a" * 64, hours * 3600),
+        )
+    purge_paypal_events(conn)
+    assert [r[0] for r in conn.execute("select run_id from run_owners")] == ["trn-young"]
+    assert conn.execute("select actor, detail from audit_log where action = 'run_owners_purged'").fetchall() == [("purge", {"deleted": 2})]
+    assert purges(conn) == [("purge", {"deleted": 0})]

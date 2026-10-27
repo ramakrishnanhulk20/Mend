@@ -16,8 +16,10 @@ is in place (C22).
 
 Every other request needs the x-mend-engine-token header, compared in constant time
 before the path or body is looked at. At most 16 tasks run at once, so a burst cannot
-use up the database's connections; a request that waits 60 seconds for a slot is
-answered 503. The dispatch code is shared with the dev bridge (make_task_handler), so
+use up the database's connections: the five heavy reads (HEAVY_TASKS) share 6 slots
+and every other task has the other 10, so no visitor's burst of reads can hold up a
+payout, a join or a leave. A request that waits 60 seconds for a slot is answered
+503. The dispatch code is shared with the dev bridge (make_task_handler), so
 what runs locally is what runs on Render. Logs are JSON lines on stderr.
 """
 
@@ -45,7 +47,12 @@ MAX_BODY_BYTES = 64 * 1024
 MIN_TOKEN_BYTES = 32
 REQUEST_TIMEOUT_SECONDS = 30
 # The database allows 100 connections (Render basic_256mb); each running task holds one.
-MAX_RUNNING_TASKS = 16
+# The reads that fit the customer model or scan the shop's records share their own 6
+# slots, so a burst of them can never take the 10 the money and membership tasks need (C20).
+HEAVY_TASKS = frozenset({"quiet_regulars", "shop_summary", "draft_campaign", "note_context", "results"})
+MAX_HEAVY_TASKS = 6
+MAX_OTHER_TASKS = 10
+MAX_RUNNING_TASKS = MAX_HEAVY_TASKS + MAX_OTHER_TASKS
 SLOT_WAIT_SECONDS = 60
 
 _TASK_PATH = re.compile(r"/tasks/([a-z_]{1,40})", re.ASCII)
@@ -106,6 +113,7 @@ def make_task_handler(
     log_kind: str,
     health_path: str | None = None,
     slots: threading.BoundedSemaphore | None = None,
+    heavy_slots: threading.BoundedSemaphore | None = None,
     slot_wait_seconds: float = SLOT_WAIT_SECONDS,
 ) -> type[BaseHTTPRequestHandler]:
     """A request handler class bound to one token, one fixed task registry and one set of names.
@@ -116,8 +124,10 @@ def make_task_handler(
     411, a longer body 413 (before it is read), a body that breaks those rules 400, a
     task that raises or answers with something other than a dict 500. With slots, a
     task waits up to slot_wait_seconds for one and is otherwise answered 503 without
-    running. A GET of health_path answers "ok" with no token; any other method gets
-    401 without the token and 405 with it. The token itself is never logged.
+    running; with heavy_slots too, a task named in HEAVY_TASKS waits for one of those
+    instead and never takes one of slots. A GET of health_path answers "ok" with no
+    token; any other method gets 401 without the token and 405 with it. The token
+    itself is never logged.
     """
     expected = token.encode("utf-8")
 
@@ -159,7 +169,8 @@ def make_task_handler(
             except TypeError:
                 self._answer(400, {"error": "wrong number of arguments for this task"})
                 return
-            if slots is not None and not slots.acquire(timeout=slot_wait_seconds):
+            pool = heavy_slots if heavy_slots is not None and match.group(1) in HEAVY_TASKS else slots
+            if pool is not None and not pool.acquire(timeout=slot_wait_seconds):
                 self._answer(503, {"error": "busy"}, task=match.group(1))
                 return
             try:
@@ -169,8 +180,8 @@ def make_task_handler(
                 self._answer(500, {"error": "the task failed"}, task=match.group(1))
                 return
             finally:
-                if slots is not None:
-                    slots.release()
+                if pool is not None:
+                    pool.release()
             if type(result) is not dict:
                 self._answer(500, {"error": "the task did not answer with an object"}, task=match.group(1))
                 return
@@ -243,7 +254,8 @@ def build_server(
         server_name="mend-task-server",
         log_kind="task_server",
         health_path=HEALTH_PATH,
-        slots=threading.BoundedSemaphore(MAX_RUNNING_TASKS),
+        slots=threading.BoundedSemaphore(MAX_OTHER_TASKS),
+        heavy_slots=threading.BoundedSemaphore(MAX_HEAVY_TASKS),
         slot_wait_seconds=slot_wait_seconds,
     )
     server = ThreadingHTTPServer((HOST, port), handler)

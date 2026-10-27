@@ -1,6 +1,9 @@
 """The payout item state machine: a stored status only ever moves forward (C10).
 
-PayPal's item statuses and where each may go next, from RD-BRIEF section 4.
+PayPal's item statuses and where each may go next, from RD-BRIEF section 4. A
+stored status may move to any status those arrows reach in one step or more, so an
+answer missed in between (PENDING, then RETURNED with the UNCLAIMED never seen)
+cannot strand an item. The arrows hold no loop, so no move ever leads back.
 FAILED, BLOCKED, RETURNED, REFUNDED and REVERSED are final. A status PayPal sends
 that is not one of these is stored as seen but counts as PENDING for every
 decision, so it can never stand in for SUCCESS, and a stale or reordered answer can
@@ -34,6 +37,20 @@ _NEXT: dict[str, frozenset[str]] = {
 }
 KNOWN_STATUSES = frozenset(_NEXT)
 FINAL_STATUSES = frozenset(status for status, onward in _NEXT.items() if not onward)
+
+
+def _reachable(start: str) -> frozenset[str]:
+    found: set[str] = set()
+    todo = list(_NEXT[start])
+    while todo:
+        status = todo.pop()
+        if status not in found:
+            found.add(status)
+            todo.extend(_NEXT[status])
+    return frozenset(found)
+
+
+_REACHABLE: dict[str, frozenset[str]] = {status: _reachable(status) for status in _NEXT}
 
 _STATUS_SHAPE = re.compile(r"[A-Z][A-Z_]{0,35}", re.ASCII)
 
@@ -72,13 +89,17 @@ def effective(status: str | None) -> str:
 
 
 def decide(previous: str | None, seen: str) -> Decision:
-    """Whether a stored status previous may become seen. previous None means the item is new."""
+    """Whether a stored status previous may become seen. previous None means the item is new.
+
+    "moved" when the arrows reach seen from previous in one step or more; never
+    backwards and never out of a final status.
+    """
     if previous is None:
         return "new"
     before, after = effective(previous), effective(seen)
     if before == after:
         return "unchanged"
-    if after in _NEXT[before]:
+    if after in _REACHABLE[before]:
         return "moved"
     return "refused"
 

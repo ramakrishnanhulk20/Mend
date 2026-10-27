@@ -535,7 +535,7 @@ def check_results(proof: Proof, conn: psycopg.Connection, campaign: dict) -> Non
     proof.note(
         f"simulated returns: rewarded {result.rewarded.simulated_returns}, holdout {result.holdout.simulated_returns}; "
         f"spend {usd(result.spend_minor)} USD (SUCCESS and PENDING items), fees {usd(result.fees_minor)} USD; "
-        f"one-sided p {result.p_value:.3f}; window open until {result.window_ends_at:%Y-%m-%d %H:%M} UTC"
+        f"one-sided p {'not yet' if result.p_value is None else format(result.p_value, '.3f')}; window open until {result.window_ends_at:%Y-%m-%d %H:%M} UTC"
     )
 
 

@@ -21,7 +21,10 @@ from datetime import date, datetime
 import psycopg
 from psycopg.types.json import Jsonb
 
-from mend_engine.campaigns.scoring import paid_net_of_refunds
+# end_of_day_utc is the boundary paid_net_of_refunds counts refunds up to, so the
+# refunds after it are exactly the ones that function left out.
+from mend_engine.campaigns.eligibility import sent_by_receiver
+from mend_engine.campaigns.scoring import end_of_day_utc, paid_net_of_refunds
 from mend_engine.campaigns.spend import CapExceeded, check_daily_cap, database_now
 from mend_engine.config import Config
 from mend_engine.members.membership import customer_refs_by_email
@@ -126,8 +129,10 @@ def approve(
     or awaiting approval; the snapshot rebuilt from its rows now must hash to
     presented_hash; and, against current data, every recipient must still be a
     member with a verified email, every amount at most the item cap, the campaign's
-    per-recipient amount and what that member has paid the shop net of refunds by
-    the campaign's as_of, the total at most the budget, the budget at most the
+    per-recipient amount and what that member paid the shop by the campaign's
+    as_of less every refund recorded up to now, less too, for a campaign no demo
+    session created, every reward that left the shop for that member in the last
+    365 days (eligibility.sent_by_receiver), the total at most the budget, the budget at most the
     campaign cap, the batch must pass validate_snapshot, and the total must fit
     under the rolling daily cap. Then the campaign moves to approved, the snapshot
     is frozen in approved_snapshots with approved_at and approved_by, and an audit
@@ -186,8 +191,10 @@ def set_amount(
     """Change one rewarded member's amount in a campaign that is not approved yet.
 
     On a draft or awaiting_approval campaign the amount must be whole cents from 1
-    up and at most the item cap, the campaign's per-recipient amount and what the
-    member has paid net of refunds by the campaign's as_of, and the new total at
+    up and at most the item cap, the campaign's per-recipient amount and the same
+    line approve() holds it to: what the member paid by the campaign's as_of less
+    every refund recorded up to now, less, for a campaign no demo session created,
+    every reward that left the shop for them in the last 365 days. The new total is at
     most the budget. On an approved campaign nothing changes but the approval,
     which is voided (void_reason "changed after approval"); a voided campaign is
     never sent. Writes one audit row either way.
@@ -210,8 +217,13 @@ def set_amount(
             raise EditRefused("amount_over_item_cap", "the amount is above the item cap")
         if amount_minor > per_recipient:
             raise EditRefused("amount_over_per_recipient", "the amount is above this campaign's amount per person")
-        if amount_minor > _paid_by_member(conn, as_of, [member_id]).get(member_id, 0):
-            raise EditRefused("amount_over_paid", "the amount is above what this member has paid net of refunds")
+        paid = _paid_by_member(conn, as_of, [member_id], every_refund=True).get(member_id, 0)
+        email = conn.execute("select paypal_email from members where member_id = %s", (member_id,)).fetchone()
+        sent = _owner_sent(conn, campaign_id).get(normalise_email(email[0]), 0) if email else 0
+        if amount_minor + sent > paid:
+            raise EditRefused(
+                "amount_over_paid", "the amount, with rewards sent in 365 days, is above what this member has paid net of refunds"
+            )
         others = conn.execute(
             "select coalesce(sum(amount_minor), 0) from campaign_members where campaign_id = %s and role = 'reward' and ref <> %s",
             (campaign_id, ref),
@@ -283,15 +295,18 @@ def _approve(conn: psycopg.Connection, campaign_id: uuid.UUID, approver: str, pr
     if not hmac.compare_digest(digest, presented):
         raise ApprovalRefused("hash_mismatch", "the campaign is not the one that was shown; review it again")
 
-    paid = _paid_by_member(conn, as_of, [r.member_id for r in recipients])
+    paid = _paid_by_member(conn, as_of, [r.member_id for r in recipients], every_refund=True)
+    sent = _owner_sent(conn, campaign_id)
     for number, recipient in enumerate(recipients, start=1):
         amount = recipient.amount_minor
         if amount > config.item_cap_minor:
             raise ApprovalRefused("amount_over_item_cap", f"item {number}: the amount is above the item cap")
         if amount > per_recipient:
             raise ApprovalRefused("amount_over_per_recipient", f"item {number}: the amount is above the amount per person")
-        if amount > paid.get(recipient.member_id, 0):
-            raise ApprovalRefused("amount_over_paid", f"item {number}: the amount is above what the member paid net of refunds")
+        if amount + sent.get(normalise_email(recipient.email), 0) > paid.get(recipient.member_id, 0):
+            raise ApprovalRefused(
+                "amount_over_paid", f"item {number}: the amount, with rewards sent in 365 days, is above what the member paid net of refunds"
+            )
     total = sum(r.amount_minor for r in recipients)
     if total > budget:
         raise ApprovalRefused("over_budget", "the amounts add up to more than the budget")
@@ -354,8 +369,23 @@ def _snapshot(campaign_id: uuid.UUID, shop_name: str, recipients: list[_Recipien
     )
 
 
-def _paid_by_member(conn: psycopg.Connection, as_of: date, member_ids: list) -> dict[uuid.UUID, int]:
-    """What each member's shop customer paid net of refunds, through the same match and sum the draft used."""
+def _owner_sent(conn: psycopg.Connection, campaign_id: uuid.UUID) -> dict[str, int]:
+    """Cents sent to each receiver in the last 365 days if no demo session created the campaign; nothing for one that did (C4).
+
+    An owner campaign is any campaign no demo session created, the rule eligibility drafts by.
+    """
+    owner_role = conn.execute("select role from campaign_owners where campaign_id = %s", (campaign_id,)).fetchone()
+    return sent_by_receiver(conn) if owner_role is None or owner_role[0] != "demo" else {}
+
+
+def _paid_by_member(
+    conn: psycopg.Connection, as_of: date, member_ids: list, *, every_refund: bool = False
+) -> dict[uuid.UUID, int]:
+    """What each member's shop customer paid by as_of net of refunds, through the same match and sum the draft used.
+
+    With every_refund, refunds recorded after as_of are taken off too: money the
+    shop has given back since the draft's day has still left it. Never below 0.
+    """
     emails = dict(
         conn.execute(
             "select member_id, paypal_email from members where member_id = any(%s) and email_verified", (member_ids,)
@@ -363,7 +393,19 @@ def _paid_by_member(conn: psycopg.Connection, as_of: date, member_ids: list) -> 
     )
     by_email = customer_refs_by_email(conn)
     customer_of = {m: by_email.get(normalise_email(e)) for m, e in emails.items()}
-    paid = paid_net_of_refunds(conn, as_of, [ref for ref in customer_of.values() if ref is not None])
+    refs = [ref for ref in customer_of.values() if ref is not None]
+    paid = paid_net_of_refunds(conn, as_of, refs)
+    if every_refund:
+        # paid_net_of_refunds already took off every refund before this same boundary, and a
+        # figure it floored at 0 stays at 0, so taking off the later ones gives paid less every refund.
+        later = dict(
+            conn.execute(
+                "select customer_ref, sum(amount_minor) from shop_refunds where refunded_at >= %s and customer_ref = any(%s) "
+                "group by customer_ref",
+                (end_of_day_utc(as_of), refs),
+            ).fetchall()
+        )
+        paid = {ref: max(total - int(later.get(ref, 0)), 0) for ref, total in paid.items()}
     return {m: paid.get(ref, 0) for m, ref in customer_of.items() if ref is not None}
 
 

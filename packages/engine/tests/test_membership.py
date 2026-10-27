@@ -1,6 +1,7 @@
 # Not covered here: Log in with PayPal itself (the web app's join callback), two
-# joins or a join and a leave racing on separate connections, and the app's
-# database role (not created yet).
+# joins or a join and a leave racing on separate connections, the app's database
+# role (test_app_role.py), and leaving by payer id (test_join_tasks.py, where
+# tasks.leave looks the member up).
 import uuid
 from collections.abc import Iterator
 
@@ -144,17 +145,90 @@ def test_a_verified_member_joining_again_unverified_is_never_downgraded(conn: ps
     assert conn.execute(AUDIT_ROWS).fetchall() == audit_before
 
 
-def test_an_upgrade_carrying_another_payer_id_is_refused_and_writes_nothing(conn: psycopg.Connection) -> None:
-    join(conn, "c7@shop.example", "PAYERAAAA", email_verified=False)
-    before = conn.execute(MEMBER_ROW).fetchall()
+def test_a_verified_join_replaces_an_unverified_row_holding_its_email_and_that_rows_payer_id(conn: psycopg.Connection) -> None:
+    squatter = join(conn, "c7@shop.example", "PAYERAAAA", email_verified=False)
     audit_before = conn.execute(AUDIT_ROWS).fetchall()
 
-    with pytest.raises(MembershipRefused) as refused:
-        join(conn, "c7@shop.example", "PAYERBBBB", email_verified=True)
+    owner = join(conn, "C7@shop.example", "PAYERBBBB", email_verified=True)
 
-    assert refused.value.reason == "identity_conflict"
+    assert owner != squatter
+    assert conn.execute("select member_id, paypal_email, paypal_payer_id, email_verified, source from members").fetchall() == [
+        (owner, "c7@shop.example", "PAYERBBBB", True, "paypal_login")
+    ]
+    new_rows = conn.execute(AUDIT_ROWS).fetchall()[len(audit_before):]
+    assert new_rows == [("member_replaced_unverified", {"member_id": str(owner), "replaced_member_id": str(squatter)})]
+    # The squatter's PayPal account is free again, so it can join under an address of its own.
+    assert join(conn, "squatter@shop.example", "PAYERAAAA") not in (owner, squatter)
+
+
+def test_replacing_an_unverified_row_voids_any_campaign_that_held_it(conn: psycopg.Connection) -> None:
+    squatter = join(conn, "c7@shop.example", "PAYERAAAA", email_verified=False)
+    held = campaign(conn, "draft", squatter)
+
+    join(conn, "c7@shop.example", "PAYERBBBB")
+
+    assert statuses(conn) == {held: ("voided", "an unverified member was replaced")}
+    assert conn.execute("select count(*) from campaign_members").fetchone()[0] == 0
+
+
+def test_a_script_joins_stand_ins_as_seed_rows_under_its_own_name_and_never_crosses_a_persons_row(conn: psycopg.Connection) -> None:
+    person = join(conn, "person@shop.example")
+    stand_in = join(conn, "c9@shop.example", actor="seed_demo")
+
+    assert dict(conn.execute("select member_id, source from members")) == {person: "paypal_login", stand_in: "seed"}
+    assert conn.execute("select actor, detail from audit_log where action = 'member_joined' order by id").fetchall() == [
+        ("member", {"member_id": str(person), "consent_version": CONSENT_VERSION}),
+        ("seed_demo", {"member_id": str(stand_in), "consent_version": CONSENT_VERSION}),
+    ]
+    before = conn.execute(MEMBER_ROW).fetchall()
+    assert join(conn, "person@shop.example", actor="seed_demo") == person
+    with pytest.raises(MembershipRefused) as joined_over:
+        join(conn, "C9@shop.example", "PAYERCCCC")
+    assert joined_over.value.reason == "identity_conflict"
     assert conn.execute(MEMBER_ROW).fetchall() == before
-    assert conn.execute(AUDIT_ROWS).fetchall() == audit_before
+    with pytest.raises(MembershipRefused) as bad_actor:
+        join(conn, "x@shop.example", actor="Seed Demo")
+    assert bad_actor.value.reason == "bad_input"
+
+
+CONSENT_2026_10_27 = (
+    "Wolf and Wren Gifts may look at your past orders with them and send thank-you cashback to this PayPal account. "
+    "To learn whether it works, a random share of customers is held back each time and gets no cashback that round, "
+    "and later purchases are counted to measure the result. Thank-you notes are written with AI from the names of "
+    "items you bought. Mend keeps your PayPal email, its verification status and your PayPal account ID for this. "
+    "You can leave at any time."
+)
+
+
+def test_the_consent_names_the_holdout_the_measurement_the_ai_notes_and_the_data_kept() -> None:
+    from mend_engine.members.consent import ACCEPTED_CONSENT_VERSIONS
+
+    assert (CONSENT_VERSION, consent_text_for(DEMO_SHOP_NAME)) == ("2026-10-27.1", CONSENT_2026_10_27)
+    assert ACCEPTED_CONSENT_VERSIONS == {"2026-10-27.1"}
+
+
+def test_a_verified_member_on_an_earlier_wording_who_joins_again_agrees_to_the_current_one(conn: psycopg.Connection) -> None:
+    member = join(conn, "c8@shop.example", "PAYERRECON")
+    conn.execute(
+        "update members set consent_version = '2026-10-20.1', consent_text_sha256 = %s, client_id = 'old-client', "
+        "joined_at = now() - interval '7 days'",
+        ("0" * 64,),
+    )
+    audit_before = conn.execute(AUDIT_ROWS).fetchall()
+
+    assert join(conn, "C8@shop.example", "PAYERRECON") == member
+
+    assert conn.execute(
+        "select consent_version, consent_text_sha256, client_id, joined_at > now() - interval '1 minute' from members"
+    ).fetchone() == (CONSENT_VERSION, consent_hash(consent_text_for(DEMO_SHOP_NAME)), CLIENT_ID, True)
+    new_rows = conn.execute(AUDIT_ROWS).fetchall()[len(audit_before):]
+    assert new_rows == [("member_reconsented", {"member_id": str(member), "consent_version": CONSENT_VERSION})]
+
+    # An unverified sign-in proves nothing about who owns the email, so it never re-consents anyone.
+    conn.execute("update members set consent_version = '2026-10-20.1'")
+    before = conn.execute(MEMBER_ROW).fetchall()
+    assert join(conn, "c8@shop.example", email_verified=False) == member
+    assert conn.execute(MEMBER_ROW).fetchall() == before
 
 
 @pytest.mark.parametrize(

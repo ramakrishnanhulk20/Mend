@@ -609,6 +609,35 @@ def test_batch_reads_take_at_most_10_a_run_oldest_first_and_one_paypal_cannot_an
     assert printed(capsys) == [refreshed(batches=10, restored=9, failed=1), refreshed(batches=2, restored=2)]
 
 
+def test_a_batch_read_that_answers_denied_records_every_snapshot_item_as_failed(
+    database: psycopg.Connection, paypal: JobsPayPal, capsys: pytest.CaptureFixture[str]
+) -> None:
+    listed_id, listed = sent_campaign(database, "owner", 60, 3)
+    unlisted_id, unlisted = sent_campaign(database, "owner", 50, 2)
+    set_status(database, listed[0], "PENDING")
+    lost_rows(database, listed[1:] + unlisted)
+    _, empty = held_batch(database, paypal, listed_id, [])
+    _, bare = held_batch(database, paypal, unlisted_id, [])
+    del bare["items"]
+    for answer_body in (empty, bare):
+        answer_body["batch_header"]["batch_status"] = "DENIED"
+
+    assert jobs.main(["refresh_items"]) == 0
+
+    assert printed(capsys) == [refreshed(batches=2)]
+    for campaign_id, count in ((listed_id, 3), (unlisted_id, 2)):
+        rows = database.execute(
+            "select i.sender_item_id, i.status from payout_items i join payout_batches b using (sender_batch_id) "
+            "where b.campaign_id = %s order by i.sender_item_id",
+            (str(campaign_id),),
+        ).fetchall()
+        assert rows == [(f"R{n}", "FAILED") for n in range(1, count + 1)]
+    assert database.execute("select status from payout_items where payout_item_id = %s", (listed[0],)).fetchone() == ("FAILED",)
+    rereads = [row[0] for row in database.execute("select detail from audit_log where action = 'payout_batch_reread' order by id")]
+    assert [(r["outcome"], r["items_failed"]) for r in rereads] == [("denied", 3), ("denied", 2)]
+    assert jobs.main(["refresh_items"]) == 0 and len(paypal.batch_reads) == 2
+
+
 def sent_with_member(conn: psycopg.Connection) -> uuid.UUID:
     """A campaign whose rewarded member is R1, sent a day ago, so a purchase an hour ago is in its window."""
     campaign_id = conn.execute(

@@ -8,6 +8,8 @@ Refunds lower what a customer has paid, never their purchase days.
 
 from __future__ import annotations
 
+import threading
+from collections import OrderedDict
 from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta, timezone
@@ -24,6 +26,12 @@ from mend_engine.shop.import_orders import SOURCE_ZONE as SHOP_ZONE
 
 HORIZON_WEEKS = 13
 UNIT_DAYS = 7.0
+# A fit reads every order and runs an optimiser, the heaviest thing a visitor can
+# start; one kept per day and data version means a burst of page loads costs one fit.
+SCORE_CACHE_ENTRIES = 4
+_SCORE_CACHE: OrderedDict[tuple, ScoreSet] = OrderedDict()
+_CACHE_LOCK = threading.Lock()
+_FIT_LOCK = threading.Lock()
 
 
 @dataclass
@@ -52,7 +60,7 @@ def _check_day(as_of: date) -> None:
         raise ValueError("as_of must be a date, not a datetime")
 
 
-def _end_of_day_utc(as_of: date) -> datetime:
+def end_of_day_utc(as_of: date) -> datetime:
     return datetime.combine(as_of + timedelta(days=1), time.min, tzinfo=SHOP_ZONE).astimezone(timezone.utc)
 
 
@@ -68,7 +76,7 @@ def paid_net_of_refunds(
     Raises ValueError if as_of is not a plain date.
     """
     _check_day(as_of)
-    end = _end_of_day_utc(as_of)
+    end = end_of_day_utc(as_of)
     only = "" if customer_refs is None else " and customer_ref = any(%s)"
     args: tuple = (end,) if customer_refs is None else (end, list(customer_refs))
     paid = dict(
@@ -88,6 +96,24 @@ def paid_net_of_refunds(
     return {ref: max(int(total) - int(refunded.get(ref, 0)), 0) for ref, total in paid.items()}
 
 
+def net_of_later_refunds(conn: psycopg.Connection, scores: ScoreSet, customer_refs: Sequence[str]) -> dict[str, int]:
+    """scores.paid_minor for each of customer_refs, less every refund recorded after the end of the London day scores.as_of.
+
+    scores.paid_minor already nets the refunds up to as_of, so this is what each
+    customer paid by as_of net of every refund on record now, never below 0 (C4): a
+    refund recorded after the scoring day still lowers what a draft may pay. A ref
+    with no paid amount counts as 0.
+    """
+    later = dict(
+        conn.execute(
+            "select customer_ref, sum(amount_minor) from shop_refunds where refunded_at >= %s and customer_ref = any(%s) "
+            "group by customer_ref",
+            (end_of_day_utc(scores.as_of), list(customer_refs)),
+        )
+    )
+    return {ref: max(scores.paid_minor.get(ref, 0) - int(later.get(ref, 0)), 0) for ref in customer_refs}
+
+
 def score_customers(conn: psycopg.Connection, as_of: date) -> ScoreSet:
     """Fit BG/NBD on every shop customer's purchase days up to as_of and score them.
 
@@ -96,10 +122,66 @@ def score_customers(conn: psycopg.Connection, as_of: date) -> ScoreSet:
     fit that does not converge, or that cannot run at all (nobody had bought by
     as_of), comes back with converged False and no scores, never a fallback.
 
+    The answer is kept in this process's memory for as_of and the data version
+    (_data_version), at most SCORE_CACHE_ENTRIES of them, least recently used
+    dropped first, so asking again costs one small query instead of a fit (C20).
+    One fit runs at a time in the process. Every caller gets its own copy.
+
     Raises ValueError if as_of is not a plain date.
     """
     _check_day(as_of)
-    end = _end_of_day_utc(as_of)
+    key = (as_of, *_data_version(conn))
+    with _CACHE_LOCK:
+        kept = _SCORE_CACHE.get(key)
+        if kept is not None:
+            _SCORE_CACHE.move_to_end(key)
+            return _copy(kept)
+    with _FIT_LOCK:
+        # Another caller may have fitted the same scores while this one waited.
+        with _CACHE_LOCK:
+            kept = _SCORE_CACHE.get(key)
+        if kept is None:
+            kept = _fit_scores(conn, as_of)
+        with _CACHE_LOCK:
+            _SCORE_CACHE[key] = kept
+            _SCORE_CACHE.move_to_end(key)
+            while len(_SCORE_CACHE) > SCORE_CACHE_ENTRIES:
+                _SCORE_CACHE.popitem(last=False)
+    return _copy(kept)
+
+
+def _data_version(conn: psycopg.Connection) -> tuple:
+    """Which records the scores are read from, and a cheap mark of what they hold.
+
+    The server, database and schema, then for shop_orders and for shop_refunds the
+    row count, largest key, money total and latest time. Any added, removed or
+    re-priced row changes it. Not covered: an edit in place that keeps all four the
+    same; the shop's records are only ever added to by the importers.
+    """
+    row = conn.execute(
+        "select current_database(), current_schema(), "
+        "(select count(*) from shop_orders), (select max(order_ref) from shop_orders), "
+        "(select coalesce(sum(total_minor), 0) from shop_orders), (select max(ordered_at) from shop_orders), "
+        "(select count(*) from shop_refunds), (select max(refund_ref) from shop_refunds), "
+        "(select coalesce(sum(amount_minor), 0) from shop_refunds), (select max(refunded_at) from shop_refunds)"
+    ).fetchone()
+    return (conn.info.host, conn.info.port, *row)
+
+
+def _copy(scores: ScoreSet) -> ScoreSet:
+    return ScoreSet(
+        scores.converged,
+        scores.message,
+        dict(scores.scores),
+        dict(scores.purchase_days),
+        dict(scores.days_silent),
+        dict(scores.paid_minor),
+        scores.as_of,
+    )
+
+
+def _fit_scores(conn: psycopg.Connection, as_of: date) -> ScoreSet:
+    end = end_of_day_utc(as_of)
 
     days: dict[str, set[date]] = {}
     rows = conn.execute(

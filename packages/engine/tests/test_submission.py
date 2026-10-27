@@ -117,15 +117,22 @@ def balance_answer(balance: str | int) -> httpx.Response:
 class FakePayPal:
     """Answers the token, balance and batch calls; post decides each Payouts answer. Thread safe.
 
-    balance is the USD available balance as PayPal writes it, or an HTTP status to fail with.
+    balance is the USD available balance as PayPal writes it, or an HTTP status to fail
+    with; it stays the same after a batch leaves, as PayPal's lagging report does.
+    balance_delay is how long each balance read takes.
     """
 
     def __init__(
-        self, post: Callable[[dict], httpx.Response], gets: dict[str, httpx.Response] | None = None, balance: str | int = "5033.32"
+        self,
+        post: Callable[[dict], httpx.Response],
+        gets: dict[str, httpx.Response] | None = None,
+        balance: str | int = "5033.32",
+        balance_delay: float = 0.0,
     ) -> None:
         self.post = post
         self.gets = gets or {}
         self.balance = balance
+        self.balance_delay = balance_delay
         self.payout_posts: list[dict] = []
         self.get_paths: list[str] = []
         self.balance_reads = 0
@@ -137,6 +144,7 @@ class FakePayPal:
         if request.method == "GET" and request.url.path == BALANCES_PATH:
             with self._lock:
                 self.balance_reads += 1
+            time.sleep(self.balance_delay)
             return balance_answer(self.balance)
         if request.method == "POST" and request.url.path == payouts.PAYOUTS_PATH:
             body = json.loads(request.content)
@@ -461,3 +469,78 @@ def test_a_frozen_snapshot_altered_behind_the_triggers_back_is_never_sent(conn: 
     with pytest.raises(SnapshotRefused):
         submit(conn, paypal.http(), campaign_id, CONFIG)
     assert paypal.payout_posts == [] and state(conn, campaign_id) == (("approved", None), [])
+
+
+def numbered(paypal: FakePayPal) -> Callable[[dict], httpx.Response]:
+    """Creates each batch under its own payout_batch_id, BATCH1 first."""
+    return lambda body: created(body, f"BATCH{len(paypal.payout_posts)}")
+
+
+def first_claimed_hours_ago(conn: psycopg.Connection, campaign_id: uuid.UUID, hours: int) -> None:
+    conn.execute("update payout_batches set created_at = created_at - make_interval(hours => %s) where campaign_id = %s", (hours, str(campaign_id)))
+    # The record of moves is append-only; the guard is off only to stage an old move.
+    conn.execute("alter table campaign_status_moves disable trigger campaign_status_moves_append_only")
+    conn.execute("update campaign_status_moves set moved_at = moved_at - make_interval(hours => %s) where campaign_id = %s", (hours, campaign_id))
+    conn.execute("alter table campaign_status_moves enable trigger campaign_status_moves_append_only")
+
+
+def test_the_room_counts_mends_own_batches_of_the_last_6_hours_against_a_balance_that_lags(conn: psycopg.Connection) -> None:
+    # Each campaign is 550 cents plus 25 cents for each of its 2 items: 600. PayPal still reports 260.00 after the first leaves.
+    first = approved_campaign(conn)
+    second = approved_campaign(conn, first=10)
+    lagging = FakePayPal(created, balance="260.00")
+    lagging.post = numbered(lagging)
+    assert submit(conn, lagging.http(), first, CONFIG).status == "submitted"
+
+    with pytest.raises(BalanceTooLow) as caught:
+        submit(conn, lagging.http(), second, CONFIG)
+
+    assert caught.value.code == "low_balance" and len(lagging.payout_posts) == 1
+    assert state(conn, second) == (("approved", None), [])
+    # A batch more than 6 hours old is taken to be in PayPal's figure already.
+    first_claimed_hours_ago(conn, first, 7)
+    assert submit(conn, lagging.http(), second, CONFIG).status == "submitted"
+
+
+def test_two_campaigns_sent_at_the_same_moment_cannot_both_spend_the_same_room(
+    conn: psycopg.Connection, server_url: str, schema: str
+) -> None:
+    # 260.00 covers one 600-cent batch over the 25000 floor, not two. Each read takes 0.3 s, so without
+    # one lock over read, check and claim both senders would read 260.00 before either claimed.
+    campaigns = [approved_campaign(conn), approved_campaign(conn, first=10)]
+    paypal = FakePayPal(created, balance="260.00", balance_delay=0.3)
+    paypal.post = numbered(paypal)
+    connections = [open_conn(server_url, schema) for _ in campaigns]
+    start = threading.Barrier(len(campaigns))
+    outcomes: list = []
+
+    def run(connection: psycopg.Connection, campaign_id: uuid.UUID) -> None:
+        start.wait()
+        try:
+            outcomes.append(submit(connection, paypal.http(), campaign_id, CONFIG).status)
+        except BalanceTooLow as short:
+            outcomes.append(short.code)
+
+    threads = [threading.Thread(target=run, args=pair) for pair in zip(connections, campaigns)]
+    try:
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=60)
+    finally:
+        for connection in connections:
+            connection.close()
+
+    assert sorted(outcomes) == ["low_balance", "submitted"] and len(paypal.payout_posts) == 1
+
+
+def test_paypal_error_text_reaches_the_audit_log_only_in_the_shape_paypal_uses(conn: psycopg.Connection) -> None:
+    odd = {"name": "<img src=x onerror=alert(1)>", "debug_id": "d1 forged line"}
+    refused = approved_campaign(conn)
+    assert submit(conn, FakePayPal(lambda _b: httpx.Response(422, json=odd)).http(), refused, CONFIG).status == "voided"
+    unknown = approved_campaign(conn, first=10)
+    assert submit(conn, FakePayPal(lambda _b: httpx.Response(503, json=odd)).http(), unknown, CONFIG).status == "submission_unknown"
+
+    for action in ("payout_voided", "payout_submission_unknown"):
+        [detail] = [row[0] for row in conn.execute("select detail from audit_log where action = %s", (action,))]
+        assert (detail["name"], detail["debug_id"]) == (None, None), action

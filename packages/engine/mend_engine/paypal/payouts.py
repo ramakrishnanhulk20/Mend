@@ -44,6 +44,10 @@ _LETTER_RUN = re.compile(r"[a-z]+", re.ASCII)
 # A word, a dot and two or more letters with no space between, such as "evil.example"
 # or "x.co": the same pattern the web app's note rule uses.
 _DOMAIN_LIKE = re.compile(r"[A-Za-z0-9-]\.[A-Za-z]{2,}", re.ASCII)
+# Ways of writing a dot so a link slips past a check for ".": "[.]", "(.)", "{.}" and
+# " dot " in any case. Read as "." before the link check. The engine is the last gate
+# before PayPal, so it holds the strictest form of the rule.
+_SPELLED_DOT = re.compile(r"\[\.\]|\(\.\)|\{\.\}|\s+dot\s+(?=(?:com|net|org|io|co|info|biz|shop|store|app|dev|xyz|me|us|uk|example)\b)", re.ASCII | re.IGNORECASE)
 # PayPal's Payouts Terms forbid implying PayPal or Venmo sponsors the offer; a note
 # never needs to name either.
 _PAYMENT_BRANDS = {"paypal": "PayPal", "venmo": "Venmo"}
@@ -195,7 +199,8 @@ def sender_batch_id_for(snapshot: BatchSnapshot) -> str:
 def _text_problem(text: object, max_chars: int) -> str | None:
     """Why text may not reach a customer's inbox, or None if it may.
 
-    Allows printable ASCII only. Covers links and domain-like words, markup (any "<"
+    Allows printable ASCII only. Covers links and domain-like words, with "[.]",
+    "(.)", "{.}" and " dot " read as a dot first, markup (any "<"
     or ">"), email addresses, long numbers such as phone or card numbers (7 or more
     digits in a row once every character that is not a letter or a digit is removed,
     so "415*555*0199" counts as one run), control characters, sandbox test codes and
@@ -217,7 +222,8 @@ def _text_problem(text: object, max_chars: int) -> str | None:
     if "<" in text or ">" in text:
         return "has markup"
     lowered = text.lower()
-    if "http" in lowered or "www." in lowered or _DOMAIN_LIKE.search(text):
+    dotted = _SPELLED_DOT.sub(".", text)
+    if "http" in lowered or "www." in dotted.lower() or _DOMAIN_LIKE.search(dotted):
         return "looks like a link"
     if "@" in text:
         return "contains @"
@@ -267,7 +273,7 @@ def validate_snapshot(snapshot: BatchSnapshot, config: Config) -> None:
     per-item cap; a total above the campaign cap; a currency other than USD; a
     malformed receiver, campaign id or sender_item_id; a note or subject that is
     empty, too long, non-ASCII, has a control character, "<" or ">", "http", "www.",
-    a domain-like word, "@", a run of 7 or more digits once every character that is
+    a domain-like word (with "[.]", "(.)", "{.}" and " dot " read as a dot), "@", a run of 7 or more digits once every character that is
     not a letter or a digit is removed, starts with a sandbox test code, or names
     PayPal or Venmo.
     """

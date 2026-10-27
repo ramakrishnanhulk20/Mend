@@ -7,6 +7,13 @@ shop), by calling their functions, and writes one model_facts row for each:
 proof, pass or fail, because the landing page shows what was measured, never a
 number nobody measured (6j). A proof that could not run at all stores nothing.
 
+The backtest row's headline is "headline": the model against recency inside the
+live segment, the customers campaigns actually rank, with 95 percent intervals.
+"all_customers" is the same measure over every customer, labelled as such. The
+older keys keep their meaning: cutoffs, converged, model_wins and mean_auc_gain
+are the all-customer numbers, deciles the all-customer decile table, and passed
+prove_backtest's own bar, which is about all customers.
+
 shop_summary reads the rows back through read_facts(), which checks each one against
 the exact shape written here, so a row of any other shape is treated as missing.
 Prints what it stored and ends with STORE FACTS RESULT: PASS only if both proofs met
@@ -31,7 +38,16 @@ from mend_engine.config import ConfigError, load_config
 from mend_engine.data.uci import CACHE_DIR, SourceError, ensure_source
 from mend_engine.db.connect import connect
 from mend_engine.db.migrate import migrate
-from mend_engine.model.backtest import decile_table, purchase_days_from_uci, run_cutoff
+from mend_engine.campaigns import eligibility
+from mend_engine.model.backtest import (
+    CONFIDENCE,
+    RESAMPLES,
+    Backtest,
+    GroupResult,
+    decile_table,
+    purchase_days_from_uci,
+    run_backtest,
+)
 from mend_engine.model.benchmark import PUBLISHED, SAMPLE_CUSTOMERS, reproduce
 
 ENV_PATH = Path(__file__).resolve().parents[3] / ".env"
@@ -40,6 +56,18 @@ UCI_KEY = "uci_backtest"
 CDNOW_SOURCE = "CDNOW sample, Fader, Hardie and Lee (2005)"
 UCI_SOURCE = "UCI Online Retail II (Chen 2012, CC BY 4.0)"
 PARAMETERS = ("r", "alpha", "a", "b", "log_likelihood")
+UCI_KEYS = frozenset({"source", "holdout_days", "cutoffs", "converged", "model_wins", "mean_auc_gain", "decile_cutoff", "deciles", "passed"})
+# Rows stored before these two keys existed are still read; a row with only one of them is not.
+UCI_GROUP_KEYS = frozenset({"headline", "all_customers"})
+LIVE_SEGMENT = "live segment"
+ALL_CUSTOMERS = "all customers"
+_GROUP_KEYS = frozenset({
+    "group", "regular_min_days", "silent_min_days", "confidence", "resamples", "valid_cutoffs",
+    "model_wins", "mean_auc_difference", "interval_low", "interval_high", "cutoffs",
+})
+_GROUP_CUTOFF_KEYS = frozenset({
+    "cutoff", "customers", "returned", "auc_model", "auc_recency", "difference", "interval_low", "interval_high",
+})
 
 _UPSERT = (
     "insert into model_facts (key, value) values (%s, %s) "
@@ -76,10 +104,14 @@ def cdnow_fact() -> dict:
 def uci_fact() -> dict:
     """The backtest at prove_backtest's cutoffs: AUC of the model against recency, and the latest decile table.
 
-    Raises SourceError or ValueError when the UCI file cannot be read or scored.
+    headline is the live segment's result and all_customers the all-customer one,
+    each per cutoff and pooled, with 95 percent bootstrap intervals (see
+    _group_fact). Raises SourceError or ValueError when the UCI file cannot be read
+    or scored.
     """
     days = purchase_days_from_uci(ensure_source(CACHE_DIR))
-    results = [run_cutoff(days, cutoff, prove_backtest.HOLDOUT_DAYS) for cutoff in prove_backtest.CUTOFFS]
+    run = run_backtest(days, prove_backtest.CUTOFFS, prove_backtest.HOLDOUT_DAYS)
+    results = run.results
     for result in results:
         print(prove_backtest.cutoff_line(result), flush=True)
     converged = [r for r in results if r.converged]
@@ -106,6 +138,46 @@ def uci_fact() -> dict:
         "decile_cutoff": latest.isoformat() if latest else None,
         "deciles": [{"decile": n, "customers": int(size), "returned_share": float(rate)} for n, size, rate in deciles],
         "passed": len(converged) >= prove_backtest.MIN_CONVERGED and wins == len(converged),
+        "headline": _group_fact(run, "live_segment"),
+        "all_customers": _group_fact(run, "all_customers"),
+    }
+
+
+def _group_fact(run: Backtest, name: str) -> dict:
+    """One group's record: per cutoff and pooled over the valid cutoffs, model minus recency with its interval.
+
+    regular_min_days and silent_min_days are the live rule for the live segment and
+    None for all customers. A valid cutoff is one where the difference is defined:
+    the fit converged and the group holds customers who came back and customers who
+    did not. Interval bounds are None where the group was too small to resample.
+    """
+    summary = getattr(run, name)
+    live = name == "live_segment"
+    return {
+        "group": LIVE_SEGMENT if live else ALL_CUSTOMERS,
+        "regular_min_days": eligibility.REGULAR_MIN_DAYS if live else None,
+        "silent_min_days": eligibility.SILENT_MIN_DAYS if live else None,
+        "confidence": CONFIDENCE,
+        "resamples": RESAMPLES,
+        "valid_cutoffs": summary.valid,
+        "model_wins": summary.model_wins,
+        "mean_auc_difference": summary.mean_difference,
+        "interval_low": summary.low,
+        "interval_high": summary.high,
+        "cutoffs": [_group_cutoff_fact(result.cutoff, getattr(result, name)) for result in run.results],
+    }
+
+
+def _group_cutoff_fact(cutoff: date, group: GroupResult) -> dict:
+    return {
+        "cutoff": cutoff.isoformat(),
+        "customers": group.customers,
+        "returned": group.returned,
+        "auc_model": group.auc_model,
+        "auc_recency": group.auc_recency,
+        "difference": group.difference,
+        "interval_low": group.low,
+        "interval_high": group.high,
     }
 
 
@@ -122,6 +194,14 @@ def _day(value: object) -> bool:
 
 def _whole(value: object, low: int = 0) -> bool:
     return type(value) is int and value >= low
+
+
+def _between(value: object, low: float, high: float) -> bool:
+    return _number(value) and low <= value <= high
+
+
+def _bounds_ok(low: object, high: object) -> bool:
+    return (low is None and high is None) or (_between(low, -1, 1) and _between(high, -1, 1) and low <= high)
 
 
 def _cdnow_ok(value: dict) -> bool:
@@ -160,11 +240,57 @@ def _decile_ok(entry: object) -> bool:
     )
 
 
-def _uci_ok(value: dict) -> bool:
-    keys = {"source", "holdout_days", "cutoffs", "converged", "model_wins", "mean_auc_gain", "decile_cutoff", "deciles", "passed"}
+def _group_cutoff_ok(entry: object) -> bool:
+    if type(entry) is not dict or set(entry) != _GROUP_CUTOFF_KEYS:
+        return False
+    measured = entry["auc_model"] is not None and entry["auc_recency"] is not None
     return (
-        set(value) == keys
-        and value["source"] == UCI_SOURCE
+        _day(entry["cutoff"])
+        and _whole(entry["customers"])
+        and _whole(entry["returned"])
+        and entry["returned"] <= entry["customers"]
+        and all(entry[key] is None or _between(entry[key], 0, 1) for key in ("auc_model", "auc_recency"))
+        and (_between(entry["difference"], -1, 1) if measured else entry["difference"] is None)
+        and _bounds_ok(entry["interval_low"], entry["interval_high"])
+        and (measured or entry["interval_low"] is None)
+    )
+
+
+def _group_ok(value: object, label: str, rule: tuple[int | None, int | None], days: list) -> bool:
+    if type(value) is not dict or set(value) != _GROUP_KEYS or value["group"] != label:
+        return False
+    if type(value["cutoffs"]) is not list or not all(_group_cutoff_ok(entry) for entry in value["cutoffs"]):
+        return False
+    differences = [entry["difference"] for entry in value["cutoffs"] if entry["difference"] is not None]
+    return (
+        [entry["cutoff"] for entry in value["cutoffs"]] == days
+        and all(type(stored) is type(wanted) and stored == wanted for stored, wanted in zip((value["regular_min_days"], value["silent_min_days"]), rule))
+        and value["confidence"] == CONFIDENCE
+        and type(value["resamples"]) is int and value["resamples"] == RESAMPLES
+        and value["valid_cutoffs"] == len(differences)
+        and value["model_wins"] == sum(1 for d in differences if d > 0)
+        and (_between(value["mean_auc_difference"], -1, 1) if differences else value["mean_auc_difference"] is None)
+        and _bounds_ok(value["interval_low"], value["interval_high"])
+        and (bool(differences) or value["interval_low"] is None)
+    )
+
+
+def _uci_ok(value: dict) -> bool:
+    keys = set(value)
+    if keys not in (UCI_KEYS, UCI_KEYS | UCI_GROUP_KEYS):
+        return False
+    if keys == UCI_KEYS | UCI_GROUP_KEYS:
+        # The headline must describe the rule campaigns use today, so a row stored
+        # under an older rule reads as missing rather than as today's number.
+        days = [entry["cutoff"] for entry in value["cutoffs"]] if type(value["cutoffs"]) is list else None
+        live_rule = (eligibility.REGULAR_MIN_DAYS, eligibility.SILENT_MIN_DAYS)
+        if not (
+            _group_ok(value["headline"], LIVE_SEGMENT, live_rule, days)
+            and _group_ok(value["all_customers"], ALL_CUSTOMERS, (None, None), days)
+        ):
+            return False
+    return (
+        value["source"] == UCI_SOURCE
         and _whole(value["holdout_days"], 1)
         and type(value["cutoffs"]) is list
         and 1 <= len(value["cutoffs"]) <= 20

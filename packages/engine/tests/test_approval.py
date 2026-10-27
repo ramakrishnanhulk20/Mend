@@ -165,6 +165,8 @@ REFUSALS: list[tuple[str, Callable, Config, str]] = [
     ("an amount over the item cap", lambda c, i, k: None, replace(CONFIG, item_cap_minor=299), "amount_over_item_cap"),
     ("an amount over the amount per person", lambda c, i, k: c.execute("update campaigns set per_recipient_minor = 299"), CONFIG, "amount_over_per_recipient"),
     ("a refund since the draft", lambda c, i, k: c.execute("insert into shop_refunds values ('C900000', 'C2', '2026-07-01 12:00+00', 701)"), CONFIG, "amount_over_paid"),
+    # The campaign's as_of is 16 Oct; money given back after it has still left the shop.
+    ("a refund recorded after the as_of", lambda c, i, k: c.execute("insert into shop_refunds values ('C900001', 'C2', '2026-10-20 12:00+00', 701)"), CONFIG, "amount_over_paid"),
     ("a total over the budget", lambda c, i, k: c.execute("update campaigns set budget_minor = 549"), CONFIG, "over_budget"),
     ("a budget over the campaign cap", lambda c, i, k: None, replace(CONFIG, campaign_cap_minor=999), "budget_over_cap"),
     ("a note the payout rules refuse", lambda c, i, k: c.execute("update campaign_members set note = 'Write to us@shop' where ref = 'R1'"), CONFIG, "snapshot_refused"),
@@ -189,6 +191,64 @@ def test_each_rule_is_rechecked_against_current_data_at_approval(
     assert status(conn, campaign_id)[0] in ("draft", "voided")
     assert conn.execute("select count(*) from approved_snapshots where campaign_id = %s", (campaign_id,)).fetchone()[0] == 0
     assert audit(conn, "approval_refused") == [{"campaign_id": str(campaign_id), "reason": reason}]
+
+
+def sent_reward(conn: psycopg.Connection, receiver: str, amount_minor: int, days_ago: int) -> None:
+    """One reward that left the shop days_ago, through a campaign holding no member rows."""
+    other = conn.execute(
+        "insert into campaigns (shop_name, goal_text, as_of, budget_minor, per_recipient_minor, holdout_share, status) "
+        "values ('Shop', 'goal', '2026-10-16', 5000, 5000, 0.5, 'submitted') returning campaign_id"
+    ).fetchone()[0]
+    snap = BatchSnapshot(str(other), "USD", "A thank-you", (PayoutItemSpec(receiver, amount_minor, "Thanks", "R1"),))
+    conn.execute("insert into approved_snapshots values (%s, %s, %s, now(), 'owner')", (other, snapshot_hash(snap), canonical_json(snap)))
+    conn.execute(
+        "insert into payout_batches (sender_batch_id, campaign_id, snapshot_hash, status, created_at) "
+        "values (%s, %s, %s, 'created', now() - make_interval(days => %s))",
+        (sender_batch_id_for(snap), str(other), snapshot_hash(snap), days_ago),
+    )
+
+
+def test_an_owner_approval_counts_rewards_sent_in_the_last_365_days_against_what_each_member_paid(conn: psycopg.Connection) -> None:
+    ids = members(conn)  # each paid 1000
+    campaign_id = draft(conn, ids, [250, 300])
+    sent_reward(conn, "c1@shop.example", 750, days_ago=30)  # with this campaign's 250, exactly at the line
+    sent_reward(conn, "C2@Shop.Example", 701, days_ago=200)  # with this campaign's 300, 1 cent past it
+
+    with pytest.raises(ApprovalRefused) as refused:
+        approve(conn, campaign_id, approver="owner", presented_hash=review_hash(conn, campaign_id), config=CONFIG)
+
+    assert refused.value.reason == "amount_over_paid" and "@" not in str(refused.value)
+    assert audit(conn, "approval_refused") == [{"campaign_id": str(campaign_id), "reason": "amount_over_paid"}]
+    assert status(conn, campaign_id) == ("draft", None)
+    remove_recipient(conn, campaign_id, "R2")
+    approve(conn, campaign_id, approver="owner", presented_hash=review_hash(conn, campaign_id), config=CONFIG)
+    assert status(conn, campaign_id) == ("approved", None)
+
+
+def test_a_demo_campaign_is_not_held_to_the_owners_365_day_line(conn: psycopg.Connection) -> None:
+    ids = members(conn)
+    campaign_id = draft(conn, ids, [250, 300])
+    conn.execute("insert into campaign_owners values (%s, 'demo', %s)", (campaign_id, "d" * 64))
+    sent_reward(conn, "c2@shop.example", 1000, days_ago=10)
+
+    approve(conn, campaign_id, approver="owner", presented_hash=review_hash(conn, campaign_id), config=CONFIG)
+
+    assert status(conn, campaign_id) == ("approved", None)
+
+
+def test_an_owner_amount_change_never_takes_a_member_past_the_365_day_line(conn: psycopg.Connection) -> None:
+    ids = members(conn)  # each paid 1000
+    campaign_id = draft(conn, ids, [250, 300])
+    sent_reward(conn, "c1@shop.example", 750, days_ago=30)
+
+    with pytest.raises(EditRefused) as refused:
+        set_amount(conn, campaign_id, "R1", 251, CONFIG)
+
+    assert refused.value.reason == "amount_over_paid" and "@" not in str(refused.value)
+    assert set_amount(conn, campaign_id, "R1", 250, CONFIG).applied  # exactly at the line
+    demo = draft(conn, ids, [250, 300])
+    conn.execute("insert into campaign_owners values (%s, 'demo', %s)", (demo, "d" * 64))
+    assert set_amount(conn, demo, "R1", 251, CONFIG).applied
 
 
 def test_a_hash_that_is_not_the_one_shown_is_refused_even_after_a_small_edit(conn: psycopg.Connection) -> None:

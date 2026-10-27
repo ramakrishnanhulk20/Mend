@@ -199,6 +199,19 @@ def test_a_phone_number_split_by_separators_is_refused(note: str, problem: str |
     assert payouts.note_problem(note, 400) == problem
 
 
+@pytest.mark.parametrize(
+    "note",
+    ["Visit evil[.]example", "Visit evil(.)example", "Visit evil{.}example", "Visit evil dot example", "Visit evil DOT example", "See www[.]shop"],
+)
+def test_a_dot_spelled_out_or_bracketed_counts_as_a_dot_in_the_link_check(note: str) -> None:
+    assert payouts.note_problem(note, 400) == "looks like a link"
+
+
+@pytest.mark.parametrize("note", ["Thank you for the polka dot cups.", "We hope the dot pattern mugs still bring you joy."])
+def test_dot_as_an_ordinary_word_is_not_a_link(note: str) -> None:
+    assert payouts.note_problem(note, 400) is None
+
+
 # "<", ">" and "@" are refused by earlier rules, as markup and as an address.
 @pytest.mark.parametrize("mark", [*(ch for ch in string.punctuation if ch not in "<>@"), " * ", " ~ ", "  "])
 def test_digits_split_by_any_mark_that_is_not_a_letter_or_a_digit_count_as_one_run(mark: str) -> None:

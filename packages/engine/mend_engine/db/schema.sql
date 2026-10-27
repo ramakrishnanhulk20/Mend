@@ -434,3 +434,21 @@ create table if not exists run_owners (
 -- ones verified in the last 400 days, so PayPal's certificate never waits behind the
 -- download budget that unauthenticated traffic shares.
 create table if not exists paypal_certs (url text primary key, last_verified_at timestamptz not null default now());
+
+-- Where a member row came from (C23, C28): 'paypal_login' for a person who clicked Join
+-- with PayPal, 'seed' for the demo shop's stand-in members, which no person consented to.
+-- Rows from before this column default to paypal_login; seed_demo marks its own rows.
+alter table members add column if not exists source text not null default 'paypal_login';
+do $$ begin
+    alter table members add constraint members_source_known check (source in ('paypal_login', 'seed'));
+exception when duplicate_object then null; end $$;
+
+-- Claude tokens spent per day and per subject (a session tag, an address tag, 'demo_all'
+-- or 'owner'), so C12 and C20 can cap tokens as well as calls. Written only by the web app.
+create table if not exists claude_usage (
+    day date not null,
+    subject text not null,
+    input_tokens bigint not null default 0,
+    output_tokens bigint not null default 0,
+    primary key (day, subject)
+);

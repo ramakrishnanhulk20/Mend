@@ -1,6 +1,7 @@
 # Not covered here: signature verification (the web receiver, C9, tested in
-# packages/web), real PayPal answers and delivery timing (prove_m5), and two event
-# runs on separate machines (they share the one database lock shown below).
+# packages/web), real PayPal answers and delivery timing (prove_m5), two event
+# runs on separate machines (they share the one database lock shown below), and
+# PayPal's real DENIED batch answer (the shape follows RD-BRIEF section 4).
 import json
 import uuid
 from collections.abc import Iterator
@@ -12,12 +13,23 @@ import psycopg
 import pytest
 from psycopg import sql
 
+from mend_engine.campaigns.results import campaign_results
+from mend_engine.campaigns.spend import database_now, spent_last_24h_minor
 from mend_engine.config import SANDBOX_API_HOST, Config
 from mend_engine.db.connect import PGDATA
 from mend_engine.db.migrate import apply_schema
 from mend_engine.events.process import EVENT_LOCK, MAX_ATTEMPTS, MAX_PASSES, process_events
 from mend_engine.maintenance.purge import purge_paypal_events
 from mend_engine.paypal.http import PayPalHttp
+from mend_engine.paypal.payouts import (
+    BatchSnapshot,
+    PayoutIdRefused,
+    PayoutItemSpec,
+    canonical_json,
+    get_item,
+    sender_batch_id_for,
+    snapshot_hash,
+)
 
 CONFIG = Config(
     paypal_client_id="cid",
@@ -217,25 +229,30 @@ def test_only_the_item_id_is_taken_from_the_event_and_a_batch_we_did_not_create_
     assert conn.execute("select status from campaigns where campaign_id = %s", (campaign_id,)).fetchone() == before
 
 
-def test_a_batch_event_resolves_a_campaign_paypal_holds_and_then_its_waiting_items(conn: psycopg.Connection) -> None:
+def batch_answer(payout_batch_id: str, sender_batch_id: str, status: str = "SUCCESS") -> dict:
+    return {"batch_header": {"payout_batch_id": payout_batch_id, "batch_status": status,
+                             "sender_batch_header": {"sender_batch_id": sender_batch_id}}}
+
+
+def campaign_status(conn: psycopg.Connection, campaign_id: uuid.UUID) -> str:
+    return conn.execute("select status from campaigns where campaign_id = %s", (campaign_id,)).fetchone()[0]
+
+
+def rest_passed(conn: psycopg.Connection) -> None:
+    """Five minutes pass for every failed re-read so far. The audit log is append-only; its guard is off only to stage the time."""
+    conn.execute("alter table audit_log disable trigger audit_log_append_only")
+    conn.execute("update audit_log set at = at - interval '6 minutes' where action = 'event_attempt_failed'")
+    conn.execute("alter table audit_log enable trigger audit_log_append_only")
+
+
+def test_a_batch_event_resolves_a_campaign_paypal_holds(conn: psycopg.Connection) -> None:
     campaign_id = campaign(conn, ("approved", "submitting", "exists_unresolved"), "mend-unres", None)
-    batch = {"batch_header": {"payout_batch_id": "BATCHU", "batch_status": "SUCCESS",
-                              "sender_batch_header": {"sender_batch_id": "mend-unres"}}}
-    paypal = FakePayPal({
-        "/v1/payments/payouts-item/ITEMU": item_answer("ITEMU", "SUCCESS", "mend-unres", "BATCHU"),
-        "/v1/payments/payouts/BATCHU": batch,
-    })
-    early_item = deliver(conn, "PAYMENT.PAYOUTS-ITEM.SUCCEEDED", {"payout_item_id": "ITEMU"}, age_minutes=2)
-    first = process_events(conn, paypal.http())
-    assert (first.outcomes, first.retrying, outcome(conn, early_item)) == ({}, 1, None)
-
+    paypal = FakePayPal({"/v1/payments/payouts/BATCHU": batch_answer("BATCHU", "mend-unres")})
     batch_event = deliver(conn, "PAYMENT.PAYOUTSBATCH.SUCCESS", {"batch_header": {"payout_batch_id": "BATCHU"}})
-    second = process_events(conn, paypal.http())
 
-    # Oldest first: the item is tried again before the batch event fills in the ledger, so it waits one more run.
-    assert (second.outcomes, second.retrying) == ({"batch resolved": 1}, 1)
-    assert outcome(conn, batch_event)[0] == "batch resolved"
-    assert conn.execute("select status from campaigns where campaign_id = %s", (campaign_id,)).fetchone()[0] == "submitted"
+    assert process_events(conn, paypal.http()).outcomes == {"batch resolved": 1}
+
+    assert outcome(conn, batch_event)[0] == "batch resolved" and campaign_status(conn, campaign_id) == "submitted"
     assert conn.execute("select payout_batch_id, status from payout_batches where sender_batch_id = 'mend-unres'").fetchone() == (
         "BATCHU", "resolved_by_event",
     )
@@ -243,8 +260,100 @@ def test_a_batch_event_resolves_a_campaign_paypal_holds_and_then_its_waiting_ite
         "select from_status, to_status from campaign_status_moves where campaign_id = %s and to_status = 'submitted'", (campaign_id,)
     ).fetchall()
     assert moves == [("exists_unresolved", "submitted")]
+
+
+def test_an_item_event_fills_in_a_missing_payout_batch_id_once_paypal_confirms_the_batch(conn: psycopg.Connection) -> None:
+    healed = campaign(conn, ("approved", "submitting", "exists_unresolved"), "mend-unres", None)
+    mismatched = campaign(conn, ("approved", "submitting", "exists_unresolved"), "mend-other", None)
+    paypal = FakePayPal({
+        "/v1/payments/payouts-item/ITEMU": item_answer("ITEMU", "SUCCESS", "mend-unres", "BATCHU"),
+        "/v1/payments/payouts/BATCHU": batch_answer("BATCHU", "mend-unres"),
+        # PayPal's item answer names our batch; its batch answer names someone else's, so neither is believed.
+        "/v1/payments/payouts-item/ITEMX": item_answer("ITEMX", "SUCCESS", "mend-other", "BATCHX"),
+        "/v1/payments/payouts/BATCHX": batch_answer("BATCHX", "mend-someone-else"),
+    })
+    item = deliver(conn, "PAYMENT.PAYOUTS-ITEM.SUCCEEDED", {"payout_item_id": "ITEMU"})
+    lie = deliver(conn, "PAYMENT.PAYOUTS-ITEM.SUCCEEDED", {"payout_item_id": "ITEMX"})
+
+    report = process_events(conn, paypal.http())
+
+    assert (report.outcomes, report.retrying) == ({"status recorded": 1, "not ours": 1}, 0)
+    assert item_status(conn, "ITEMU") == "SUCCESS" and campaign_status(conn, healed) == "submitted"
+    assert conn.execute("select payout_batch_id, status from payout_batches where sender_batch_id = 'mend-unres'").fetchone() == (
+        "BATCHU", "resolved_by_event",
+    )
+    resolved = conn.execute("select detail from audit_log where action = 'batch_resolved_by_event'").fetchall()
+    assert resolved == [({"campaign_id": str(healed), "sender_batch_id": "mend-unres", "payout_batch_id": "BATCHU", "from": "exists_unresolved"},)]
+    assert outcome(conn, lie)[0] == "not ours" and item_status(conn, "ITEMX") is None
+    assert campaign_status(conn, mismatched) == "exists_unresolved"
+    assert conn.execute("select payout_batch_id from payout_batches where sender_batch_id = 'mend-other'").fetchone() == (None,)
+
+
+def test_exists_unresolved_with_a_success_batch_event_and_five_503s_heals_once_paypal_answers(conn: psycopg.Connection) -> None:
+    # The auditor's repro. The event body names only the payout_batch_id, which our ledger does not hold yet.
+    campaign_id = campaign(conn, ("approved", "submitting", "exists_unresolved"), "mend-unres", None)
+    sent(conn)
+    paypal = FakePayPal()
+    heal = deliver(conn, "PAYMENT.PAYOUTSBATCH.SUCCESS", {"batch_header": {"payout_batch_id": "BATCHU"}})
+    # A batch our ledger already holds for a sent campaign needs nothing healed, so it still gives up.
+    settled = deliver(conn, "PAYMENT.PAYOUTSBATCH.SUCCESS", {"batch_header": {"payout_batch_id": "BATCHOURS"}})
+
+    for _ in range(MAX_ATTEMPTS):
+        process_events(conn, paypal.http())
+        rest_passed(conn)
+
+    assert (attempts(conn, heal), outcome(conn, heal)) == (MAX_ATTEMPTS, None)
+    assert outcome(conn, settled)[0] == "gave up"
+    paypal.answers["/v1/payments/payouts/BATCHU"] = batch_answer("BATCHU", "mend-unres")
+    assert process_events(conn, paypal.http()).outcomes == {"batch resolved": 1}
+    assert outcome(conn, heal)[0] == "batch resolved" and campaign_status(conn, campaign_id) == "submitted"
+
+
+def test_a_failed_reread_is_tried_again_only_after_5_minutes_however_often_runs_are_nudged(conn: psycopg.Connection) -> None:
+    sent(conn)
+    paypal = FakePayPal()
+    tid = deliver(conn, "PAYMENT.PAYOUTS-ITEM.SUCCEEDED", {"payout_item_id": "ITEM1"})
+
+    first, nudged = process_events(conn, paypal.http()), process_events(conn, paypal.http())
+
+    assert (first.retrying, nudged.retrying, len(paypal.reads), attempts(conn, tid)) == (1, 0, 1, 1)
+    rest_passed(conn)
     process_events(conn, paypal.http())
-    assert outcome(conn, early_item)[0] == "status recorded" and item_status(conn, "ITEMU") == "SUCCESS"
+    assert (len(paypal.reads), attempts(conn, tid)) == (2, 2)
+
+
+def test_a_denied_batch_records_every_snapshot_item_as_failed_so_spend_and_results_stop_counting_them(conn: psycopg.Connection) -> None:
+    campaign_id = conn.execute(
+        "insert into campaigns (shop_name, goal_text, as_of, budget_minor, per_recipient_minor, holdout_share, status) "
+        "values ('Shop', 'goal', '2026-10-16', 1000, 300, 0.5, 'submitted') returning campaign_id"
+    ).fetchone()[0]
+    snap = BatchSnapshot(
+        str(campaign_id), "USD", "A thank-you",
+        (PayoutItemSpec("m1@shop.example", 100, "Thanks", "R1"), PayoutItemSpec("m3@shop.example", 250, "Thanks", "R3")),
+    )
+    conn.execute("insert into approved_snapshots values (%s, %s, %s, now(), 'owner')", (campaign_id, snapshot_hash(snap), canonical_json(snap)))
+    sender_batch_id = sender_batch_id_for(snap)
+    conn.execute(
+        "insert into payout_batches (sender_batch_id, campaign_id, snapshot_hash, payout_batch_id, status) values (%s, %s, %s, 'BATCHD', 'created')",
+        (sender_batch_id, str(campaign_id), snapshot_hash(snap)),
+    )
+    conn.execute("insert into payout_items (payout_item_id, sender_batch_id, sender_item_id, status) values ('ITEMD1', %s, 'R1', 'PENDING')", (sender_batch_id,))
+    assert spent_last_24h_minor(conn, database_now(conn)) == 350
+    paypal = FakePayPal({"/v1/payments/payouts/BATCHD": batch_answer("BATCHD", sender_batch_id, "DENIED")})
+    tid = deliver(conn, "PAYMENT.PAYOUTSBATCH.DENIED", {"batch_header": {"payout_batch_id": "BATCHD"}})
+
+    process_events(conn, paypal.http())
+
+    assert (outcome(conn, tid)[0], outcome(conn, tid)[1]["items_failed"]) == ("batch denied", 2)
+    rows = conn.execute("select sender_item_id, status from payout_items where sender_batch_id = %s order by sender_item_id", (sender_batch_id,)).fetchall()
+    assert rows == [("R1", "FAILED"), ("R3", "FAILED")] and item_status(conn, "ITEMD1") == "FAILED"
+    assert spent_last_24h_minor(conn, database_now(conn)) == 0
+    payouts = campaign_results(conn, campaign_id).payouts
+    assert (payouts.failed_minor, payouts.pending_minor) == (350, 0)
+    # A row recorded for an item PayPal never named carries an id no PayPal call accepts, so it is never read or cancelled.
+    [made_up] = [r[0] for r in conn.execute("select payout_item_id from payout_items where sender_item_id = 'R3'")]
+    with pytest.raises(PayoutIdRefused):
+        get_item(paypal.http(), made_up)
 
 
 def test_batch_events_for_other_batches_or_settled_campaigns_change_nothing(conn: psycopg.Connection) -> None:
@@ -292,13 +401,19 @@ def test_a_verified_capture_of_our_simulated_order_is_attributed_to_the_right_ar
     ]
 
 
-def test_a_capture_of_any_other_order_is_not_ours_and_is_never_read(conn: psycopg.Connection) -> None:
+def test_a_capture_of_any_other_order_is_not_ours_is_never_read_and_its_order_id_is_not_kept(conn: psycopg.Connection) -> None:
     sent(conn)
     paypal = FakePayPal()
     tid = deliver(conn, "PAYMENT.CAPTURE.COMPLETED", {"supplementary_data": {"related_ids": {"order_id": "STRANGER1"}}})
     process_events(conn, paypal.http())
     assert outcome(conn, tid)[0] == "not ours" and paypal.reads == []
     assert conn.execute("select count(*) from attributions").fetchone()[0] == 0
+    # A stranger's order id is PayPal transaction data, so it goes with the raw body at 48 hours (C27).
+    kept = conn.execute(
+        "select (select coalesce(string_agg(detail::text, ' '), '') from event_outcomes) || "
+        "(select coalesce(string_agg(detail::text, ' '), '') from audit_log)"
+    ).fetchone()[0]
+    assert "STRANGER1" not in kept and "paypal_order_id" not in outcome(conn, tid)[1]
 
 
 @pytest.mark.parametrize(
@@ -348,6 +463,7 @@ def test_a_failed_reread_leaves_the_event_for_the_next_run_and_the_fifth_failure
     for run in range(1, MAX_ATTEMPTS):
         report = process_events(conn, paypal.http())
         assert (report.retrying, report.outcomes, outcome(conn, tid)) == (1, {}, None), run
+        rest_passed(conn)
     final = process_events(conn, paypal.http())
     assert final.outcomes == {"gave up": 1}
     given_up = outcome(conn, tid)

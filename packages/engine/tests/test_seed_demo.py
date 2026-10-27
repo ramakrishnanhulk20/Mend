@@ -23,6 +23,8 @@ from mend_engine.config import SANDBOX_API_HOST, Config, ConfigError
 from mend_engine.data.uci import ZIP_NAME
 from mend_engine.db.connect import PGDATA
 from mend_engine.db.migrate import apply_schema
+from mend_engine.members.consent import CONSENT_VERSION, DEMO_SHOP_NAME
+from mend_engine.members.membership import join_member
 from mend_engine.paypal.payouts import normalise_email
 from mend_engine.shop.import_orders import REFUNDS_SOURCE_SUFFIX
 
@@ -181,8 +183,11 @@ def test_a_fresh_database_gets_the_shop_the_facts_the_40_demo_members_and_the_te
     assert len(refs) == 41 and set(demo) < refs
     ranked = quiet_regular_members(conn, scores, AS_OF)
     assert ranked[0].member_id == receiver_member(conn)
-    actions = conn.execute("select action, actor from audit_log where actor = 'seed_demo' order by id").fetchall()
+    actions = conn.execute("select action, actor from audit_log where action <> 'member_joined' order by id").fetchall()
     assert actions == [("shop_customer_linked_to_sandbox_receiver", "seed_demo"), ("sandbox_receiver_moved_first", "seed_demo")]
+    # Every member here was joined by the seed, the receiver too, so each is a labelled stand-in under the seed's name.
+    assert conn.execute("select actor, count(*) from audit_log where action = 'member_joined' group by actor").fetchall() == [("seed_demo", 41)]
+    assert conn.execute("select source, consent_version, count(*) from members group by 1, 2").fetchall() == [("seed", CONSENT_VERSION, 41)]
     out = capsys.readouterr().out
     assert "receiver: moved to rank 1 (was rank " in out
     assert RECEIVER.lower() not in out.lower()
@@ -237,6 +242,70 @@ def test_moving_the_receiver_first_trades_two_order_histories_and_changes_nothin
 
     assert seed_demo.seed_receiver_first(conn, config, scores) == "receiver: already first"
     assert audit_rows(conn) == audit_before + 1 and member_matches(conn) == matched
+
+
+def test_the_stand_ins_are_labelled_and_re_consented_and_the_receivers_real_row_is_left_as_it_is(seeded: tuple) -> None:
+    conn, config, stand = seeded
+    # The live database: the test receiver joined through Log in with PayPal, then the seed
+    # ran while members had no source and the wording was the earlier one.
+    seed_demo.seed_orders(conn)
+    seed_demo.seed_refunds(conn)
+    scores = seed_demo.shop_scores(conn)
+    real = join_member(
+        conn, paypal_email=RECEIVER, paypal_payer_id="PAYERRECEIVE1", email_verified=True, shop_name=DEMO_SHOP_NAME, client_id="cid"
+    )
+    seed_demo.seed_members(conn, config, scores)
+    seed_demo.seed_receiver(conn, config, scores)
+    seed_demo.seed_receiver_first(conn, config, scores)
+    conn.execute("update members set source = 'paypal_login', consent_version = '2026-10-20.1', consent_text_sha256 = %s", ("0" * 64,))
+    receiver_before = conn.execute("select xmin::text, m.* from members m where member_id = %s", (real,)).fetchone()
+    audit_before = audit_rows(conn)
+
+    assert seed_demo.seed_members(conn, config, scores) == "members: 40 demo members (0 new), 40 labelled as demo stand-ins"
+    seed_demo.seed_receiver(conn, config, scores)
+
+    stand_ins = conn.execute("select member_id, source, consent_version from members where member_id <> %s", (real,)).fetchall()
+    assert len(stand_ins) == 40 and all(row[1:] == ("seed", CONSENT_VERSION) for row in stand_ins)
+    assert conn.execute("select xmin::text, m.* from members m where member_id = %s", (real,)).fetchone() == receiver_before
+    new = conn.execute("select actor, action, detail from audit_log order by id").fetchall()[audit_before:]
+    assert new[0] == ("seed_demo", "members_labelled_seed", {"member_ids": sorted(str(row[0]) for row in stand_ins)})
+    assert [action for _actor, action, _detail in new[1:]] == ["member_reconsented"] * 40
+    assert {actor for actor, _action, _detail in new} == {"seed_demo"} and "@" not in json.dumps([d for *_, d in new])
+    assert seed_demo.seed_members(conn, config, scores) == "members: 40 demo members (0 new)" and audit_rows(conn) == audit_before + 41
+
+
+def test_moving_first_waits_while_the_receivers_real_row_is_on_an_earlier_consent(seeded: tuple) -> None:
+    conn, config, stand = seeded
+    seed_demo.seed_orders(conn)
+    seed_demo.seed_refunds(conn)
+    scores = seed_demo.shop_scores(conn)
+    join_member(
+        conn, paypal_email=RECEIVER, paypal_payer_id="PAYERRECEIVE1", email_verified=True, shop_name=DEMO_SHOP_NAME, client_id="cid"
+    )
+    seed_demo.seed_members(conn, config, scores)
+    seed_demo.seed_receiver(conn, config, scores)
+    changed = conn.execute("update members set consent_version = '2026-10-20.1' where source = 'paypal_login'").rowcount
+    assert changed == 1
+    before = state(conn)
+    assert seed_demo.seed_receiver_first(conn, config, scores) == "receiver: waiting for the test customer to join again under the current consent"
+    assert state(conn) == before
+
+
+def test_moving_first_says_the_receiver_is_held_while_a_running_measurement_holds_it(seeded: tuple) -> None:
+    conn, config, stand = seeded
+    scores = seed_up_to_the_receiver(conn, config)
+    running = conn.execute(
+        "insert into campaigns (shop_name, goal_text, as_of, budget_minor, per_recipient_minor, holdout_share, status) "
+        "values ('Shop', 'goal', '2026-10-16', 1000, 100, 0.5, 'draft') returning campaign_id"
+    ).fetchone()[0]
+    conn.execute(
+        "insert into campaign_members (campaign_id, ref, member_id, role, rank, score) values (%s, 'R1', %s, 'holdout', 1, 0.1)",
+        (running, receiver_member(conn)),
+    )
+    before = state(conn)
+
+    assert seed_demo.seed_receiver_first(conn, config, scores) == "receiver: held by a running measurement"
+    assert state(conn) == before
 
 
 def test_moving_first_is_refused_and_changes_nothing_while_the_receiver_is_not_an_eligible_member(seeded: tuple) -> None:

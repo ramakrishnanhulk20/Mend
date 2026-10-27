@@ -50,18 +50,28 @@ from mend_engine.campaigns.approval import (
 from mend_engine.campaigns.approval import set_note as set_campaign_note
 from mend_engine.campaigns.cancel import cancel_unclaimed as cancel_unclaimed_items
 from mend_engine.campaigns.drafts import NOTE_TEMPLATE, DraftRefused, DraftSettings, build_draft, draft_view
-from mend_engine.campaigns.eligibility import REGULAR_MIN_DAYS, SILENT_MIN_DAYS
+from mend_engine.campaigns.eligibility import OWNER_SCOPE, REGULAR_MIN_DAYS, SILENT_MIN_DAYS, DraftScope, drafting_for
 from mend_engine.campaigns.reconcile import reconcile as reconcile_campaigns
 from mend_engine.campaigns.results import ArmResults, PayoutStanding, campaign_results
 from mend_engine.campaigns.scoring import SHOP_ZONE, ScoreSet, score_customers
-from mend_engine.campaigns.spend import CAMPAIGN_VOIDED_SQL, ITEM_CAME_BACK_SQL, MONEY_BACK_STATUSES, WINDOW, CapExceeded
+from mend_engine.campaigns import spend
+from mend_engine.campaigns.spend import (
+    CAMPAIGN_VOIDED_SQL,
+    DEMO_DAILY_CAP_MINOR,
+    DEMO_SPEND_LOCK,
+    WINDOW,
+    CapExceeded,
+    DemoPoolExceeded,
+)
 from mend_engine.campaigns.submission import submit
 from mend_engine.config import Config, ConfigError, load_config
 from mend_engine.db.connect import connect
 from mend_engine.events.process import process_events as process_stored_events
 from mend_engine.maintenance.purge import purge_paypal_events
-from mend_engine.members.consent import DEMO_SHOP_NAME, consent_hash, consent_text_for
+from mend_engine.members.consent import ACCEPTED_CONSENT_VERSIONS, DEMO_SHOP_NAME, consent_hash, consent_text_for
 from mend_engine.members.membership import (
+    SOURCE_LOGIN,
+    SOURCE_SEED,
     MembershipRefused,
     customer_refs_by_email,
     join_member,
@@ -103,7 +113,6 @@ ROLES = ("owner", "demo")
 # them, and never looser than the owner's caps from config.
 DEMO_ITEM_CAP_MINOR = 200
 DEMO_CAMPAIGN_CAP_MINOR = 1000
-DEMO_DAILY_CAP_MINOR = 5000
 DEMO_CAMPAIGNS_PER_SESSION_PER_DAY = 5
 DEMO_SUBMITS_PER_SESSION_PER_DAY = 2
 # Scoring and drafting cost grows with the candidates asked for; the owner keeps build_draft's 2 to 250.
@@ -118,7 +127,6 @@ SESSION_IDLE = timedelta(hours=2)
 # single number serialises demo submissions, so two cannot both fit under the demo pool
 # or both be a session's second send of the day.
 DRAFT_LOCK_CLASS = 773131
-DEMO_SPEND_LOCK = 7731300005
 # A demo send that cannot take the spend lock in this long answers "busy" (C20): a
 # send stuck on a slow PayPal must not hold every other visitor's send for ever.
 DEMO_SPEND_WAIT_SECONDS = 10.0
@@ -130,6 +138,7 @@ _monotonic = monotonic
 MAX_LOG_DETAIL_CHARS = 4000
 MAX_QUIET_REGULARS = 50
 SUMMARY_CURRENCY = "USD"
+SEEDED_LABEL = "demo stand-ins"
 # What a note may be written from (C15): a few recent item names, cut short, and how
 # long since the customer last ordered. More names are read than kept because some
 # are dropped by the note rule.
@@ -171,6 +180,7 @@ _SECRET_ENV_NAMES = (
     "MEND_ENGINE_TOKEN",
     "RENDER_API_KEY",
 )
+_SECRET_ENV_SUFFIXES = ("_SECRET", "_TOKEN", "_KEY", "_PASSWORD")
 # The role of the actor the running task checked, so a refusal raised anywhere below
 # it, in this module or another, is recorded against the right role. _run resets it.
 _ACTING_ROLE: ContextVar[str | None] = ContextVar("mend_acting_role", default=None)
@@ -221,24 +231,37 @@ def draft_campaign(settings: object, actor: object) -> dict:
 
     settings is {"goal_text", "as_of" (YYYY-MM-DD), "budget_minor", "per_recipient_minor",
     "holdout_share" (a string such as "0.30"), "max_candidates"} and nothing else.
-    A demo actor drafts under 1000 cents per campaign and 200 per person, from at most
-    20 candidates, at most 5 campaigns per session in any 24 hours, and the demo pool
-    of 5000 cents per rolling day; a demo max_candidates above 20 is refused before
-    anything is scored. The campaign is recorded against the actor's session in
+    as_of must be the shop's own day, the one draft_limits gives; any other day, or
+    any day at all for a shop with no orders, is refused "invalid_input" before
+    anything is scored. A demo actor drafts under 1000 cents per campaign and 200 per
+    person, from at most 20 candidates, at most 5 campaigns per session in any 24
+    hours, and the demo pool of 5000 cents per rolling day; a demo max_candidates
+    above 20 is refused before anything is scored. Candidates are drafted for the
+    actor's scope (eligibility.DraftScope): a member another open or still-measuring
+    campaign of the same scope holds is left out, and two drafts of one scope run one
+    after the other. The campaign is recorded against the actor's session in
     campaign_owners in the same transaction as the draft. Returns campaign_id and
-    counts; refusals carry build_draft's reason, "over_cap", "limit_reached" or
-    "over_demo_daily_cap".
+    counts; refusals carry build_draft's reason, "invalid_input", "over_cap",
+    "limit_reached" or "over_demo_daily_cap".
     """
 
     def work(config: Config, conn: psycopg.Connection) -> dict:
         role, session = _checked_actor(conn, actor)
         draft_settings = _checked_settings(settings)
+        # Code sets the scoring day (C4): an earlier one would leave out later orders and refunds.
+        if draft_settings.as_of != _shop_as_of(conn):
+            raise _Refused("invalid_input", "as_of must be the shop's own day, the London day of its latest order")
         if role == "demo" and draft_settings.max_candidates > DEMO_MAX_CANDIDATES:
             raise _Refused("over_cap", f"a demo draft may consider at most {DEMO_MAX_CANDIDATES} candidates")
         with conn.transaction():
+            # Held until commit, so two drafts of one scope run one after the other: the
+            # second sees the first's members as taken (C6), and a demo session's two
+            # drafts cannot both pass its daily count.
+            scope = DraftScope("demo", session) if role == "demo" else OWNER_SCOPE
+            conn.execute(
+                "select pg_advisory_xact_lock(%s::integer, hashtext(%s))", (DRAFT_LOCK_CLASS, session if role == "demo" else role)
+            )
             if role == "demo":
-                # Held until commit, so two drafts from one session cannot both pass the count.
-                conn.execute("select pg_advisory_xact_lock(%s::integer, hashtext(%s))", (DRAFT_LOCK_CLASS, session))
                 made = conn.execute(
                     "select count(*) from campaign_owners o join campaigns c on c.campaign_id = o.campaign_id "
                     "where o.session_id = %s and c.created_at > now() - %s",
@@ -246,7 +269,8 @@ def draft_campaign(settings: object, actor: object) -> dict:
                 ).fetchone()[0]
                 if made >= DEMO_CAMPAIGNS_PER_SESSION_PER_DAY:
                     raise _Refused("limit_reached", f"a demo session may draft {DEMO_CAMPAIGNS_PER_SESSION_PER_DAY} campaigns a day")
-            result = build_draft(conn, _role_config(config, role), draft_settings)
+            with drafting_for(scope):
+                result = build_draft(conn, _role_config(config, role), draft_settings)
             if role == "demo":
                 _check_demo_pool(conn, result.total_minor)
             conn.execute(
@@ -480,9 +504,13 @@ def shop_summary() -> dict:
     who bought on 3 or more days and have been silent 60 or more by as_of, the rule
     campaigns use. quiet_regulars_paid_12m_minor is what they paid in the 12 months
     up to as_of, net of refunds in those months and never below 0 per customer, in
-    USD cents. benchmark and backtest are the rows python -m mend_engine.store_facts
-    wrote, each None when missing or malformed: no number is shown that was not
-    measured (6j). Returns counts only, never a name, email, member id or customer ref.
+    USD cents. members_joined counts the people who joined through Log in with
+    PayPal; members_seeded counts the demo stand-ins a script joined, which no person
+    agreed to, and members_seeded_label names them as such so the two are never
+    shown as one number (C23). benchmark and backtest are the rows python -m
+    mend_engine.store_facts wrote, each None when missing or malformed: no number is
+    shown that was not measured (6j). Returns counts only, never a name, email,
+    member id or customer ref.
     """
 
     def work(config: Config, conn: psycopg.Connection) -> dict:
@@ -493,13 +521,19 @@ def shop_summary() -> dict:
             scores = score_customers(conn, as_of)
             quiet = _quiet_refs(scores)
             paid_12m = _paid_in_last_year(conn, as_of, quiet)
-        customers, members = conn.execute("select (select count(*) from shop_customers), (select count(*) from members)").fetchone()
+        customers, joined, seeded = conn.execute(
+            "select (select count(*) from shop_customers), (select count(*) from members where source = %s), "
+            "(select count(*) from members where source = %s)",
+            (SOURCE_LOGIN, SOURCE_SEED),
+        ).fetchone()
         facts = read_facts(conn)
         return {
             "ok": True,
             "as_of": as_of.isoformat() if as_of is not None else None,
             "shop_customers": customers,
-            "members": members,
+            "members_joined": joined,
+            "members_seeded": seeded,
+            "members_seeded_label": SEEDED_LABEL,
             "quiet_regulars": len(quiet),
             "quiet_regulars_paid_12m_minor": paid_12m,
             "currency": SUMMARY_CURRENCY,
@@ -714,22 +748,24 @@ def join(identity: object, consent: object) -> dict:
     identity is exactly {"email", "email_verified", "payer_id"} from Log in with
     PayPal; consent is the hash consent_text gave the page the customer saw. The
     member is recorded with the current consent version and this app's client id.
-    Joining again returns the same member_id; it changes nothing, except that a verified
-    join upgrades a member who first joined unverified (join_member). created says
-    whether this call made the member; it is read just before the join, so two
-    first joins at the same moment may both say True for the same member_id.
-    linked says whether a verified email matches one shop customer. Refuses
-    "bad_identity" for an identity of the wrong shape, "consent_changed" when
-    consent is not exactly the current hash, "not_payable" for an email PayPal
+    Joining again returns the same member_id and changes nothing, except that a
+    verified join upgrades a member who first joined unverified, replaces an
+    unverified row holding the email under another payer id with a new member, and
+    records the current wording for a member who agreed to an earlier one
+    (join_member). created says whether this call made the member; it is read just
+    before the join, so two first joins at the same moment may both say True for the
+    same member_id. linked says whether a verified email matches one shop customer.
+    Refuses "bad_identity" for an identity of the wrong shape, "consent_changed"
+    when consent is not exactly the current hash, "not_payable" for an email PayPal
     could not pay, and "identity_conflict" when the email or payer id belongs to a
-    different member. Nothing is written on a refusal.
+    different member or the email is a demo stand-in's. Nothing is written on a refusal.
     """
 
     def work(config: Config, conn: psycopg.Connection) -> dict:
         email, verified, payer_id = _checked_identity(identity)
         if type(consent) is not str or consent != consent_hash(consent_text_for(DEMO_SHOP_NAME)):
             raise _Refused("consent_changed", "the consent hash is not the current wording's")
-        existing = conn.execute("select 1 from members where paypal_email = %s", (normalise_email(email),)).fetchone()
+        existing = conn.execute("select member_id from members where paypal_email = %s", (normalise_email(email),)).fetchone()
         try:
             member_id = join_member(
                 conn,
@@ -747,7 +783,7 @@ def join(identity: object, consent: object) -> dict:
         return {
             "ok": True,
             "member_id": str(member_id),
-            "created": existing is None,
+            "created": existing is None or existing[0] != member_id,
             "linked": match_member_to_customer(conn, member_id) is not None,
         }
 
@@ -757,29 +793,44 @@ def join(identity: object, consent: object) -> dict:
 def leave(identity: object) -> dict:
     """Take the customer PayPal just signed in off the thank-you list at once (C28).
 
-    identity has the same shape join takes. The member is found by the one email
-    normaliser. Leaving voids every campaign not yet sent that holds the member, in
-    the same transaction that deletes them; voided counts those campaigns. left is
-    False when no member has that email, which is not an error. Refuses
-    "bad_identity" for an identity of the wrong shape, "email_unverified" before
-    any lookup when PayPal has not verified the email (an unverified email proves
-    nothing about who owns it), and "identity_conflict" when the member has a payer
-    id and the identity carries a different one.
+    identity has the same shape join takes. The member is the one row whose email
+    matches by the one email normaliser, or whose payer id matches: a matching payer
+    id proves the PayPal account even when its email has changed since joining.
+    Leaving voids every campaign not yet sent that holds the member, in the same
+    transaction that deletes them; voided counts those campaigns. left is False,
+    which is not an error, when no member matches, and when the match is a demo
+    stand-in (source 'seed'), which no person joined and so no sign-in can remove.
+    A row whose email PayPal never verified is removed by the verified owner of that
+    email whatever payer id it holds. Refuses "bad_identity" for an identity of the
+    wrong shape, "email_unverified" before any lookup when PayPal has not verified
+    the email (an unverified email proves nothing about who owns it), and
+    "identity_conflict" when the email and the payer id match two different
+    members, or the email matches a verified member whose payer id is another one.
     """
 
     def work(config: Config, conn: psycopg.Connection) -> dict:
         email, verified, payer_id = _checked_identity(identity)
         if verified is not True:
             raise _Refused("email_unverified", "leaving needs an email PayPal has verified")
-        row = conn.execute(
-            "select member_id, paypal_payer_id from members where paypal_email = %s", (normalise_email(email),)
-        ).fetchone()
-        if row is None:
-            return {"ok": True, "left": False, "voided": 0}
-        member_id, stored_payer_id = row
-        if stored_payer_id is not None and payer_id is not None and stored_payer_id != payer_id:
-            raise _Refused("identity_conflict", "the member's PayPal account is not the one signed in")
-        result = leave_member(conn, member_id)
+        email_key = normalise_email(email)
+        with conn.transaction():
+            # Locked until commit, so the row that was matched is the row that is removed.
+            rows = conn.execute(
+                "select member_id, paypal_email, paypal_payer_id, email_verified, source from members "
+                "where paypal_email = %s or paypal_payer_id = %s for update",
+                (email_key, payer_id),
+            ).fetchall()
+            if not rows:
+                return {"ok": True, "left": False, "voided": 0}
+            if len(rows) > 1:
+                raise _Refused("identity_conflict", "the email and the PayPal account belong to two different members")
+            member_id, _email, stored_payer_id, stored_verified, source = rows[0]
+            if source == SOURCE_SEED:
+                return {"ok": True, "left": False, "voided": 0}
+            proven_by_account = payer_id is not None and stored_payer_id == payer_id
+            if not proven_by_account and stored_verified and stored_payer_id is not None and payer_id is not None:
+                raise _Refused("identity_conflict", "the member's PayPal account is not the one signed in")
+            result = leave_member(conn, member_id)
         return {"ok": True, "left": result.removed, "voided": len(result.voided_campaigns)}
 
     return _run("leave", work)
@@ -913,8 +964,16 @@ def _log(record: dict) -> None:
 
 
 def _scrub(text: str, config: Config | None) -> str:
-    """text with every known secret, session id, cookie-shaped token and email address replaced, and capped in length."""
+    """text with every known secret, session id, cookie-shaped token and email address replaced, and capped in length.
+
+    A known secret is the value of each name in _SECRET_ENV_NAMES and of every
+    environment variable whose name, in capitals, is DATABASE_URL or ends in _SECRET,
+    _TOKEN, _KEY or _PASSWORD, so a key added to the deployment later is covered
+    without a change here. Values under 6 characters are left, as too short to tell
+    from ordinary text. Not covered: a secret held under a name that breaks the rule.
+    """
     secrets = [os.environ.get(name) for name in _SECRET_ENV_NAMES]
+    secrets += [value for name, value in os.environ.items() if _secret_shaped(name)]
     if config is not None:
         secrets += [config.paypal_client_secret, config.paypal_client_id, config.database_url]
         if config.database_url:
@@ -927,6 +986,11 @@ def _scrub(text: str, config: Config | None) -> str:
             text = text.replace(secret, "[removed]")
     text = _LOG_EMAIL.sub("[email]", _LOG_COOKIE.sub("[cookie]", _LOG_HEX.sub("[hex64]", text)))
     return text[:MAX_LOG_DETAIL_CHARS]
+
+
+def _secret_shaped(name: str) -> bool:
+    upper = name.upper()
+    return upper == "DATABASE_URL" or upper.endswith(_SECRET_ENV_SUFFIXES)
 
 
 def _checked_actor(conn: psycopg.Connection, actor: object) -> tuple[str, str]:
@@ -1051,31 +1115,15 @@ def _role_config(config: Config, role: str) -> Config:
 
 
 def demo_spent_last_24h_minor(conn: psycopg.Connection) -> int:
-    """Cents in every demo-created campaign that reached submitting in the last 24 hours.
-
-    Counted the way spend.spent_last_24h_minor counts the shop's own cap, limited to
-    campaigns a demo session created: a voided campaign counts nothing, an item
-    PayPal reports FAILED, BLOCKED, RETURNED or REFUNDED stops counting, one with no
-    status yet still counts.
-    """
-    row = conn.execute(
-        "select coalesce(sum((item ->> 'amount_minor')::bigint), 0) "
-        "from approved_snapshots s join campaign_owners o on o.campaign_id = s.campaign_id and o.role = 'demo' "
-        "cross join lateral jsonb_array_elements(s.canonical_json::jsonb -> 'items') item "
-        "where exists (select 1 from payout_batches b where b.campaign_id = s.campaign_id::text and b.created_at > now() - %s) "
-        "and not " + CAMPAIGN_VOIDED_SQL + " and not " + ITEM_CAME_BACK_SQL,
-        (WINDOW, list(MONEY_BACK_STATUSES)),
-    ).fetchone()
-    return int(row[0])
+    """Cents the demo pool counts now: spend.demo_spent_last_24h_minor, the one rule reconcile uses too."""
+    return spend.demo_spent_last_24h_minor(conn)
 
 
 def _check_demo_pool(conn: psycopg.Connection, extra_minor: int) -> None:
-    spent = demo_spent_last_24h_minor(conn)
-    if spent + extra_minor > DEMO_DAILY_CAP_MINOR:
-        raise _Refused(
-            "over_demo_daily_cap",
-            f"demo campaigns spent {spent} cents in 24 hours; {extra_minor} more would pass {DEMO_DAILY_CAP_MINOR}",
-        )
+    try:
+        spend.check_demo_pool(conn, extra_minor)
+    except DemoPoolExceeded as exc:
+        raise _Refused("over_demo_daily_cap", str(exc)) from None
 
 
 def _check_demo_submits(conn: psycopg.Connection, session: str) -> None:
@@ -1165,10 +1213,12 @@ def _paid_in_last_year(conn: psycopg.Connection, as_of: date, refs: list[str]) -
 
 
 def _member_refs(conn: psycopg.Connection) -> set[str]:
-    """Customer refs a verified member is matched to, by the one email normaliser, as eligibility matches them."""
+    """Customer refs a verified member on an accepted consent wording is matched to, by the one email normaliser, as eligibility matches them."""
     refs = customer_refs_by_email(conn)
     matched = set()
-    for (email,) in conn.execute("select paypal_email from members where email_verified"):
+    for (email,) in conn.execute(
+        "select paypal_email from members where email_verified and consent_version = any(%s)", (sorted(ACCEPTED_CONSENT_VERSIONS),)
+    ):
         ref = refs.get(normalise_email(email))
         if ref is not None:
             matched.add(ref)

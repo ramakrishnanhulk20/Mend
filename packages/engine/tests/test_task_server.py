@@ -160,7 +160,7 @@ def test_a_body_over_64_kb_is_refused_before_it_is_read(port: int, calls: list) 
 
 
 def test_a_task_that_waits_too_long_for_a_free_slot_is_refused_without_running(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(task_server, "MAX_RUNNING_TASKS", 1)
+    monkeypatch.setattr(task_server, "MAX_OTHER_TASKS", 1)
     started, release, ran = threading.Event(), threading.Event(), []
 
     def slow(value: object) -> dict:
@@ -181,6 +181,43 @@ def test_a_task_that_waits_too_long_for_a_free_slot_is_refused_without_running(m
         release.set()
         holder.join(10)
         assert first == [(200, {"ok": True})] and ran == [1]
+    finally:
+        release.set()
+        server.shutdown()
+        server.server_close()
+
+
+def test_heavy_reads_share_six_slots_and_the_other_ten_are_always_free_for_money_and_membership() -> None:
+    assert task_server.HEAVY_TASKS == {"quiet_regulars", "shop_summary", "draft_campaign", "note_context", "results"}
+    assert task_server.HEAVY_TASKS <= set(tasks.TASK_NAMES)
+    assert (task_server.MAX_HEAVY_TASKS, task_server.MAX_OTHER_TASKS, task_server.MAX_RUNNING_TASKS) == (6, 10, 16)
+    started, release = threading.Semaphore(0), threading.Event()
+
+    def slow(value: object) -> dict:
+        started.release()
+        release.wait(10)
+        return {"ok": True}
+
+    registry = {"shop_summary": slow, "results": slow, "join": lambda value: {"ok": True, "joined": value}}
+    server = build_server(0, TOKEN, registry, slot_wait_seconds=0.2)
+    serve(server)
+    port = server.server_address[1]
+    held: list = []
+    holders = [
+        threading.Thread(target=lambda name=name: held.append(call(port, {"args": [1]}, path=f"/tasks/{name}")))
+        for name in ("shop_summary", "results") * 3
+    ]
+    try:
+        for holder in holders:
+            holder.start()
+        assert all(started.acquire(timeout=10) for _ in holders)
+
+        assert call(port, {"args": [7]}, path="/tasks/shop_summary") == (503, {"error": "busy"})
+        assert call(port, {"args": [7]}, path="/tasks/join") == (200, {"ok": True, "joined": 7})
+        release.set()
+        for holder in holders:
+            holder.join(10)
+        assert held == [(200, {"ok": True})] * 6
     finally:
         release.set()
         server.shutdown()

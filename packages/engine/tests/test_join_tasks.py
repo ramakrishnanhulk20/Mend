@@ -19,7 +19,7 @@ from mend_engine.config import SANDBOX_API_HOST, Config
 from mend_engine.db.connect import PGDATA
 from mend_engine.db.migrate import apply_schema
 from mend_engine.members.consent import CONSENT_VERSION, DEMO_SHOP_NAME, consent_text_for
-from mend_engine.members.membership import LEFT_REASON
+from mend_engine.members.membership import LEFT_REASON, join_member
 
 CLIENT_ID = "cid-for-join-tests"
 PAYER_A = "PAYERAAAAAAA1"
@@ -167,11 +167,51 @@ def test_a_verified_join_upgrades_an_unverified_member_and_links_them(conn: psyc
     assert written(conn) == (1, 2)
 
 
-def test_an_upgrade_carrying_another_payer_id_is_identity_conflict_and_writes_nothing(conn: psycopg.Connection, config: Config) -> None:
-    tasks.join(identity("c1@shop.example", verified=False, payer_id=PAYER_A), CONSENT)
+def test_an_unverified_row_for_an_email_no_longer_blocks_its_verified_owners_join_or_leave(conn: psycopg.Connection, config: Config) -> None:
+    squatter = tasks.join(identity("v@shop.example", verified=False, payer_id=PAYER_A), CONSENT)["member_id"]
+
+    owner = tasks.join(identity("V@shop.example", payer_id=PAYER_B), CONSENT)
+
+    assert owner["ok"] is True and owner["created"] is True and owner["member_id"] != squatter
+    assert conn.execute("select member_id::text, paypal_email, paypal_payer_id, email_verified from members").fetchall() == [
+        (owner["member_id"], "v@shop.example", PAYER_B, True)
+    ]
+    action, detail = conn.execute("select action, detail from audit_log order by id desc limit 1").fetchone()
+    assert (action, detail) == ("member_replaced_unverified", {"member_id": owner["member_id"], "replaced_member_id": squatter})
+
+    tasks.join(identity("w@shop.example", verified=False, payer_id=PAYER_A), CONSENT)
+    assert tasks.leave(identity("w@shop.example", payer_id="PAYERCCCCCCC3")) == {"ok": True, "left": True, "voided": 0}
+    assert conn.execute("select paypal_email from members").fetchall() == [("v@shop.example",)]
+
+
+def test_leave_finds_the_member_by_payer_id_when_their_paypal_email_changed(conn: psycopg.Connection, config: Config) -> None:
+    member_id = uuid.UUID(tasks.join(identity("old@shop.example", payer_id=PAYER_A), CONSENT)["member_id"])
+    draft = draft_holding(conn, member_id)
+
+    assert tasks.leave(identity("new@shop.example", payer_id=PAYER_A)) == {"ok": True, "left": True, "voided": 1}
+
+    assert written(conn)[0] == 0
+    assert conn.execute("select status from campaigns where campaign_id = %s", (draft,)).fetchone() == ("voided",)
+
+
+def test_leave_refuses_an_email_and_a_payer_id_that_point_at_two_different_members(conn: psycopg.Connection, config: Config) -> None:
+    tasks.join(identity("a@shop.example"), CONSENT)
+    tasks.join(identity("b@shop.example", payer_id=PAYER_B), CONSENT)
+
+    assert refused(tasks.leave(identity("a@shop.example", payer_id=PAYER_B)), "identity_conflict")
+    assert written(conn) == (2, 2)
+
+
+def test_a_seed_row_is_never_joined_over_or_left_through_log_in_with_paypal(conn: psycopg.Connection, config: Config) -> None:
+    join_member(
+        conn, paypal_email="c5@shop.example", paypal_payer_id=None, email_verified=True,
+        shop_name=DEMO_SHOP_NAME, client_id=CLIENT_ID, actor="seed_demo",
+    )
     before = conn.execute("select xmin::text, m.* from members m").fetchall()
 
-    assert refused(tasks.join(identity("c1@shop.example", payer_id=PAYER_B), CONSENT), "identity_conflict")
+    assert refused(tasks.join(identity("C5@shop.example", payer_id=PAYER_A), CONSENT), "identity_conflict")
+    assert tasks.leave(identity("c5@shop.example", payer_id=PAYER_A)) == {"ok": True, "left": False, "voided": 0}
+    assert tasks.leave(identity("c5@shop.example")) == {"ok": True, "left": False, "voided": 0}
 
     assert conn.execute("select xmin::text, m.* from members m").fetchall() == before
     assert written(conn) == (1, 1)

@@ -1,6 +1,7 @@
 # Not covered here: how statuses and attributions get in (test_events.py), real
-# returns from a live storefront (none yet), the results page that shows this, and
-# PayPal's own 30-day clock, which may start a little after our ledger row is written.
+# returns from a live storefront (none yet), the results page that shows this,
+# PayPal's own 30-day clock, which may start a little after our ledger row is written,
+# and whether 30 members per arm can detect a lift of any given size (power).
 import math
 import uuid
 from collections.abc import Iterator
@@ -12,7 +13,7 @@ import pytest
 from psycopg import sql
 
 from mend_engine.campaigns.attribution import attribute_purchase
-from mend_engine.campaigns.results import TOO_EARLY, PayoutStanding, campaign_results, lift_p_value
+from mend_engine.campaigns.results import TOO_EARLY, TOO_FEW, PayoutStanding, campaign_results, lift_p_value
 from mend_engine.db.connect import PGDATA
 from mend_engine.db.migrate import apply_schema
 from mend_engine.paypal.payouts import BatchSnapshot, PayoutItemSpec, canonical_json, snapshot_hash
@@ -77,19 +78,31 @@ def returns(conn: psycopg.Connection, campaign_id: uuid.UUID, refs: range, *, si
         assert result.recorded, result.reason
 
 
-def test_the_p_value_matches_a_hand_checked_case() -> None:
-    # 30 of 100 rewarded against 15 of 100 held back. Pooled rate 0.225, so
-    # z = 0.15 / sqrt(0.225 * 0.775 * (1/100 + 1/100)) = 2.5400, and the one-sided
-    # p-value is the normal tail beyond it, 0.5 * erfc(z / sqrt 2) = 0.00554.
-    z = 0.15 / math.sqrt(0.225 * 0.775 * 0.02)
-    assert round(z, 4) == 2.54
-    assert lift_p_value(30, 100, 15, 100) == pytest.approx(0.5 * math.erfc(z / math.sqrt(2)), rel=1e-9)
-    assert round(lift_p_value(30, 100, 15, 100), 5) == 0.00554
-    assert lift_p_value(15, 100, 30, 100) == pytest.approx(1 - 0.00554, abs=1e-5)
-    assert lift_p_value(0, 30, 0, 30) == lift_p_value(30, 30, 30, 30) == 0.5
+def test_the_p_value_is_fishers_exact_test_checked_by_hand() -> None:
+    # 3 of 30 rewarded came back and none of 30 held back. Given 3 returns among the
+    # 60, the chance all 3 land in the rewarded arm is C(30, 3) / C(60, 3) = 4060 / 34220.
+    assert lift_p_value(3, 30, 0, 30) == pytest.approx(4060 / 34220, rel=1e-12)
+    # 30 of 100 against 15 of 100: the hypergeometric tail from 30 up, summed by hand.
+    tail = sum(math.comb(100, k) * math.comb(100, 45 - k) for k in range(30, 46)) / math.comb(200, 45)
+    assert round(tail, 5) == 0.00857
+    assert lift_p_value(30, 100, 15, 100) == pytest.approx(tail, rel=1e-9)
+    assert lift_p_value(15, 100, 30, 100) == pytest.approx(0.99683, abs=1e-5)
+    assert lift_p_value(0, 30, 0, 30) == lift_p_value(30, 30, 30, 30) == 1.0
     for bad in ((1, 0, 0, 5), (6, 5, 0, 5), (-1, 5, 0, 5), (1.0, 5, 0, 5)):
         with pytest.raises(ValueError):
             lift_p_value(*bad)
+
+
+@pytest.mark.parametrize("rewarded_back", [3, 5], ids=["3 of 30 against 0 of 30", "5 of 30 against 0 of 30"])
+def test_a_few_returns_against_none_are_not_called_a_lift(conn: psycopg.Connection, rewarded_back: int) -> None:
+    # The old z-test called 3 against 0 a lift (one-sided p = 0.038); Fisher's exact
+    # test gives 0.119. 5 against 0 passes Fisher (0.026), but 5 returns among 60
+    # members is 2.5 expected per arm, under the 5 a verdict needs.
+    campaign_id = campaign(conn, 30, 30)
+    returns(conn, campaign_id, range(1, rewarded_back + 1), simulated=False)
+    result = campaign_results(conn, campaign_id)
+    assert not result.window_open and (result.rewarded.real_returns, result.holdout.real_returns) == (rewarded_back, 0)
+    assert (result.verdict, result.p_value) == (TOO_FEW, None)
 
 
 def test_simulated_returns_are_shown_apart_and_never_enter_the_rates(conn: psycopg.Connection) -> None:
@@ -104,7 +117,10 @@ def test_simulated_returns_are_shown_apart_and_never_enter_the_rates(conn: psyco
     assert (after.rewarded.real_returns, after.holdout.real_returns) == (5, 5)
     assert (after.rewarded.simulated_returns, after.holdout.simulated_returns) == (20, 2)
     assert after.rewarded.real_rate == pytest.approx(5 / 30) and after.holdout.real_rate == pytest.approx(5 / 30)
-    assert (after.p_value, after.verdict) == (before.p_value, before.verdict) == (0.5, "no measurable difference yet (one-sided p = 0.500)")
+    # 10 returns among 60 members is exactly 5 expected per arm, so the verdict gate opens.
+    assert (after.p_value, after.verdict) == (before.p_value, before.verdict)
+    assert after.p_value == pytest.approx(lift_p_value(5, 30, 5, 30)) and round(after.p_value, 3) == 0.635
+    assert after.verdict == "no measurable difference yet (one-sided p = 0.635)"
 
 
 def test_a_clear_lift_with_30_per_arm_after_the_window_closes_is_called(conn: psycopg.Connection) -> None:
@@ -128,9 +144,9 @@ def test_too_early_below_30_per_arm_or_while_the_window_is_open(
     if sent_days_ago is not None:
         returns(conn, campaign_id, range(1, 16), simulated=False)
     result = campaign_results(conn, campaign_id)
-    assert result.verdict == TOO_EARLY
     assert result.window_open == (sent_days_ago != 31)
-    assert result.p_value is not None
+    assert result.verdict == (TOO_EARLY if result.window_open else TOO_FEW)
+    assert result.p_value is None
 
 
 def test_spend_counts_success_and_pending_items_at_their_approved_amounts(conn: psycopg.Connection) -> None:

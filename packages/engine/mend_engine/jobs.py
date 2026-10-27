@@ -35,6 +35,7 @@ from mend_engine.campaigns.cancel import (
     CANCEL_REST_AFTER,
     ITEM_RESTING_SQL,
     UNCLAIMED,
+    BatchReadBack,
     CancelIncomplete,
     ReadBackRefused,
     cancel_unclaimed,
@@ -44,9 +45,9 @@ from mend_engine.campaigns.cancel import (
 from mend_engine.campaigns.simulate import read_order
 from mend_engine.config import Config
 from mend_engine.events.payout_status import FINAL_STATUSES
-from mend_engine.events.process import record_simulated_purchase
-from mend_engine.paypal.http import PayPalError, PayPalHttp
-from mend_engine.paypal.payouts import SnapshotRefused
+from mend_engine.events.process import DENIED, batch_header, record_denied_batch, record_simulated_purchase
+from mend_engine.paypal.http import PayPalError, PayPalHttp, PayPalResponse
+from mend_engine.paypal.payouts import PAYOUTS_PATH, SnapshotRefused
 
 DEMO_CANCEL_LOCK = 7731300006
 DEMO_UNCLAIMED_AFTER = timedelta(minutes=10)
@@ -137,9 +138,12 @@ def refresh_items() -> dict:
       records only items of this batch named in the snapshot. In the same
       transaction each inserted row writes one "payout_item_restored" audit row
       (item id, batch, status), each move one "payout_item_refreshed" row, and the
-      batch one "payout_batch_reread" row (counts, outcome "read"). A read that fails
-      writes "payout_batch_reread" with outcome "failed" alone, so the batch goes
-      behind every other. Each item skipped is logged with its reason.
+      batch one "payout_batch_reread" row (counts, outcome "read"). When PayPal
+      answers DENIED for that same batch, listing items or not, every snapshot item
+      is recorded FAILED through events.process.record_denied_batch and the row's
+      outcome is "denied", with items_failed. A read that fails writes
+      "payout_batch_reread" with outcome "failed" alone, so the batch goes behind
+      every other. Each item skipped is logged with its reason.
     - Simulated orders: up to 10 the simulate button created whose PayPal order id
       is stored and has no attributed purchase, created or last read here at least
       15 minutes ago, least recently first. Each is read with
@@ -215,13 +219,49 @@ def _refresh_items(config: Config, conn: psycopg.Connection, http: PayPalHttp, d
             totals["unchanged"] += 1
 
 
+class _BatchAnswer:
+    """Passes every call on to http and keeps PayPal's last answer for a batch.
+
+    read_batch_back makes the GET itself and hands back only item changes, so this
+    is how the scheduled read learns PayPal's batch_status without a second request.
+    """
+
+    def __init__(self, http: PayPalHttp) -> None:
+        self._http = http
+        self._asked: str | None = None
+        self._body: dict | None = None
+
+    def request(self, method: str, path: str, **kwargs: object) -> PayPalResponse:
+        response = self._http.request(method, path, **kwargs)
+        if method == "GET" and path.startswith(PAYOUTS_PATH + "/"):
+            self._asked, self._body = path.rsplit("/", 1)[1], response.body
+        return response
+
+    def __getattr__(self, name: str) -> object:
+        return getattr(self._http, name)
+
+    def denied(self, sender_batch_id: str) -> bool:
+        """True when PayPal answered DENIED for the very batch id read, under this sender_batch_id."""
+        if self._body is None:
+            return False
+        named, status = batch_header(self._body)
+        return named == (self._asked, sender_batch_id) and status == DENIED
+
+
 def _restore_batches(config: Config, conn: psycopg.Connection, http: PayPalHttp, due: list[str], totals: dict) -> None:
     for sender_batch_id in due:
         totals["batches"] += 1
+        answer = _BatchAnswer(http)
         try:
             # One transaction, so a restored row or a move is never stored without its audit row.
             with conn.transaction():
-                result = read_batch_back(conn, http, sender_batch_id)
+                try:
+                    result = read_batch_back(conn, answer, sender_batch_id)
+                except ReadBackRefused:
+                    # A batch PayPal did not process may list no items; any other refusal stands.
+                    if not answer.denied(sender_batch_id):
+                        raise
+                    result = BatchReadBack((), ())
                 restored = moved = 0
                 for payout_item_id, change in result.changes:
                     if change.decision == "new":
@@ -234,11 +274,10 @@ def _restore_batches(config: Config, conn: psycopg.Connection, http: PayPalHttp,
                     elif change.decision == "moved":
                         moved += 1
                         _audit(conn, "payout_item_refreshed", {"payout_item_id": payout_item_id, "from": change.previous, "to": change.stored})
-                _audit(
-                    conn,
-                    "payout_batch_reread",
-                    {"sender_batch_id": sender_batch_id, "outcome": "read", "restored": restored, "moved": moved, "skipped": len(result.skipped)},
-                )
+                reread = {"sender_batch_id": sender_batch_id, "outcome": "read", "restored": restored, "moved": moved, "skipped": len(result.skipped)}
+                if answer.denied(sender_batch_id):
+                    reread.update(outcome="denied", items_failed=record_denied_batch(conn, sender_batch_id))
+                _audit(conn, "payout_batch_reread", reread)
         except Exception as exc:
             totals["failed"] += 1
             _log_failure(config, {"sender_batch_id": sender_batch_id}, exc)

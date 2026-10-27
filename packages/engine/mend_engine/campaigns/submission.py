@@ -10,12 +10,14 @@ PayPal is called, so a crash part way leaves a record to reconcile, never a gap.
 Once any attempt for a sender_batch_id may have reached PayPal, no answer but a
 created batch or PayPal's duplicate refusal settles the campaign, so a batch that
 exists is never written off as refused. Immediately before every POST, every
-receiver must still be a member (C28). Before the claim, the shop's balance must
-cover the batch, its fees and the floor (C20); when it does not, nothing is claimed.
+receiver must still be a member (C28). In the claim's own transaction, under one
+lock, the shop's balance less Mend's own recent batches must cover the batch, its
+fees and the floor (C20); when it does not, nothing is claimed.
 """
 
 from __future__ import annotations
 
+import re
 import uuid
 from dataclasses import dataclass
 
@@ -26,7 +28,7 @@ from mend_engine.campaigns.approval import frozen_snapshot
 from mend_engine.campaigns.spend import CapExceeded, check_daily_cap, database_now, lock_daily_cap
 from mend_engine.config import Config
 from mend_engine.members.membership import LEFT_REASON
-from mend_engine.paypal.balances import check_room
+from mend_engine.paypal.balances import check_room, lock_balance
 from mend_engine.paypal.http import PayPalError, PayPalHttp
 from mend_engine.paypal.payouts import (
     REFUSAL_STATUSES,
@@ -48,6 +50,8 @@ REFUSED_REASON = "PayPal refused the batch"
 # never resends a campaign that has one; PayPal's batch event settles it.
 BLOCKED_ACTION = "send_blocked_member_left"
 _INSERT_AUDIT = "insert into audit_log (actor, action, detail) values (%s, %s, %s)"
+_ERROR_NAME = re.compile(r"[A-Z0-9_]{1,64}", re.ASCII)
+_DEBUG_ID = re.compile(r"[A-Za-z0-9]{1,64}", re.ASCII)
 
 
 @dataclass(frozen=True)
@@ -68,11 +72,14 @@ def submit(conn: psycopg.Connection, http: PayPalHttp, campaign_id: uuid.UUID, c
     """Send an approved campaign as one Payouts batch, at most once however often it is called.
 
     Reads the frozen snapshot and checks it against its hash and the payout rules.
-    If the campaign is approved, reads the shop's PayPal balance once
-    (balances.check_room). Then, in one transaction under the daily-cap lock: moves
-    the campaign from approved to submitting with one conditional update, re-checks
-    the rolling daily cap, writes the payout_batches ledger row (status submitting)
-    and an audit row. Only then calls send_claimed, passing the payout_batch_id the
+    Then, if the campaign is approved, in one transaction under the balance lock and
+    then the daily-cap lock: asks again that it is approved, reads the shop's PayPal
+    balance once and checks the room left after Mend's own batches of the last 6
+    hours (balances.check_room), moves the campaign from approved to submitting with
+    one conditional update, re-checks the rolling daily cap, writes the
+    payout_batches ledger row (status submitting) and an audit row. The balance lock
+    is held until that commit, so a second sender's check sees this claim. Only
+    then calls send_claimed, passing the payout_batch_id the
     ledger already holds for this sender_batch_id, if any; a ledger row that was
     already there means an earlier submission may have reached PayPal, so the
     outcome counts as ambiguous. send_claimed records the answer by its rules. A
@@ -83,8 +90,8 @@ def submit(conn: psycopg.Connection, http: PayPalHttp, campaign_id: uuid.UUID, c
     read or sent and the current state comes back with sent False.
 
     Raises BalanceTooLow, with nothing changed (the campaign stays approved and is
-    not claimed), when the balance less the batch total and 25 cents an item is
-    below config.balance_floor_minor ("low_balance") or cannot be read
+    not claimed), when the balance less Mend's batches of the last 6 hours, the
+    batch total and 25 cents an item is below config.balance_floor_minor ("low_balance") or cannot be read
     ("balance_unavailable"); CapExceeded, with nothing changed but an audit row,
     when the batch would pass the daily cap; SnapshotRefused, with nothing changed,
     when the frozen snapshot fails its hash or a payout rule; LookupError for no
@@ -101,17 +108,22 @@ def submit(conn: psycopg.Connection, http: PayPalHttp, campaign_id: uuid.UUID, c
     total = sum(item.amount_minor for item in snap.items)
     # Only an approved campaign can be claimed below, so only it is worth a balance read.
     # The status guard never moves a campaign back to approved once it has left.
-    if conn.execute("select status from campaigns where campaign_id = %s", (campaign_id,)).fetchone()[0] != "approved":
+    if _status(conn, campaign_id) != "approved":
         return _current(conn, campaign_id, sender_batch_id)
-    check_room(http, snap, config.balance_floor_minor)
 
     try:
         with conn.transaction():
-            lock_daily_cap(conn)
-            claimed = conn.execute(
-                "update campaigns set status = 'submitting' where campaign_id = %s and status = 'approved' returning 1",
-                (campaign_id,),
-            ).fetchone()
+            lock_balance(conn)
+            # Asked again under the lock every claim takes, so of many callers only the
+            # one that will claim spends a balance read.
+            claimed = None
+            if _status(conn, campaign_id) == "approved":
+                check_room(conn, http, snap, config.balance_floor_minor)
+                lock_daily_cap(conn)
+                claimed = conn.execute(
+                    "update campaigns set status = 'submitting' where campaign_id = %s and status = 'approved' returning 1",
+                    (campaign_id,),
+                ).fetchone()
             if claimed is None:
                 known = None
             else:
@@ -182,7 +194,7 @@ def send_claimed(
     except SubmissionUnknown as exc:
         return _settle(conn, campaign_id, sender_batch_id, "submission_unknown", None, _error_detail(exc))
     except PayPalError as exc:
-        detail = {"status": exc.status, "name": exc.name, "debug_id": exc.debug_id}
+        detail = {"status": exc.status, **_paypal_strings(exc.name, exc.debug_id)}
         # submit_batch raises this only for a refusal that proves nothing was created; checked again here.
         if after_ambiguity or exc.status not in REFUSAL_STATUSES:
             return _settle(conn, campaign_id, sender_batch_id, "submission_unknown", None, detail)
@@ -257,6 +269,11 @@ def _receivers_still_members(conn: psycopg.Connection, snap: BatchSnapshot) -> b
     return found == len(receivers)
 
 
+def _status(conn: psycopg.Connection, campaign_id: uuid.UUID) -> str | None:
+    row = conn.execute("select status from campaigns where campaign_id = %s", (campaign_id,)).fetchone()
+    return row[0] if row else None
+
+
 def _current(conn: psycopg.Connection, campaign_id: uuid.UUID, sender_batch_id: str) -> SubmissionResult:
     row = conn.execute("select status from campaigns where campaign_id = %s", (campaign_id,)).fetchone()
     if row is None:
@@ -268,7 +285,16 @@ def _current(conn: psycopg.Connection, campaign_id: uuid.UUID, sender_batch_id: 
 
 
 def _error_detail(exc: SubmissionUnknown) -> dict:
-    return {"reason": exc.reason, "status": exc.status, "name": exc.name, "debug_id": exc.debug_id}
+    return {"reason": exc.reason, "status": exc.status, **_paypal_strings(exc.name, exc.debug_id)}
+
+
+def _paypal_strings(name: object, debug_id: object) -> dict:
+    # PayPal's own strings, kept only when they have the shape PayPal uses (as in
+    # campaigns/cancel.py), so nothing else reaches the audit log.
+    return {
+        "name": name if isinstance(name, str) and _ERROR_NAME.fullmatch(name) else None,
+        "debug_id": debug_id if isinstance(debug_id, str) and _DEBUG_ID.fullmatch(debug_id) else None,
+    }
 
 
 def _audit(conn: psycopg.Connection, action: str, campaign_id: uuid.UUID, sender_batch_id: str, **detail: object) -> None:

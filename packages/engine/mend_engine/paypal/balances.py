@@ -1,15 +1,22 @@
 """The shop's PayPal balance, read before any payout batch is sent (C20).
 
-PayPal's reporting balance can trail real activity by up to three hours, so two
-batches sent close together can both see the same figure. The floor kept back
-under every batch is what absorbs that; the daily cap bounds how much can go out
-inside the lag.
+PayPal's reporting balance can trail real activity by up to three hours, so a batch
+sent a moment ago may not show in it yet. The room a batch may use is therefore the
+reported balance less every batch Mend itself claimed in the last 6 hours, twice
+the lag, whether or not the figure shows it already: that errs towards sending
+less. The read, the check and the claim all happen under one lock in one
+transaction, so two senders can never both spend the same room.
 """
 
 from __future__ import annotations
 
 import re
+from datetime import timedelta
 
+import psycopg
+from psycopg.pq import TransactionStatus
+
+from mend_engine.campaigns.spend import CAMPAIGN_VOIDED_SQL, CLAIMED_SINCE_SQL, database_now
 from mend_engine.paypal.http import PayPalError, PayPalHttp
 from mend_engine.paypal.payouts import BatchSnapshot
 
@@ -17,6 +24,21 @@ BALANCES_PATH = "/v1/reporting/balances?currency_code=USD"
 # PayPal's Payouts fee for the API is about 0.25 USD an item, taken from the balance on
 # top of the amount, so each item is held to that much more.
 FEE_PER_ITEM_MINOR = 25
+# Taken by every first send and every resend before the balance read, and held to the
+# end of the transaction that claims the batch. Any fixed number works, as for
+# spend.DAILY_CAP_LOCK, which is always taken after this one.
+BALANCE_LOCK = 7731300008
+OUTFLOW_WINDOW = timedelta(hours=6)
+# Parameters: the fee per item, the campaign being sent, and the start of the window.
+# Every item, with its fee, of every other campaign whose latest claim is after that
+# start. Items PayPal reports as failed or returned still count: whether the lagging
+# figure shows them back yet is unknown. Only a voided campaign, which never sent
+# anything, is left out.
+_OUTFLOWS_SQL = (
+    "select coalesce(sum((item ->> 'amount_minor')::bigint + %s), 0) "
+    "from approved_snapshots s cross join lateral jsonb_array_elements(s.canonical_json::jsonb -> 'items') item "
+    "where s.campaign_id::text <> %s and " + CLAIMED_SINCE_SQL + " and not " + CAMPAIGN_VOIDED_SQL
+)
 LOW_BALANCE = "low_balance"
 BALANCE_UNAVAILABLE = "balance_unavailable"
 
@@ -68,22 +90,52 @@ def available_usd_minor(http: PayPalHttp) -> int:
     return -cents if sign else cents
 
 
-def check_room(http: PayPalHttp, snap: BatchSnapshot, floor_minor: int) -> None:
+def lock_balance(conn: psycopg.Connection) -> None:
+    """Take BALANCE_LOCK until the current transaction ends.
+
+    Raises RuntimeError outside a transaction, where the lock would end at once.
+    """
+    if conn.info.transaction_status != TransactionStatus.INTRANS:
+        raise RuntimeError("the balance lock needs an open transaction")
+    conn.execute("select pg_advisory_xact_lock(%s)", (BALANCE_LOCK,))
+
+
+def recent_outflows_minor(conn: psycopg.Connection, campaign_id: str) -> int:
+    """Cents, fees included, in every batch Mend claimed in the last 6 hours for a campaign other than campaign_id.
+
+    A campaign counts from its latest move into submitting, as for the daily cap,
+    and counts every item of its frozen snapshot plus 25 cents each, unless it is
+    voided. Ledger rows with no frozen snapshot (the M1 proof payouts) are not counted.
+    """
+    since = database_now(conn) - OUTFLOW_WINDOW
+    return int(conn.execute(_OUTFLOWS_SQL, (FEE_PER_ITEM_MINOR, campaign_id, since)).fetchone()[0])
+
+
+def check_room(conn: psycopg.Connection, http: PayPalHttp, snap: BatchSnapshot, floor_minor: int) -> None:
     """Refuse a batch the shop's balance cannot cover with the floor still left over.
 
-    Reads the balance once. The batch needs its total plus 25 cents an item; what
-    the balance has beyond that must be at least floor_minor. Raises BalanceTooLow
-    "low_balance" when it is not, and "balance_unavailable" when the balance could
-    not be read at all, so an unknown balance never lets money out.
+    Must run inside the transaction that then claims the batch: it takes
+    BALANCE_LOCK first, which that transaction keeps until it commits, so the next
+    sender's check sees this claim. Reads the balance once, then takes off
+    recent_outflows_minor for every other campaign. The batch needs its total plus
+    25 cents an item; what is left beyond that must be at least floor_minor.
+
+    Raises BalanceTooLow "low_balance" when it is not, and "balance_unavailable"
+    when the balance could not be read at all, so an unknown balance never lets
+    money out; RuntimeError outside a transaction, with nothing read.
     """
+    lock_balance(conn)
     try:
         available = available_usd_minor(http)
     except PayPalError as exc:
         raise BalanceTooLow(
             BALANCE_UNAVAILABLE, f"the balance could not be read (status={exc.status} name={exc.name} debug_id={exc.debug_id})"
         ) from None
+    outflows = recent_outflows_minor(conn, snap.campaign_id)
     needed = sum(item.amount_minor for item in snap.items) + FEE_PER_ITEM_MINOR * len(snap.items)
-    if available - needed < floor_minor:
+    if available - outflows - needed < floor_minor:
         raise BalanceTooLow(
-            LOW_BALANCE, f"available {available} cents less {needed} for the batch and its fees is below the {floor_minor} cent floor"
+            LOW_BALANCE,
+            f"available {available} cents less {outflows} sent in the last 6 hours and {needed} for the batch and its fees "
+            f"is below the {floor_minor} cent floor",
         )

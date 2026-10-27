@@ -1,6 +1,8 @@
 # Not covered here: the real UCI numbers (prove_backtest runs all six cutoffs on the
 # real file), whether a given cutoff's fit converges on real data, seasonality, and
 # any lift from a campaign. A backtest on a fixed log tests the ranking, never a send.
+# The bootstrap's coverage (that 95 percent intervals hold the truth 95 percent of
+# the time) is not tested; only its known-answer cases and its wiring are.
 import io
 import math
 import zipfile
@@ -13,9 +15,18 @@ from hypothesis import given
 from hypothesis import strategies as st
 from openpyxl import Workbook
 
+from mend_engine.campaigns import eligibility
 from mend_engine.data.uci import COLUMNS, SHEETS, XLSX_NAME
 from mend_engine.model import backtest
-from mend_engine.model.backtest import auc, decile_table, purchase_days_from_uci, run_cutoff
+from mend_engine.model.backtest import (
+    Paired,
+    auc,
+    decile_table,
+    difference_interval,
+    purchase_days_from_uci,
+    run_backtest,
+    run_cutoff,
+)
 from mend_engine.model.bgnbd import FitResult, Params
 
 D = date
@@ -116,14 +127,110 @@ def test_run_cutoff_counts_known_returners_by_hand() -> None:
     # Back within 91 days: steady (2 days), lapsed-back (1), edge-in on the last day (1).
     # edge-out comes back one day too late; late's days are not in the cohort.
     assert result.actual_purchase_days == 4
-    # 3 or more days and silent 90 or more: lapsed-back 141, lapsed-gone exactly 90,
-    # edge-in 107, edge-out 106. nearly-lapsed is silent 89; two-days has only 2 days.
-    assert result.lapsed_regulars == 4
-    assert result.lapsed_returned_share == 0.5
+    # 3 or more days and silent 60 or more, the rule campaigns use: lapsed-back 141,
+    # lapsed-gone 90, nearly-lapsed 89, edge-in 107, edge-out 106. two-days has only
+    # 2 days. Back of those five: lapsed-back and edge-in.
+    assert result.lapsed_regulars == 5
+    assert result.lapsed_returned_share == 0.4
     # Gone, by days silent: 90, 89, 106, 29, 136. Back: 0, 141, 107. Every gone
     # customer beats steady (5 pairs) and only two-days beats edge-in (1), so 6 of 15.
     assert result.auc_recency == pytest.approx(0.4, abs=1e-12)
     assert (result.auc_model is None) == (result.predicted_purchase_days is None) == (not result.converged)
+
+
+def test_each_group_is_scored_inside_itself_by_hand() -> None:
+    result = run_cutoff(HAND, CUT)
+
+    assert (backtest.REGULAR_MIN_DAYS, backtest.SILENT_MIN_DAYS) == (eligibility.REGULAR_MIN_DAYS, eligibility.SILENT_MIN_DAYS)
+    live = result.live_segment
+    # The five lapsed regulars above. Gone, by days silent: 90, 89, 106. Back: 141,
+    # 107. No gone one was silent longer than a returner, so recency wins 0 of 6 pairs.
+    assert (live.customers, live.returned, live.auc_recency) == (5, 2, 0.0)
+    # This fit does not converge, so there is no model number and nothing to resample.
+    assert (live.auc_model, live.difference, live.low, live.high) == (None, None, None, None)
+    assert result.target_group == live
+    everyone = result.all_customers
+    assert (everyone.customers, everyone.returned) == (8, 3)
+    assert (everyone.auc_model, everyone.auc_recency) == (result.auc_model, result.auc_recency)
+
+
+def test_every_group_carries_a_seeded_interval_on_its_difference() -> None:
+    shop = simulated_shop()
+    result = run_cutoff(shop, SIM_CUT)
+
+    assert run_cutoff(shop, SIM_CUT) == result
+    seen = {c: [d for d in days if d <= SIM_CUT] for c, days in shop.items()}
+    live = [
+        c for c, days in seen.items()
+        if len(days) >= eligibility.REGULAR_MIN_DAYS and (SIM_CUT - days[-1]).days >= eligibility.SILENT_MIN_DAYS
+    ]
+    assert result.live_segment.customers == len(live) > 100
+    assert result.all_customers.customers == result.customers
+    assert result.all_customers.auc_model == result.auc_model
+    for group in (result.live_segment, result.target_group, result.all_customers):
+        assert group.difference == group.auc_model - group.auc_recency
+        assert group.low <= group.difference <= group.high
+        assert group.high - group.low < 0.5
+
+
+def test_difference_interval_on_cases_with_a_known_answer() -> None:
+    gone = np.array([True] * 20 + [False] * 20)
+    ranked = np.arange(40, 0, -1, dtype=float)
+    ids = [f"c{n}" for n in range(40)]
+
+    assert difference_interval([Paired(ids, ranked, ranked, gone)]) == (0.0, 0.0)
+    # A perfect ranking against its reverse differs by exactly 1 on every resample.
+    assert difference_interval([Paired(ids, ranked, -ranked, gone)]) == (1.0, 1.0)
+    assert difference_interval([Paired(ids, ranked, -ranked, gone), Paired(ids, ranked, ranked, gone)]) == (0.5, 0.5)
+    # With two customers some resample draws one of them twice and loses a kind.
+    tiny = Paired(["a", "b"], np.array([1.0, 0.0]), np.array([0.0, 1.0]), np.array([True, False]))
+    assert difference_interval([tiny]) is None
+
+
+@pytest.mark.parametrize(
+    ("parts", "options"),
+    [
+        ([], {}),
+        ([Paired(["a", "a"], np.array([1.0, 0.0]), np.array([0.0, 1.0]), np.array([1, 0]))], {}),
+        ([Paired(["a", "b"], np.array([1.0, 0.0, 2.0]), np.array([0.0, 1.0]), np.array([1, 0]))], {}),
+        ([Paired(["a", "b"], np.array([1.0, 0.0]), np.array([0.0, 1.0]), np.array([1, 1]))], {}),
+        ([Paired(["a", "b"], np.array([1.0, math.nan]), np.array([0.0, 1.0]), np.array([1, 0]))], {}),
+        ([Paired(["a", "b"], np.array([1.0, 0.0]), np.array([0.0, 1.0]), np.array([1, 0]))], {"resamples": 0}),
+        ([Paired(["a", "b"], np.array([1.0, 0.0]), np.array([0.0, 1.0]), np.array([1, 0]))], {"resamples": True}),
+        ([Paired(["a", "b"], np.array([1.0, 0.0]), np.array([0.0, 1.0]), np.array([1, 0]))], {"seed": -1}),
+    ],
+)
+def test_difference_interval_refuses_what_it_cannot_resample(parts: list, options: dict) -> None:
+    with pytest.raises(ValueError):
+        difference_interval(parts, **options)
+
+
+def test_run_backtest_pools_only_the_cutoffs_where_the_difference_is_defined(monkeypatch: pytest.MonkeyPatch) -> None:
+    shop = simulated_shop()
+    cutoffs = (SIM_CUT - timedelta(days=182), SIM_CUT - timedelta(days=91), SIM_CUT)
+    real_fit, calls = backtest.fit, []
+
+    def first_fit_fails(*args, **kwargs) -> FitResult:
+        found = real_fit(*args, **kwargs)
+        calls.append(found)
+        return found if len(calls) > 1 else FitResult(found.params, found.log_likelihood, False, "not converged: forced for this test")
+
+    monkeypatch.setattr(backtest, "fit", first_fit_fails)
+    run = run_backtest(shop, cutoffs)
+
+    assert [r.cutoff for r in run.results] == list(cutoffs)
+    assert run.results[0].live_segment.difference is None and run.results[0].all_customers.difference is None
+    for name in ("live_segment", "target_group", "all_customers"):
+        summary = getattr(run, name)
+        differences = [getattr(r, name).difference for r in run.results[1:]]
+        assert summary.valid == 2
+        assert summary.model_wins == sum(1 for d in differences if d > 0)
+        assert summary.mean_difference == pytest.approx(sum(differences) / 2, abs=1e-15)
+        assert summary.low <= summary.mean_difference <= summary.high
+    with pytest.raises(ValueError):
+        run_backtest(shop, ())
+    with pytest.raises(ValueError):
+        run_backtest(shop, (SIM_CUT, SIM_CUT))
 
 
 def test_a_fit_that_does_not_converge_is_reported_not_scored() -> None:

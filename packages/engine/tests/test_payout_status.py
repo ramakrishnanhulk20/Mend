@@ -38,12 +38,29 @@ SPEC = {
 }
 
 
-def test_every_pair_of_known_statuses_follows_the_table() -> None:
+def reachable(status: str) -> set[str]:
+    """Every status SPEC's arrows lead to from status, in one or more steps."""
+    found: set[str] = set()
+    todo = list(SPEC[status])
+    while todo:
+        step = todo.pop()
+        if step not in found:
+            found.add(step)
+            todo.extend(SPEC[step])
+    return found
+
+
+def test_every_pair_of_known_statuses_follows_the_table_in_one_step_or_more() -> None:
     assert KNOWN_STATUSES == set(SPEC) and FINAL_STATUSES == {"FAILED", "BLOCKED", "RETURNED", "REFUNDED", "REVERSED"}
     for before in SPEC:
         for after in SPEC:
-            expected = "unchanged" if before == after else ("moved" if after in SPEC[before] else "refused")
+            expected = "unchanged" if before == after else ("moved" if after in reachable(before) else "refused")
             assert decide(before, after) == expected, (before, after)
+    # A missed answer in between must not strand an item: PayPal can report PENDING, then RETURNED.
+    assert decide("PENDING", "RETURNED") == decide("ONHOLD", "REFUNDED") == "moved"
+    assert decide("SUCCESS", "UNCLAIMED") == decide("RETURNED", "PENDING") == "refused"
+    # No status reaches itself, so following the arrows can never lead back.
+    assert all(status not in reachable(status) for status in SPEC)
 
 
 def test_an_unknown_status_is_kept_as_text_but_counts_as_pending() -> None:
@@ -67,7 +84,7 @@ def test_no_order_of_answers_ever_moves_a_status_backwards_or_off_a_final_one(an
             continue
         if stored is not None:
             before, after = effective(stored), effective(seen)
-            assert before == after or after in SPEC[before]
+            assert before == after or after in reachable(before)
             assert before not in FINAL_STATUSES or before == after
         stored = seen
 
@@ -114,6 +131,13 @@ def test_a_verified_success_after_returned_leaves_it_returned(conn: psycopg.Conn
     change = record(conn, "SUCCESS")
     assert (change.decision, change.previous, change.stored) == ("refused", "RETURNED", "RETURNED")
     assert stored(conn) == ("RETURNED", 25)
+
+
+def test_pending_then_returned_is_recorded(conn: psycopg.Connection) -> None:
+    # The UNCLAIMED answer in between was never seen; RETURNED is still reachable, so it is stored.
+    record(conn, "PENDING")
+    change = record(conn, "RETURNED")
+    assert (change.decision, change.previous, change.stored, stored(conn)) == ("moved", "PENDING", "RETURNED", ("RETURNED", 25))
 
 
 def test_a_success_paypal_reverses_becomes_reversed_and_nothing_moves_it_on(conn: psycopg.Connection) -> None:

@@ -1,11 +1,16 @@
 """Proves M4a on the demo shop's real records: python -m mend_engine.prove_m4a
 
-Joins 40 demo members (the 40 quiet regulars most at risk on 2026-10-16, by their
-synthetic shop emails) and one member who is no shop customer, scores the shop,
-builds two campaign drafts, tries to break the draft rules, and has one member
-leave. Prints PASS or FAIL per line and a final M4A RESULT line. It calls no
-PayPal API and moves no money. The 40 demo members stay in place for M4b; every
-campaign this run creates ends voided, and the non-customer member leaves.
+Joins the 40 demo stand-ins (the 40 quiet regulars most at risk on 2026-10-16, by the
+synthetic address each was given) and one stand-in who is no shop customer, all under
+this script's own name, scores the shop, and shows who is eligible and who a running
+measurement still holds. It drafts, shows that a second draft over the same members is
+refused while the first holds them, voids and redraws until the random holdout
+differs, checks every amount against today's caps, tries to break the draft rules,
+and has one stand-in leave. Prints PASS or FAIL per line and a final M4A RESULT line.
+It calls no PayPal API and moves no money. Run python -m mend_engine.seed_demo first,
+so the stand-ins are labelled and on the current consent wording. The 40 stand-ins
+stay in place for M4b; every campaign this run creates ends voided, and the
+non-customer stand-in leaves.
 """
 
 from __future__ import annotations
@@ -23,23 +28,31 @@ import psycopg
 from psycopg.types.json import Jsonb
 
 from mend_engine.campaigns.drafts import DraftRefused, DraftSettings, build_draft, draft_view
-from mend_engine.campaigns.eligibility import REGULAR_MIN_DAYS, SILENT_MIN_DAYS, quiet_regular_members
+from mend_engine.campaigns.eligibility import (
+    REGULAR_MIN_DAYS,
+    SILENT_MIN_DAYS,
+    Candidate,
+    quiet_regular_members,
+    sent_by_receiver,
+)
 from mend_engine.campaigns.holdout import DEFAULT_HOLDOUT_SHARE, holdout_size
-from mend_engine.campaigns.scoring import ScoreSet, paid_net_of_refunds, score_customers
+from mend_engine.campaigns.scoring import ScoreSet, net_of_later_refunds, score_customers
 from mend_engine.config import Config, ConfigError, load_config
 from mend_engine.db.connect import connect
 from mend_engine.db.migrate import migrate
 from mend_engine.members.consent import CONSENT_VERSION, DEMO_SHOP_NAME, consent_hash, consent_text_for
 from mend_engine.members.membership import (
     LEFT_REASON,
+    SOURCE_SEED,
     VOIDABLE_STATUSES,
     MembershipRefused,
+    customer_refs_by_email,
     join_member,
     leave_member,
     match_member_to_customer,
 )
 from mend_engine.paypal.payouts import normalise_email
-from mend_engine.shop.identities import SYNTHETIC_DOMAIN
+from mend_engine.shop.identities import SYNTHETIC_DOMAIN, synthetic_email
 
 ENV_PATH = Path(__file__).resolve().parents[3] / ".env"
 AS_OF = date(2026, 10, 16)
@@ -49,7 +62,22 @@ OUTSIDER_EMAIL = "not-a-customer@mend.example"
 GOAL = "Bring back our quiet regulars with a small thank-you"
 RUN_VOID_REASON = "proof run finished"
 ACTOR = "prove_m4a"
-CHECKS = 10
+CHECKS = 11
+# A fixed holdout would match on every draw; a random one over even 2 members differs
+# within 16 draws except about once in 65,000 runs.
+MAX_REDRAWS = 16
+# The owner's campaigns that still hold their members, written out again from the rule
+# (voided, or 30 days after first sent, lets them go; first sent is the first move to
+# submitted, else the first batch row) rather than imported, so the eligibility check
+# is compared with a second reading of it.
+HELD_BY_OWNER_CAMPAIGNS = (
+    "select distinct cm.member_id from campaign_members cm join campaigns c on c.campaign_id = cm.campaign_id "
+    "left join campaign_owners o on o.campaign_id = c.campaign_id "
+    "where cm.member_id is not null and o.role is distinct from 'demo' and c.status <> 'voided' "
+    "and coalesce(coalesce((select min(s.moved_at) from campaign_status_moves s where s.campaign_id = c.campaign_id "
+    "and s.to_status = 'submitted'), (select min(b.created_at) from payout_batches b where b.campaign_id = c.campaign_id::text)) "
+    "> now() - interval '30 days', true)"
+)
 
 _UUID_SHAPE = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}", re.IGNORECASE)
 _CUSTOMER_REF_SHAPE = re.compile(r"C[0-9]")
@@ -62,6 +90,10 @@ class Proof:
     def line(self, ok: bool, text: str) -> None:
         self.results.append(ok)
         print(f"[{'PASS' if ok else 'FAIL'}] {text}", flush=True)
+
+    @staticmethod
+    def note(text: str) -> None:
+        print(f"       NOTE: {text}", flush=True)
 
 
 def describe(exc: BaseException) -> str:
@@ -81,12 +113,20 @@ def demo_customers(scores: ScoreSet) -> list[str]:
     return sorted(quiet, key=lambda ref: (scores.scores[ref], ref))[:DEMO_MEMBERS]
 
 
-def join_demo_members(conn: psycopg.Connection, config: Config, refs: list[str]) -> dict[uuid.UUID, str]:
-    emails = dict(conn.execute("select customer_ref, email from shop_customers where customer_ref = any(%s)", (refs,)))
-    return {join(conn, config, emails[ref]): ref for ref in refs}
+def join_demo_members(conn: psycopg.Connection, config: Config, refs: list[str]) -> dict[uuid.UUID, str | None]:
+    """The stand-ins for refs, joined by the synthetic address each was given, each mapped to the shop customer it matches now.
+
+    The address is fixed by customer_ref, as seed_demo fixes it, so moving the test
+    receiver first (which trades two shop emails) never puts the receiver on the list;
+    the match is then read through the one email normaliser, as eligibility reads it.
+    """
+    emails = {join(conn, config, synthetic_email(ref)): synthetic_email(ref) for ref in refs}
+    by_email = customer_refs_by_email(conn)
+    return {member_id: by_email.get(normalise_email(email)) for member_id, email in emails.items()}
 
 
-def join(conn: psycopg.Connection, config: Config, email: str) -> uuid.UUID:
+def join(conn: psycopg.Connection, config: Config, email: str, actor: str = ACTOR) -> uuid.UUID:
+    # Joined under the script's own name, so each is a demo stand-in (source 'seed'), never a person's row.
     return join_member(
         conn,
         paypal_email=email,
@@ -94,6 +134,7 @@ def join(conn: psycopg.Connection, config: Config, email: str) -> uuid.UUID:
         email_verified=True,
         shop_name=DEMO_SHOP_NAME,
         client_id=config.paypal_client_id,
+        actor=actor,
     )
 
 
@@ -104,13 +145,25 @@ def roles(conn: psycopg.Connection, campaign_id: uuid.UUID) -> dict[uuid.UUID, s
 def check_members(proof: Proof, conn: psycopg.Connection, config: Config, demo: dict, outsider: uuid.UUID) -> None:
     digest = consent_hash(consent_text_for(DEMO_SHOP_NAME))
     rows = conn.execute(
-        "select member_id, consent_version, consent_text_sha256, client_id from members where member_id = any(%s)",
+        "select member_id, consent_version, consent_text_sha256, client_id, source from members where member_id = any(%s)",
         ([*demo, outsider],),
     ).fetchall()
-    consented = [r for r in rows if r[1] == CONSENT_VERSION and r[2] == digest and r[3] == config.paypal_client_id]
+    consented = [
+        r for r in rows if r[1] == CONSENT_VERSION and r[2] == digest and r[3] == config.paypal_client_id and r[4] == SOURCE_SEED
+    ]
     demo_count = sum(1 for r in consented if r[0] in demo)
     ok = len(demo) == demo_count == DEMO_MEMBERS and len(consented) == DEMO_MEMBERS + 1
-    proof.line(ok, f"members: {demo_count} demo members joined with consent version {CONSENT_VERSION}")
+    proof.line(
+        ok,
+        f"members: {demo_count} demo stand-ins and the non-customer, each labelled seed under {ACTOR}, "
+        f"on consent version {CONSENT_VERSION}",
+    )
+    if not ok:
+        proof.note("a stand-in still on an earlier wording or unlabelled is fixed by running python -m mend_engine.seed_demo")
+
+
+def held_members(conn: psycopg.Connection) -> set[uuid.UUID]:
+    return {member_id for (member_id,) in conn.execute(HELD_BY_OWNER_CAMPAIGNS)}
 
 
 def test_receiver_member(conn: psycopg.Connection, config: Config) -> uuid.UUID | None:
@@ -125,17 +178,26 @@ def test_receiver_member(conn: psycopg.Connection, config: Config) -> uuid.UUID 
 
 def check_eligible(
     proof: Proof, conn: psycopg.Connection, config: Config, scores: ScoreSet, demo: dict, outsider: uuid.UUID
-) -> None:
+) -> list[Candidate]:
     candidates = quiet_regular_members(conn, scores, AS_OF)
-    ids = [c.member_id for c in candidates]
-    # Refunds can cancel all a demo customer paid; such a member could be paid nothing, so is never eligible (C4).
-    refunded_out = {m for m, ref in demo.items() if scores.paid_minor[ref] < 1}
+    ids = {c.member_id for c in candidates}
+    held = held_members(conn)
+    regular = {
+        m: ref
+        for m, ref in demo.items()
+        if ref in scores.scores and scores.purchase_days[ref] >= REGULAR_MIN_DAYS and scores.days_silent[ref] >= SILENT_MIN_DAYS
+    }
+    # What each may still be paid: paid net of every refund, less rewards sent in 365 days (C4).
+    paid = net_of_later_refunds(conn, scores, list(regular.values()))
+    sent = sent_by_receiver(conn)
+    email_of = dict(conn.execute("select member_id, paypal_email from members where member_id = any(%s)", (list(regular),)))
+    no_room = {m for m, ref in regular.items() if m not in held and paid[ref] - sent.get(normalise_email(email_of[m]), 0) < 1}
+    expected = set(regular) - held - no_room
     receiver = test_receiver_member(conn, config)
-    allowed = set(demo) | ({receiver} if receiver else set())
     ok = (
-        set(demo) - refunded_out <= set(ids)
-        and not refunded_out & set(ids)
-        and set(ids) <= allowed
+        expected <= ids
+        and ids <= expected | ({receiver} if receiver else set())
+        and not ids & held
         and outsider not in ids
         and match_member_to_customer(conn, outsider) is None
         and all(a.score <= b.score for a, b in zip(candidates, candidates[1:]))
@@ -150,14 +212,37 @@ def check_eligible(
     proof.line(
         ok,
         f"eligible: {len(candidates)} quiet regular members{with_receiver}, most at risk first; "
-        f"{len(refunded_out)} demo members whose refunds cancel what they paid are left out; "
-        "the non-customer member is not eligible",
+        f"{len(held & set(demo))} demo stand-ins held by a running measurement and {len(no_room)} with nothing "
+        "left to be paid are left out; the non-customer is not eligible",
     )
+    return candidates
+
+
+def check_one_at_a_time(
+    proof: Proof, conn: psycopg.Connection, config: Config, settings: DraftSettings, first: uuid.UUID, eligible: int, created: list
+) -> None:
+    """A second draft while the first holds its members: refused when fewer than 2 are left, never sharing one otherwise (C6)."""
+    taken = set(roles(conn, first))
+    left = eligible - len(taken)
+    try:
+        second = build_draft(conn, config, settings).campaign_id
+        created.append(second)
+        outcome, shared = "drafted", set(roles(conn, second)) & taken
+    except DraftRefused as refused:
+        outcome, shared = refused.reason, set()
+    if left < 2:
+        ok = outcome == "too_few_candidates"
+        text = f"one at a time: a second draft while the first holds its {len(taken)} members is refused (too_few_candidates)"
+    else:
+        ok = outcome == "drafted" and not shared
+        text = f"one at a time: a second draft takes only the {left} members the first does not hold"
+    proof.line(ok, text + ("" if ok else f" (got {outcome}, {len(shared)} shared)"))
 
 
 def check_holdout(
-    proof: Proof, conn: psycopg.Connection, first: uuid.UUID, first_roles: dict, second: uuid.UUID, settings: DraftSettings
-) -> None:
+    proof: Proof, conn: psycopg.Connection, config: Config, settings: DraftSettings, first: uuid.UUID, first_roles: dict, created: list
+) -> uuid.UUID:
+    """Checks the first draft's holdout, voids it and redraws over the same members until the holdout differs; returns the redraw."""
     held = {m for m, role in first_roles.items() if role == "holdout"}
     count = len(first_roles)
     unpaid = conn.execute(
@@ -165,40 +250,49 @@ def check_holdout(
         "and amount_minor is null and note is null",
         (first,),
     ).fetchone()[0]
-    second_held = {m for m, role in roles(conn, second).items() if role == "holdout"}
-    ok = (
-        len(held) == holdout_size(count, settings.holdout_share) == unpaid
-        and roles(conn, first) == first_roles
-        and second_held != held
-    )
+    kept = roles(conn, first) == first_roles
+    void_own(conn, [first])
+    differs, same_members, draws, current = False, False, 0, first
+    while draws < MAX_REDRAWS and not differs:
+        draws += 1
+        current = build_draft(conn, config, settings).campaign_id
+        created.append(current)
+        redrawn = roles(conn, current)
+        same_members = set(redrawn) == set(first_roles)
+        differs = same_members and {m for m, role in redrawn.items() if role == "holdout"} != held
+        if not differs:
+            void_own(conn, [current])
+    ok = len(held) == holdout_size(count, settings.holdout_share) == unpaid and kept and differs
     proof.line(
         ok,
-        f"holdout: {len(held)} of {count} held back at random before any summary existed; "
-        "the same campaign keeps the same holdout when read again",
+        f"holdout: {len(held)} of {count} held back at random before any summary existed; the same campaign "
+        "keeps its holdout when read again; voided and drawn again over the same members, the holdout differs",
     )
+    proof.note(f"the holdout differed on redraw {draws} of at most {MAX_REDRAWS}" if differs else f"no redraw of {draws} differed")
+    return current
 
 
-def check_amounts(proof: Proof, conn: psycopg.Connection, config: Config, campaign_id: uuid.UUID, settings: DraftSettings) -> None:
+def check_amounts(
+    proof: Proof, conn: psycopg.Connection, config: Config, campaign_id: uuid.UUID, settings: DraftSettings, candidates: list[Candidate]
+) -> None:
     rows = conn.execute(
         "select member_id, role, amount_minor from campaign_members where campaign_id = %s", (campaign_id,)
     ).fetchall()
     reward = [(m, amount) for m, role, amount in rows if role == "reward"]
-    customer_of = {m: match_member_to_customer(conn, m) for m, _ in reward}
-    # The cap on each reward is what the customer paid net of refunds, the one number the draft and approval both use (C4).
-    paid = paid_net_of_refunds(conn, AS_OF, [ref for ref in customer_of.values() if ref])
+    # Each reward's own cap is what eligibility worked out for that member today (C4): paid net of
+    # every refund on record, less, for the owner, what was sent to them in the last 365 days.
+    room = {c.member_id: c.paid_minor for c in candidates}
     split = settings.budget_minor // len(reward) if reward else 0
     each_ok = all(
-        customer_of[m] in paid
-        and amount == min(settings.per_recipient_minor, config.item_cap_minor, split, paid[customer_of[m]])
-        for m, amount in reward
+        m in room and amount == min(settings.per_recipient_minor, config.item_cap_minor, split, room[m]) for m, amount in reward
     )
     holdout_ok = all(amount is None for _m, role, amount in rows if role == "holdout")
     total = sum(amount for _m, amount in reward)
     ok = bool(reward) and each_ok and holdout_ok and total <= settings.budget_minor
     proof.line(
         ok,
-        "amounts: every reward at most min(per-recipient, item cap, budget split, what they paid); "
-        "total <= budget; holdout members have no amount",
+        "amounts: every reward is min(per-recipient, item cap, budget split, what that member may still be paid: "
+        "paid net of every refund, less rewards sent in 365 days); total <= budget; holdout members have no amount",
     )
 
 
@@ -244,8 +338,10 @@ def check_view(proof: Proof, conn: psycopg.Connection, campaign_id: uuid.UUID) -
 
 
 def check_leave(proof: Proof, conn: psycopg.Connection, config: Config, campaign_id: uuid.UUID, demo: dict) -> dict:
+    # The most at-risk stand-in in the draft, never the test receiver, whose row may be a person's own.
     leaver = conn.execute(
-        "select member_id from campaign_members where campaign_id = %s and rank = 1", (campaign_id,)
+        "select member_id from campaign_members where campaign_id = %s and member_id = any(%s) order by rank limit 1",
+        (campaign_id, list(demo)),
     ).fetchone()[0]
     email = conn.execute("select paypal_email from members where member_id = %s", (leaver,)).fetchone()[0]
     result = leave_member(conn, leaver)
@@ -330,7 +426,7 @@ def run() -> bool:
             outsider = join(conn, config, OUTSIDER_EMAIL)
             check_members(proof, conn, config, demo, outsider)
             proof.line(True, f"scoring: BG/NBD converged on {len(scores.scores):,} shop customers as of {AS_OF}")
-            check_eligible(proof, conn, config, scores, demo, outsider)
+            candidates = check_eligible(proof, conn, config, scores, demo, outsider)
 
             settings = DraftSettings(
                 goal_text=GOAL,
@@ -340,16 +436,19 @@ def run() -> bool:
                 holdout_share=DEFAULT_HOLDOUT_SHARE,
                 max_candidates=DEMO_MEMBERS,
             )
-            first = build_draft(conn, config, settings).campaign_id
+            try:
+                first = build_draft(conn, config, settings).campaign_id
+            except DraftRefused as refused:
+                proof.line(False, f"draft: {refused.reason}; {len(candidates)} members are eligible and a draft needs 2")
+                return False
             created.append(first)
             first_roles = roles(conn, first)
-            second = build_draft(conn, config, settings).campaign_id
-            created.append(second)
-            check_holdout(proof, conn, first, first_roles, second, settings)
-            check_amounts(proof, conn, config, first, settings)
+            check_one_at_a_time(proof, conn, config, settings, first, len(candidates), created)
+            current = check_holdout(proof, conn, config, settings, first, first_roles, created)
+            check_amounts(proof, conn, config, current, settings, candidates)
             check_refusals(proof, conn, config, settings)
-            check_view(proof, conn, first)
-            demo = check_leave(proof, conn, config, first, demo)
+            check_view(proof, conn, current)
+            demo = check_leave(proof, conn, config, current, demo)
             check_c25(proof, conn, config)
             leave_member(conn, outsider)
             check_kept(proof, conn, demo)

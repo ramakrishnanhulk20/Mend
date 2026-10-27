@@ -15,8 +15,10 @@ import psycopg
 import pytest
 from psycopg import sql
 
+from mend_engine.campaigns import reconcile as reconcile_module
 from mend_engine.campaigns.approval import approve, review_hash
 from mend_engine.campaigns.reconcile import RECONCILE_LOCK, reconcile
+from mend_engine.campaigns.spend import database_now, spent_last_24h_minor
 from mend_engine.campaigns.submission import submit
 from mend_engine.config import SANDBOX_API_HOST, Config
 from mend_engine.db.connect import PGDATA
@@ -25,6 +27,10 @@ from mend_engine.members.consent import DEMO_SHOP_NAME
 from mend_engine.members.membership import join_member, leave_member
 from mend_engine.paypal import payouts
 from mend_engine.paypal.http import PayPalHttp
+from mend_engine.paypal.payouts import BatchSnapshot, PayoutItemSpec, canonical_json, sender_batch_id_for, snapshot_hash
+
+# The lock every demo send takes (tasks.DEMO_SPEND_LOCK), written out so the test does not lean on the code under test.
+DEMO_SPEND_LOCK = 7731300005
 
 CONFIG = Config(
     paypal_client_id="cid",
@@ -362,6 +368,137 @@ def test_a_campaign_unsettled_for_over_an_hour_is_flagged_once(conn: psycopg.Con
 
     assert state(conn, stale)[0] == state(conn, fresh)[0] == "submission_unknown"
     assert audit_rows(conn, "needs_attention") == [{"campaign_id": str(stale), "status": "submission_unknown"}]
+
+
+def large_campaign(conn: psycopg.Connection, first: int) -> uuid.UUID:
+    """An approved campaign paying 10000 cents: ten new members at 1000 each, plus one held back."""
+    campaign_id = conn.execute(
+        "insert into campaigns (shop_name, goal_text, as_of, budget_minor, per_recipient_minor, holdout_share, status) "
+        "values (%s, 'goal', '2026-10-16', 10000, 1000, 0.5, 'draft') returning campaign_id",
+        (DEMO_SHOP_NAME,),
+    ).fetchone()[0]
+    for rank in range(1, 12):
+        n = first + rank - 1
+        conn.execute("insert into shop_customers values (%s, 'Maya R.', %s, 'UK')", (f"C{n}", f"c{n}@shop.example"))
+        conn.execute("insert into shop_orders values (%s, %s, '2026-06-01 12:00+00', 1000, 'USD')", (f"o{n}", f"C{n}"))
+        member_id = join_member(
+            conn, paypal_email=f"c{n}@shop.example", paypal_payer_id=None, email_verified=True,
+            shop_name=DEMO_SHOP_NAME, client_id="cid",
+        )
+        reward = rank <= 10
+        conn.execute(
+            "insert into campaign_members values (%s, %s, %s, %s, %s, 0.1, %s, %s)",
+            (campaign_id, f"R{rank}", member_id, "reward" if reward else "holdout", rank,
+             1000 if reward else None, NOTE if reward else None),
+        )
+    approve(conn, campaign_id, approver="owner", presented_hash=review_hash(conn, campaign_id), config=CONFIG)
+    return campaign_id
+
+
+def first_claimed_hours_ago(conn: psycopg.Connection, campaign_id: uuid.UUID, hours: int) -> None:
+    conn.execute(
+        "update payout_batches set created_at = created_at - make_interval(hours => %s) where campaign_id = %s",
+        (hours, str(campaign_id)),
+    )
+    backdate_submitting(conn, campaign_id, hours * 60)
+
+
+def test_a_late_resend_waits_while_it_would_pass_the_daily_cap(conn: psycopg.Connection) -> None:
+    # The auditor's repro: a 25-hour-old unknown campaign plus two new 10000 sends under a 20000 cap.
+    late = large_campaign(conn, 1)
+    submit(conn, Payouts(refuse=lambda: httpx.Response(503, json={})).http(), late, CONFIG)
+    first_claimed_hours_ago(conn, late, 25)
+    late_sender = state(conn, late)[1][0][0]
+    paypal = Payouts()
+    for first in (20, 40):
+        assert submit(conn, paypal.http(), large_campaign(conn, first), CONFIG).status == "submitted"
+
+    runs = [reconcile(conn, paypal.http()) for _ in range(2)]
+
+    assert all((run.actions[0].after, run.actions[0].sent) == ("submission_unknown", False) for run in runs)
+    assert late_sender not in paypal.posts and len(paypal.batches) == 2
+    assert audit_rows(conn, "resend_waiting_on_cap") == [
+        {"campaign_id": str(late), "sender_batch_id": late_sender, "reason": "daily_cap"}
+    ]
+    assert audit_rows(conn, "reconcile_resubmitting") == []
+    assert spent_last_24h_minor(conn, database_now(conn)) == 20000
+
+
+def demo_spent_now(conn: psycopg.Connection, items: int) -> uuid.UUID:
+    """A demo campaign that took items 100-cent rewards from the demo pool just now."""
+    campaign_id = conn.execute(
+        "insert into campaigns (shop_name, goal_text, as_of, budget_minor, per_recipient_minor, holdout_share, status) "
+        "values ('Shop', 'goal', '2026-10-16', 10000, 100, 0.5, 'submitted') returning campaign_id"
+    ).fetchone()[0]
+    snap = BatchSnapshot(
+        str(campaign_id), "USD", "A thank-you", tuple(PayoutItemSpec(f"x{n}@shop.example", 100, "Thanks", f"R{n}") for n in range(1, items + 1))
+    )
+    conn.execute("insert into approved_snapshots values (%s, %s, %s, now(), 'owner')", (campaign_id, snapshot_hash(snap), canonical_json(snap)))
+    conn.execute(
+        "insert into payout_batches (sender_batch_id, campaign_id, snapshot_hash, status) values (%s, %s, %s, 'created')",
+        (sender_batch_id_for(snap), str(campaign_id), snapshot_hash(snap)),
+    )
+    conn.execute("insert into campaign_owners values (%s, 'demo', %s)", (campaign_id, "d" * 64))
+    return campaign_id
+
+
+def test_a_late_demo_resend_waits_for_the_demo_pool_and_the_demo_spend_lock(conn: psycopg.Connection, server_url: str) -> None:
+    late = unknown_after_503s(conn)
+    conn.execute("insert into campaign_owners values (%s, 'demo', %s)", (late, "e" * 64))
+    first_claimed_hours_ago(conn, late, 25)
+    late_sender = state(conn, late)[1][0][0]
+    pool_taker = demo_spent_now(conn, 46)
+    paypal = Payouts()
+
+    # 4600 cents of the 5000 demo pool are out, and the resend carries 500.
+    [waiting] = reconcile(conn, paypal.http()).actions
+    assert (waiting.after, waiting.sent, paypal.posts) == ("submission_unknown", False, [])
+    assert audit_rows(conn, "resend_waiting_on_cap") == [
+        {"campaign_id": str(late), "sender_batch_id": late_sender, "reason": "demo_pool"}
+    ]
+
+    taker_sender = conn.execute("select sender_batch_id from payout_batches where campaign_id = %s", (str(pool_taker),)).fetchone()[0]
+    conn.execute(
+        "insert into payout_items (payout_item_id, sender_batch_id, sender_item_id, status) "
+        "select 'BACK' || n, %s, 'R' || n, 'RETURNED' from generate_series(1, 46) n",
+        (taker_sender,),
+    )
+    with psycopg.connect(server_url, autocommit=True) as other:
+        other.execute("select pg_advisory_lock(%s)", (DEMO_SPEND_LOCK,))
+        [busy] = reconcile(conn, paypal.http()).actions
+        other.execute("select pg_advisory_unlock(%s)", (DEMO_SPEND_LOCK,))
+    assert (busy.after, busy.sent, paypal.posts) == ("submission_unknown", False, [])
+
+    [sent] = reconcile(conn, paypal.http()).actions
+    assert (sent.after, sent.sent, paypal.posts) == ("submitted", True, [late_sender])
+    assert len(audit_rows(conn, "resend_waiting_on_cap")) == 1
+
+
+def test_an_unexpected_error_on_one_campaign_is_logged_scrubbed_and_the_run_goes_on(
+    conn: psycopg.Connection, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    broken = unknown_after_503s(conn)
+    healthy = unknown_after_503s(conn, first=10)
+    backdate_submitting(conn, broken, 61)
+    real_frozen_snapshot = reconcile_module.frozen_snapshot
+
+    def frozen_snapshot(connection: psycopg.Connection, campaign_id: uuid.UUID) -> object:
+        if campaign_id == broken:
+            raise RuntimeError(f"lost the database for {CONFIG.paypal_client_secret} and c1@shop.example")
+        return real_frozen_snapshot(connection, campaign_id)
+
+    monkeypatch.setattr(reconcile_module, "frozen_snapshot", frozen_snapshot)
+    paypal = Payouts()
+
+    report = reconcile(conn, paypal.http())
+
+    assert [(a.campaign_id, a.after, a.sent) for a in report.actions] == [(broken, "submission_unknown", False), (healthy, "submitted", True)]
+    assert audit_rows(conn, "needs_attention") == [{"campaign_id": str(broken), "status": "submission_unknown"}]
+    logged = [json.loads(line) for line in capsys.readouterr().err.splitlines() if line.startswith("{")]
+    [failure] = [entry for entry in logged if entry.get("outcome") == "failed"]
+    assert (failure["task"], failure["campaign_id"], failure["exception"]) == ("reconcile", str(broken), "RuntimeError")
+    text = json.dumps(logged)
+    assert CONFIG.paypal_client_secret not in text and "c1@shop.example" not in text
 
 
 def test_two_runs_never_overlap(conn: psycopg.Connection, server_url: str) -> None:

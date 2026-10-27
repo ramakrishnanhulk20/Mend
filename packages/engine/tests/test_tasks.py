@@ -253,6 +253,75 @@ def test_a_demo_session_may_draft_five_campaigns_a_day(conn: psycopg.Connection,
     assert tasks.draft_campaign(DEMO_SETTINGS, actor(conn, "demo"))["ok"] is True
 
 
+def members_of(conn: psycopg.Connection, campaign_id: str) -> set[uuid.UUID]:
+    return {r[0] for r in conn.execute("select member_id from campaign_members where campaign_id = %s", (uuid.UUID(campaign_id),))}
+
+
+def test_two_owner_drafts_at_once_never_share_a_member_and_a_demo_visitors_draft_is_its_own(
+    conn: psycopg.Connection, paypal: FakePayPal
+) -> None:
+    seed_shop(conn)
+    owner = actor(conn, "owner")
+    gate = threading.Barrier(2)
+    answers: list[dict] = []
+
+    def draft() -> None:
+        gate.wait()
+        answers.append(tasks.draft_campaign(DEMO_SETTINGS, owner))
+
+    workers = [threading.Thread(target=draft) for _ in range(2)]
+    for worker in workers:
+        worker.start()
+    for worker in workers:
+        worker.join(timeout=120)
+
+    assert len(answers) == 2 and all(answer["ok"] for answer in answers), answers
+    first, second = (members_of(conn, answer["campaign_id"]) for answer in answers)
+    assert len(first) == len(second) == 10 and not first & second
+    # A demo visitor's measurement is its own, so it starts from the same most-at-risk members.
+    demo = members_of(conn, tasks.draft_campaign(DEMO_SETTINGS, actor(conn, "demo"))["campaign_id"])
+    assert demo in (first, second)
+
+
+def test_a_draft_for_any_day_but_the_shops_own_is_refused_before_anything_is_scored(
+    conn: psycopg.Connection, paypal: FakePayPal, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    owner = actor(conn, "owner")
+    built: list[int] = []
+    real_build_draft = tasks.build_draft
+
+    def counted(*args: object, **kwargs: object) -> object:
+        built.append(1)
+        return real_build_draft(*args, **kwargs)
+
+    monkeypatch.setattr(tasks, "build_draft", counted)
+    assert refused(tasks.draft_campaign(DEMO_SETTINGS, owner), "invalid_input")  # a shop with no orders has no day
+    seed_shop(conn)
+    for day in ("2026-10-15", "2026-10-17", "2025-10-16"):
+        assert refused(tasks.draft_campaign({**DEMO_SETTINGS, "as_of": day}, owner), "invalid_input")
+    assert built == [] and counts(conn) == (0, 0)
+    assert tasks.draft_campaign(DEMO_SETTINGS, owner)["ok"] is True and built == [1]
+
+
+def test_log_lines_lose_the_value_of_every_secret_shaped_environment_variable(monkeypatch: pytest.MonkeyPatch) -> None:
+    secret_values = {
+        "STRIPE_WEBHOOK_SECRET": "whsec-value-1234",
+        "SLACK_TOKEN": "tok-value-5678",
+        "ANTHROPIC_API_KEY": "key-value-9012",
+        "ADMIN_PASSWORD": "pw-value-3456",
+        "DATABASE_URL": "postgresql://u:dbpw-7890@dbhost/db",
+        "lower_case_token": "tok-lower-1111",
+    }
+    for name, value in secret_values.items():
+        monkeypatch.setenv(name, value)
+    monkeypatch.setenv("MEND_DAILY_CAP_MINOR", "20000500")
+
+    scrubbed = tasks._scrub("failed with " + " and ".join(secret_values.values()) + " under cap 20000500", None)
+
+    assert not any(value in scrubbed for value in secret_values.values()), scrubbed
+    assert scrubbed.count("[removed]") == len(secret_values) and "20000500" in scrubbed
+
+
 def test_a_demo_draft_may_consider_at_most_20_candidates_and_is_refused_before_scoring(
     conn: psycopg.Connection, paypal: FakePayPal, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -756,6 +825,9 @@ def test_the_shop_summary_matches_a_direct_read_and_says_when_the_model_facts_ar
     quiet = [r[0] for r in conn.execute(QUIET_BY_SQL)]
     # One refund inside the year comes off, one larger than the year's purchases floors that customer at 0.
     conn.execute("insert into shop_refunds values ('X1', %s, '2026-09-01 12:00+00', 300), ('X2', %s, '2026-09-01 12:00+00', 999999)", (quiet[0], quiet[1]))
+    # Two stand-ins a script joined, which no person agreed to, are counted apart from the people who joined.
+    for email in ("stand-in-1@shop.example", "stand-in-2@shop.example"):
+        join_member(conn, paypal_email=email, paypal_payer_id=None, email_verified=True, shop_name=DEMO_SHOP_NAME, client_id="cid", actor="seed_demo")
 
     summary = tasks.shop_summary()
 
@@ -764,7 +836,9 @@ def test_the_shop_summary_matches_a_direct_read_and_says_when_the_model_facts_ar
         "ok": True,
         "as_of": conn.execute(f"select max((ordered_at at time zone '{LONDON_RULE}')::date)::text from shop_orders").fetchone()[0],
         "shop_customers": 200,
-        "members": len(quiet),
+        "members_joined": len(quiet),
+        "members_seeded": 2,
+        "members_seeded_label": "demo stand-ins",
         "quiet_regulars": len(quiet),
         "quiet_regulars_paid_12m_minor": int(expected_paid),
         "currency": "USD",
@@ -811,6 +885,16 @@ def test_quiet_regulars_lists_the_most_at_risk_first_and_never_an_identifier(con
     # Every quiet regular in the seed joined; with the members gone, none of them is one.
     assert all(row["member"] for row in rows)
     conn.execute("delete from members")
+    assert not any(row["member"] for row in tasks.quiet_regulars(demo, 50)["rows"])
+
+
+def test_quiet_regulars_counts_as_a_member_only_someone_on_an_accepted_consent_wording(conn: psycopg.Connection, paypal: FakePayPal) -> None:
+    seed_shop(conn)
+    demo = actor(conn, "demo")
+    assert all(row["member"] for row in tasks.quiet_regulars(demo, 50)["rows"])
+
+    conn.execute("update members set consent_version = '2026-10-20.1'")
+
     assert not any(row["member"] for row in tasks.quiet_regulars(demo, 50)["rows"])
 
 

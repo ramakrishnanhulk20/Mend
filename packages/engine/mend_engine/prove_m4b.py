@@ -11,6 +11,12 @@ Real sandbox spend per run: at most 3.00 USD in payouts plus PayPal's fee per it
 The @shop.example receivers are not sandbox accounts, so their items stay UNCLAIMED
 and PayPal returns them after 30 days. The test receiver stays a member, linked to
 one shop customer's record by email, and later runs reuse that link.
+
+Members this script joins are stand-ins under its own name (source 'seed'). A test
+receiver with no member row becomes one; a row the receiver made itself through Log
+in with PayPal is used as it is, and if it is on an earlier consent wording the run
+stops and waits for the receiver to join again. A run within 30 days of the last
+sent one finds the receiver held by that measurement and says so (C6).
 """
 
 from __future__ import annotations
@@ -48,8 +54,9 @@ from mend_engine.data.uci import CACHE_DIR, SourceError, ensure_source
 from mend_engine.db.connect import connect
 from mend_engine.db.migrate import migrate
 from mend_engine.maintenance.purge import purge_paypal_events
-from mend_engine.members.consent import DEMO_SHOP_NAME
+from mend_engine.members.consent import ACCEPTED_CONSENT_VERSIONS, DEMO_SHOP_NAME
 from mend_engine.members.membership import (
+    SOURCE_SEED,
     MembershipRefused,
     customer_refs_by_email,
     join_member,
@@ -230,7 +237,7 @@ def check_verified(proof: Proof, conn: psycopg.Connection, config: Config, score
     email = conn.execute("select email from shop_customers where customer_ref = %s", (ref,)).fetchone()[0]
     member_id = join_member(
         conn, paypal_email=email, paypal_payer_id=None, email_verified=False,
-        shop_name=DEMO_SHOP_NAME, client_id=config.paypal_client_id,
+        shop_name=DEMO_SHOP_NAME, client_id=config.paypal_client_id, actor=ACTOR,
     )
     try:
         linked = match_member_to_customer(conn, member_id)
@@ -243,7 +250,14 @@ def check_verified(proof: Proof, conn: psycopg.Connection, config: Config, score
     )
 
 
-def link_test_receiver(conn: psycopg.Connection, config: Config, scores: ScoreSet) -> uuid.UUID:
+def link_test_receiver(conn: psycopg.Connection, config: Config, scores: ScoreSet) -> uuid.UUID | None:
+    """The test receiver's member id, linked to one quiet regular; None while its own row is on an earlier wording.
+
+    With no member row, the receiver is joined as a stand-in under this script's name.
+    A stand-in row is joined again, which brings it to the current wording. A row the
+    receiver made through Log in with PayPal is never changed here: on an accepted
+    wording it is used as it is, on an earlier one only the receiver can agree again.
+    """
     receiver = normalise_email(config.test_receiver or "")
     row = conn.execute("select customer_ref from shop_customers where email = %s", (receiver,)).fetchone()
     if row is None:
@@ -254,10 +268,34 @@ def link_test_receiver(conn: psycopg.Connection, config: Config, scores: ScoreSe
                 "insert into audit_log (actor, action, detail) values (%s, %s, %s)",
                 (ACTOR, "shop_customer_linked_to_sandbox_receiver", Jsonb({"customer_ref": ref})),
             )
-    return join_member(
+    member_id = join_member(
         conn, paypal_email=receiver, paypal_payer_id=None, email_verified=True,
-        shop_name=DEMO_SHOP_NAME, client_id=config.paypal_client_id,
+        shop_name=DEMO_SHOP_NAME, client_id=config.paypal_client_id, actor=ACTOR,
     )
+    source, version = conn.execute("select source, consent_version from members where member_id = %s", (member_id,)).fetchone()
+    if source != SOURCE_SEED and version not in ACCEPTED_CONSENT_VERSIONS:
+        return None
+    return member_id
+
+
+def receiver_unavailable(conn: psycopg.Connection, scores: ScoreSet, receiver_id: uuid.UUID) -> str | None:
+    """Why the test receiver cannot be drafted for the owner now, or None when it can."""
+    if receiver_id in {c.member_id for c in quiet_regular_members(conn, scores, AS_OF)}:
+        return None
+    # First sent is the first move to submitted, else the first batch row, as eligibility reads it.
+    unsent, closes = conn.execute(
+        "select bool_or(sent is null), max(sent + interval '30 days') from (select coalesce((select min(s.moved_at) "
+        "from campaign_status_moves s where s.campaign_id = c.campaign_id and s.to_status = 'submitted'), "
+        "(select min(b.created_at) from payout_batches b where b.campaign_id = c.campaign_id::text)) as sent "
+        "from campaign_members cm join campaigns c using (campaign_id) left join campaign_owners o using (campaign_id) "
+        "where cm.member_id = %s and c.status <> 'voided' and o.role is distinct from 'demo') held",
+        (receiver_id,),
+    ).fetchone()
+    if unsent:
+        return "the test receiver is held by an owner campaign not yet sent, which holds it until voided"
+    if closes is not None and closes > database_now(conn):
+        return f"the test receiver is held by a running measurement until {closes.astimezone(timezone.utc):%Y-%m-%d %H:%M} UTC"
+    return "the test receiver is not an eligible quiet regular (unlinked, or nothing left to be paid)"
 
 
 def settings() -> DraftSettings:
@@ -289,10 +327,11 @@ def left_member_refusal(conn: psycopg.Connection, config: Config, receiver_id: u
     campaign_id = build_draft(conn, config, settings()).campaign_id
     created.append(campaign_id)
     shown = review_hash(conn, campaign_id)
+    # A stand-in, never the receiver or a person who joined, since it leaves and is joined again as a stand-in.
     leaver = conn.execute(
-        "select member_id from campaign_members where campaign_id = %s and role = 'reward' and member_id <> %s "
-        "order by rank limit 1",
-        (campaign_id, receiver_id),
+        "select cm.member_id from campaign_members cm join members m using (member_id) where cm.campaign_id = %s "
+        "and cm.role = 'reward' and cm.member_id <> %s and m.source = %s order by cm.rank limit 1",
+        (campaign_id, receiver_id, SOURCE_SEED),
     ).fetchone()[0]
     email = conn.execute("select paypal_email from members where member_id = %s", (leaver,)).fetchone()[0]
     leave_member(conn, leaver)
@@ -304,7 +343,7 @@ def left_member_refusal(conn: psycopg.Connection, config: Config, receiver_id: u
     # They join again as a new member, so the demo keeps its 40 members.
     join_member(
         conn, paypal_email=email, paypal_payer_id=None, email_verified=True,
-        shop_name=DEMO_SHOP_NAME, client_id=config.paypal_client_id,
+        shop_name=DEMO_SHOP_NAME, client_id=config.paypal_client_id, actor=ACTOR,
     )
     return reason
 
@@ -591,14 +630,23 @@ def run() -> bool:
             scores = check_refunds(proof, conn)
             check_verified(proof, conn, config, scores)
             receiver_id = link_test_receiver(conn, config, scores)
+            if receiver_id is None:
+                proof.line(False, "receiver: waiting for the test customer to join again under the current consent")
+                return False
+            unavailable = receiver_unavailable(conn, scores, receiver_id)
+            if unavailable is not None:
+                proof.line(False, f"receiver: {unavailable}")
+                return False
             left_reason = left_member_refusal(conn, config, receiver_id, created)
+            # Before the main draft: a member is in one draft at a time (C6), and the edit voids
+            # this campaign, so its members are free again for the main one.
+            check_tamper(proof, conn, config, created)
             campaign_id = draft_main(proof, conn, config, receiver_id, created)
             if campaign_id is None:
                 return False
             check_refusals(proof, conn, config, campaign_id, left_reason)
             if not check_approval(proof, conn, config, campaign_id):
                 return False
-            check_tamper(proof, conn, config, created)
             sent = check_race(proof, config, campaign_id)
             if sent is None or sent.status != "submitted" or sent.payout_batch_id is None:
                 proof.line(False, f"payout: no batch was created ({sent.status if sent else 'no winner'})")

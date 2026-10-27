@@ -17,20 +17,24 @@ import re
 import uuid
 from collections import Counter
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timedelta
 
 import psycopg
 from psycopg.types.json import Jsonb
 
+from mend_engine.campaigns.approval import frozen_snapshot
 from mend_engine.campaigns.attribution import SimulatedMatch, attribute_purchase, simulated_order_for, utc_time
 from mend_engine.campaigns.simulate import read_order
 from mend_engine.events.payout_status import ItemConflict, as_seen, record_item_status
 from mend_engine.money import MoneyError, to_minor
 from mend_engine.paypal.http import PayPalError, PayPalHttp
-from mend_engine.paypal.payouts import get_batch, get_item
+from mend_engine.paypal.payouts import SnapshotRefused, get_batch, get_item, sender_batch_id_for
 
 ACTOR = "events"
 MAX_ATTEMPTS = 5
+# A delivery whose re-read failed is tried again only this long after, however often
+# runs are nudged, so MAX_ATTEMPTS spans at least 20 minutes of PayPal being down.
+RETRY_AFTER = timedelta(minutes=5)
 MAX_LIMIT = 500
 # A delivery stored while a run holds the lock is picked up by that run's next pass;
 # the cap stops a steady stream of deliveries from keeping one call going for ever.
@@ -42,7 +46,19 @@ BATCH_PREFIX = "PAYMENT.PAYOUTSBATCH."
 CAPTURE_COMPLETED = "PAYMENT.CAPTURE.COMPLETED"
 # A campaign in one of these may have a batch at PayPal whose id the ledger lacks.
 RESOLVABLE = ("submitting", "submission_unknown", "exists_unresolved")
+# A campaign in one of these waits on PayPal's batch event to settle it, so that event is never given up.
+UNSETTLED = ("submission_unknown", "exists_unresolved")
 RESOLVED_LEDGER_STATUS = "resolved_by_event"
+# PayPal's batch status for a batch it did not process: no item in it paid anyone.
+DENIED = "DENIED"
+# An item PayPal never named gets a ledger row under this id. ":" and lower case keep it
+# out of the payout id shape, so get_item and cancel_item refuse it before any request.
+DENIED_ITEM_ID = "denied:{sender_batch_id}:{sender_item_id}"
+# True when delivery "e" had a failed re-read within the named parameter rest.
+_RESTING_SQL = (
+    "exists (select 1 from audit_log a where a.action = 'event_attempt_failed' "
+    "and a.detail ->> 'transmission_id' = e.transmission_id and a.at > now() - %(rest)s)"
+)
 
 _PAYOUT_ID = re.compile(r"[A-Z0-9]{1,32}", re.ASCII)
 _SENDER_BATCH_ID = re.compile(r"[A-Za-z0-9_.:-]{1,256}", re.ASCII)
@@ -74,7 +90,10 @@ class ProcessReport:
 
 @dataclass(frozen=True)
 class _Retry:
+    """No outcome yet. keep is True when the delivery may be what an unsettled campaign is waiting on, so it is never given up."""
+
     detail: dict
+    keep: bool = False
 
 
 class _AlreadyDecided(Exception):
@@ -86,33 +105,43 @@ def process_events(conn: psycopg.Connection, http: PayPalHttp, *, limit: int = 1
 
     For each, by its stored event_type:
     - PAYMENT.PAYOUTS-ITEM.*: reads the item named by resource.payout_item_id from
-      PayPal; only if PayPal puts it in a batch whose sender_batch_id and
-      payout_batch_id are both in payout_batches, records its status through the
-      state machine ("status recorded", or "status refused" for a move the machine
-      does not allow). A batch the ledger knows but has no payout_batch_id for yet
-      is retried.
+      PayPal; only if PayPal puts it in a batch whose sender_batch_id is in
+      payout_batches, under the payout_batch_id the ledger holds, records its status
+      through the state machine ("status recorded", or "status refused" for a move
+      the machine does not allow). When the ledger has no payout_batch_id for that
+      batch yet, reads the batch PayPal names and, only if PayPal's batch carries
+      the ledger's sender_batch_id, fills it in as a batch event would (and treats a
+      DENIED batch as below) before recording the item; a batch that does not is
+      "not ours".
     - PAYMENT.PAYOUTSBATCH.*: reads the batch named by its payout_batch_id; if its
       sender_batch_id is in the ledger and the campaign is submitting,
       submission_unknown or exists_unresolved, records the payout_batch_id and
       moves the campaign to submitted ("batch resolved"), else "batch unchanged".
+      When PayPal says the batch is DENIED, every item of the campaign's frozen
+      snapshot is recorded FAILED (record_denied_batch) and the outcome is "batch
+      denied", holding items_failed.
     - PAYMENT.CAPTURE.COMPLETED: if the order named in
       supplementary_data.related_ids.order_id is in simulated_orders, reads it from
       PayPal and attributes it as simulated when PayPal says COMPLETED ("purchase
-      recorded" or "purchase refused"). Any other order is "not ours" and is never read.
+      recorded" or "purchase refused"). Any other order is "not ours", is never
+      read, and its order id is not kept (C27).
     - Anything else: "ignored". A body that cannot be read: "malformed".
-    A PayPal error during a re-read writes an audit row and no outcome, so the next
-    run retries; the fifth failed attempt across runs writes "gave up".
+    A PayPal error during a re-read writes an "event_attempt_failed" audit row and
+    no outcome; the delivery is tried again only once 5 minutes have passed since
+    its last failed attempt, however many runs start meanwhile. The fifth failed
+    attempt writes "gave up", except for a batch event while the campaign it may
+    settle is submission_unknown or exists_unresolved (_may_settle_a_campaign),
+    which is tried every 5 minutes until PayPal answers or its body is purged.
 
     Each outcome is written in one transaction with its effects and an audit row.
     Returns ran False, reading nothing, when another run holds the lock.
 
     After a pass releases the lock, if a delivery this call has not tried is still
-    without an outcome (one stored while the lock was held, whose own nudge found
-    the lock taken and returned ran False), the call takes the lock again and runs
-    another pass: at most 3 passes and limit deliveries in all. A delivery this call
-    already tried, such as one waiting on PayPal, is left for the next call, so a
-    retry still costs one attempt per call. Raises ValueError for a limit that is
-    not a whole number from 1 to 500.
+    without an outcome and not resting (one stored while the lock was held, whose
+    own nudge found the lock taken and returned ran False), the call takes the lock
+    again and runs another pass: at most 3 passes and limit deliveries in all. A
+    delivery this call already tried is left for a later call. Raises ValueError
+    for a limit that is not a whole number from 1 to 500.
     """
     if type(limit) is not int or not 1 <= limit <= MAX_LIMIT:
         raise ValueError(f"limit must be a whole number from 1 to {MAX_LIMIT}")
@@ -128,9 +157,9 @@ def process_events(conn: psycopg.Connection, http: PayPalHttp, *, limit: int = 1
             rows = conn.execute(
                 "select e.transmission_id, e.event_type, e.raw from paypal_events e "
                 "where not exists (select 1 from event_outcomes o where o.transmission_id = e.transmission_id) "
-                "and e.transmission_id <> all(%s::text[]) "
-                "order by e.received_at, e.transmission_id limit %s",
-                (tried, limit - len(tried)),
+                "and e.transmission_id <> all(%(tried)s::text[]) and not " + _RESTING_SQL + " "
+                "order by e.received_at, e.transmission_id limit %(most)s",
+                {"tried": tried, "rest": RETRY_AFTER, "most": limit - len(tried)},
             ).fetchall()
             for transmission_id, event_type, raw in rows:
                 tried.append(transmission_id)
@@ -139,7 +168,7 @@ def process_events(conn: psycopg.Connection, http: PayPalHttp, *, limit: int = 1
                 except _AlreadyDecided:
                     continue
                 if isinstance(result, _Retry):
-                    if _note_failed_attempt(conn, transmission_id, event_type, result.detail):
+                    if _note_failed_attempt(conn, transmission_id, event_type, result.detail, keep=result.keep):
                         outcomes["gave up"] += 1
                     else:
                         retrying += 1
@@ -157,12 +186,12 @@ def process_events(conn: psycopg.Connection, http: PayPalHttp, *, limit: int = 1
 
 
 def _untried_waiting(conn: psycopg.Connection, tried: list[str]) -> bool:
-    """Whether any stored delivery not in tried has no outcome yet."""
+    """Whether any stored delivery not in tried and not resting after a failed attempt has no outcome yet."""
     return conn.execute(
         "select exists (select 1 from paypal_events e "
         "where not exists (select 1 from event_outcomes o where o.transmission_id = e.transmission_id) "
-        "and e.transmission_id <> all(%s::text[]))",
-        (tried,),
+        "and e.transmission_id <> all(%(tried)s::text[]) and not " + _RESTING_SQL + ")",
+        {"tried": tried, "rest": RETRY_AFTER},
     ).fetchone()[0]
 
 
@@ -203,10 +232,20 @@ def _item_event(conn: psycopg.Connection, http: PayPalHttp, transmission_id: str
     ).fetchone()
     if ledger is None:
         return _decide(conn, transmission_id, event_type, "not ours", {**detail, "reason": "the batch is not in our ledger"})
+    batch_status = None
     if ledger[0] is None:
-        # The batch event or reconcile will fill this in; until then the item waits.
-        return _Retry({**detail, "reason": "the ledger has no payout_batch_id for this batch yet"})
-    if ledger[0] != payout_batch_id:
+        # The item names a batch id the ledger lacks. PayPal's own batch answer, not the
+        # item's, decides whether that batch is the one we sent.
+        try:
+            batch = get_batch(http, payout_batch_id)
+        except PayPalError as exc:
+            return _Retry({**detail, **_error_detail(exc)})
+        named, batch_status = batch_header(batch)
+        if named != (payout_batch_id, sender_batch_id):
+            return _decide(
+                conn, transmission_id, event_type, "not ours", {**detail, "reason": "PayPal's batch does not carry this item's sender_batch_id"}
+            )
+    elif ledger[0] != payout_batch_id:
         return _decide(
             conn, transmission_id, event_type, "not ours", {**detail, "reason": "PayPal's batch is not the one in our ledger"}
         )
@@ -217,6 +256,18 @@ def _item_event(conn: psycopg.Connection, http: PayPalHttp, transmission_id: str
     detail.update(sender_item_id=sender_item_id, seen=seen)
 
     def apply() -> tuple[str, dict]:
+        extra: dict = {}
+        if batch_status is not None:
+            known = conn.execute(
+                "select payout_batch_id from payout_batches where sender_batch_id = %s for update", (sender_batch_id,)
+            ).fetchone()[0]
+            if known is not None and known != payout_batch_id:
+                return "not ours", {"reason": "PayPal's batch is not the one in our ledger"}
+            if known is None:
+                resolution, found = _resolve_batch(conn, sender_batch_id, payout_batch_id)
+                if resolution != "batch resolved":
+                    return "status refused", {**found, "reason": "the ledger has no payout_batch_id and the campaign is not waiting on one"}
+                extra["resolved_from"] = found["from"]
         try:
             change = record_item_status(
                 conn,
@@ -227,8 +278,10 @@ def _item_event(conn: psycopg.Connection, http: PayPalHttp, transmission_id: str
                 fee_minor=_fee_minor(item.get("payout_item_fee")),
             )
         except ItemConflict:
-            return "status refused", {"reason": "the item is stored under another batch"}
-        extra = {"decision": change.decision, "from": change.previous, "to": change.stored}
+            return "status refused", {**extra, "reason": "the item is stored under another batch"}
+        extra.update({"decision": change.decision, "from": change.previous, "to": change.stored})
+        if batch_status == DENIED:
+            extra["items_failed"] = record_denied_batch(conn, sender_batch_id)
         if change.decision == "refused":
             return "status refused", {**extra, "reason": "the state machine does not allow this move"}
         return "status recorded", extra
@@ -243,56 +296,149 @@ def _batch_event(conn: psycopg.Connection, http: PayPalHttp, transmission_id: st
     try:
         batch = get_batch(http, payout_batch_id)
     except PayPalError as exc:
-        return _Retry({"payout_batch_id": payout_batch_id, **_error_detail(exc)})
+        named_sender = _dig(event, "resource", "batch_header", "sender_batch_header", "sender_batch_id")
+        keep = _may_settle_a_campaign(conn, payout_batch_id, named_sender)
+        return _Retry({"payout_batch_id": payout_batch_id, **_error_detail(exc)}, keep=keep)
     detail: dict = {"payout_batch_id": payout_batch_id}
     if _dig(batch, "batch_header", "payout_batch_id") != payout_batch_id:
         return _decide(conn, transmission_id, event_type, "not ours", {**detail, "reason": "PayPal's answer is for another batch"})
-    sender_batch_id = _dig(batch, "batch_header", "sender_batch_header", "sender_batch_id")
+    (_, sender_batch_id), batch_status = batch_header(batch)
     if not _matches(_SENDER_BATCH_ID, sender_batch_id):
         return _decide(conn, transmission_id, event_type, "not ours", {**detail, "reason": "PayPal's answer names no sender_batch_id"})
-    detail.update(sender_batch_id=sender_batch_id, batch_status=as_seen(_dig(batch, "batch_header", "batch_status")))
+    detail.update(sender_batch_id=sender_batch_id, batch_status=batch_status)
     if conn.execute("select 1 from payout_batches where sender_batch_id = %s", (sender_batch_id,)).fetchone() is None:
         return _decide(conn, transmission_id, event_type, "not ours", {**detail, "reason": "the batch is not in our ledger"})
 
     def apply() -> tuple[str, dict]:
-        known, campaign_text = conn.execute(
-            "select payout_batch_id, campaign_id from payout_batches where sender_batch_id = %s for update", (sender_batch_id,)
-        ).fetchone()
+        known = conn.execute(
+            "select payout_batch_id from payout_batches where sender_batch_id = %s for update", (sender_batch_id,)
+        ).fetchone()[0]
         if known is not None and known != payout_batch_id:
             return "batch unchanged", {"reason": "the ledger holds a different payout_batch_id"}
-        campaign_id = _uuid_or_none(campaign_text)
-        status = None
-        if campaign_id is not None:
-            row = conn.execute("select status from campaigns where campaign_id = %s for update", (campaign_id,)).fetchone()
-            status = row[0] if row else None
-        if status not in RESOLVABLE:
-            return "batch unchanged", {"campaign_id": campaign_text, "campaign_status": status, "reason": "nothing to resolve"}
-        conn.execute(
-            "update payout_batches set payout_batch_id = %s, status = %s where sender_batch_id = %s",
-            (payout_batch_id, RESOLVED_LEDGER_STATUS, sender_batch_id),
-        )
-        conn.execute("update campaigns set status = 'submitted' where campaign_id = %s", (campaign_id,))
-        _audit(
-            conn,
-            "batch_resolved_by_event",
-            {"campaign_id": str(campaign_id), "sender_batch_id": sender_batch_id, "payout_batch_id": payout_batch_id, "from": status},
-        )
-        return "batch resolved", {"campaign_id": str(campaign_id), "from": status}
+        outcome, extra = _resolve_batch(conn, sender_batch_id, payout_batch_id)
+        if batch_status == DENIED:
+            return "batch denied", {**extra, "items_failed": record_denied_batch(conn, sender_batch_id)}
+        return outcome, extra
 
     return _decide_with(conn, transmission_id, event_type, detail, apply)
+
+
+def batch_header(batch: object) -> tuple[tuple[object, object], str]:
+    """((payout_batch_id, sender_batch_id), batch_status as as_seen() stores it) from PayPal's answer for a batch."""
+    header = _dig(batch, "batch_header")
+    named = (_dig(header, "payout_batch_id"), _dig(header, "sender_batch_header", "sender_batch_id"))
+    return named, as_seen(_dig(header, "batch_status"))
+
+
+def _resolve_batch(conn: psycopg.Connection, sender_batch_id: str, payout_batch_id: str) -> tuple[str, dict]:
+    """Record PayPal's payout_batch_id for our sender_batch_id and settle a campaign waiting on it.
+
+    The caller holds the ledger row locked and has checked that it holds no other
+    payout_batch_id. Only a campaign in RESOLVABLE is touched: its ledger row takes
+    the id (status resolved_by_event), it moves to submitted and one
+    "batch_resolved_by_event" audit row is written ("batch resolved"). Any other
+    campaign is left as it is ("batch unchanged"). Runs inside the caller's transaction.
+    """
+    campaign_text = conn.execute("select campaign_id from payout_batches where sender_batch_id = %s", (sender_batch_id,)).fetchone()[0]
+    campaign_id = _uuid_or_none(campaign_text)
+    status = None
+    if campaign_id is not None:
+        row = conn.execute("select status from campaigns where campaign_id = %s for update", (campaign_id,)).fetchone()
+        status = row[0] if row else None
+    if status not in RESOLVABLE:
+        return "batch unchanged", {"campaign_id": campaign_text, "campaign_status": status, "reason": "nothing to resolve"}
+    conn.execute(
+        "update payout_batches set payout_batch_id = %s, status = %s where sender_batch_id = %s",
+        (payout_batch_id, RESOLVED_LEDGER_STATUS, sender_batch_id),
+    )
+    conn.execute("update campaigns set status = 'submitted' where campaign_id = %s", (campaign_id,))
+    _audit(
+        conn,
+        "batch_resolved_by_event",
+        {"campaign_id": str(campaign_id), "sender_batch_id": sender_batch_id, "payout_batch_id": payout_batch_id, "from": status},
+    )
+    return "batch resolved", {"campaign_id": str(campaign_id), "from": status}
+
+
+def record_denied_batch(conn: psycopg.Connection, sender_batch_id: str) -> int:
+    """Record every item of a batch PayPal answered DENIED as FAILED, so no cap or result counts money that never left (C4, C10).
+
+    The caller has read the batch from PayPal under the payout_batch_id the ledger
+    holds or has just confirmed. Acts only on a batch the ledger holds for a
+    campaign whose frozen snapshot passes its checks and gives this same
+    sender_batch_id. Each snapshot item with a payout_items row of this batch is
+    moved to FAILED through record_item_status, so an item already in a final
+    status keeps it; an item with no row gets one, under DENIED_ITEM_ID, which no
+    PayPal call accepts, so it is never read back or cancelled. Runs inside the
+    caller's transaction. Returns how many snapshot items hold FAILED afterwards,
+    0 when it acted on nothing.
+    """
+    row = conn.execute("select campaign_id from payout_batches where sender_batch_id = %s", (sender_batch_id,)).fetchone()
+    campaign_id = _uuid_or_none(row[0]) if row else None
+    if campaign_id is None:
+        return 0
+    try:
+        snap = frozen_snapshot(conn, campaign_id)
+    except SnapshotRefused:
+        return 0
+    if snap is None or sender_batch_id_for(snap) != sender_batch_id:
+        return 0
+    held: dict[str, list[str]] = {}
+    for payout_item_id, sender_item_id in conn.execute(
+        "select payout_item_id, sender_item_id from payout_items where sender_batch_id = %s order by payout_item_id", (sender_batch_id,)
+    ):
+        held.setdefault(sender_item_id, []).append(payout_item_id)
+    failed = 0
+    for item in snap.items:
+        ids = held.get(item.sender_item_id) or [DENIED_ITEM_ID.format(sender_batch_id=sender_batch_id, sender_item_id=item.sender_item_id)]
+        stored = [
+            record_item_status(
+                conn, payout_item_id=payout_item_id, sender_batch_id=sender_batch_id,
+                sender_item_id=item.sender_item_id, seen="FAILED", fee_minor=None,
+            ).stored
+            for payout_item_id in ids
+        ]
+        failed += all(status == "FAILED" for status in stored)
+    return failed
+
+
+def _may_settle_a_campaign(conn: psycopg.Connection, payout_batch_id: str, named_sender: object) -> bool:
+    """Whether a batch event PayPal could not be asked about may be what an unsettled campaign is waiting on.
+
+    Judged from the event body alone, which only ever keeps a delivery retrying and
+    never changes state. The campaign is the ledger's row for the sender_batch_id
+    the body names, or else for its payout_batch_id; it may settle when that
+    campaign is submission_unknown or exists_unresolved. When the body names
+    neither, it may be the batch of any such campaign whose ledger row still lacks a
+    payout_batch_id, so it is kept while one exists.
+    """
+    row = None
+    if _matches(_SENDER_BATCH_ID, named_sender):
+        row = conn.execute("select campaign_id from payout_batches where sender_batch_id = %s", (named_sender,)).fetchone()
+    if row is None:
+        row = conn.execute("select campaign_id from payout_batches where payout_batch_id = %s", (payout_batch_id,)).fetchone()
+    if row is not None:
+        return conn.execute(
+            "select exists (select 1 from campaigns where campaign_id::text = %s and status = any(%s))", (row[0], list(UNSETTLED))
+        ).fetchone()[0]
+    return conn.execute(
+        "select exists (select 1 from payout_batches b join campaigns c on c.campaign_id::text = b.campaign_id "
+        "where b.payout_batch_id is null and c.status = any(%s))",
+        (list(UNSETTLED),),
+    ).fetchone()[0]
 
 
 def _capture_event(conn: psycopg.Connection, http: PayPalHttp, transmission_id: str, event_type: str, event: dict) -> str | _Retry:
     order_id = _dig(event, "resource", "supplementary_data", "related_ids", "order_id")
     if not _matches(_ORDER_ID, order_id):
         return _decide(conn, transmission_id, event_type, "malformed", {"reason": "the event names no order"})
-    detail: dict = {"paypal_order_id": order_id}
     # Matched only through the order id this server stored when it made the order (C8).
-    # Anyone else's order is never read, so no stranger's payer data is fetched.
+    # Anyone else's order is never read, so no stranger's payer data is fetched, and its
+    # id is not written down either: outcome rows outlive the 48-hour purge (C27).
     match = simulated_order_for(conn, order_id)
     if match is None:
-        return _decide(conn, transmission_id, event_type, "not ours", {**detail, "reason": "not an order the simulate button created"})
-    detail.update(campaign_id=str(match.campaign_id), ref=match.ref)
+        return _decide(conn, transmission_id, event_type, "not ours", {"reason": "not an order the simulate button created"})
+    detail: dict = {"paypal_order_id": order_id, "campaign_id": str(match.campaign_id), "ref": match.ref}
     try:
         order = read_order(http, order_id)
     except PayPalError as exc:
@@ -375,15 +521,15 @@ def _decide_with(conn: psycopg.Connection, transmission_id: str, event_type: str
     return outcome
 
 
-def _note_failed_attempt(conn: psycopg.Connection, transmission_id: str, event_type: str, detail: dict) -> bool:
-    """Record one failed attempt; on the fifth across runs write "gave up". Returns True when it gave up."""
+def _note_failed_attempt(conn: psycopg.Connection, transmission_id: str, event_type: str, detail: dict, *, keep: bool) -> bool:
+    """Record one failed attempt; from the fifth on write "gave up" unless keep. Returns True when it gave up."""
     with conn.transaction():
         _audit(conn, "event_attempt_failed", {"transmission_id": transmission_id, "event_type": event_type, **detail})
         attempts = conn.execute(
             "select count(*) from audit_log where action = 'event_attempt_failed' and detail ->> 'transmission_id' = %s",
             (transmission_id,),
         ).fetchone()[0]
-        if attempts < MAX_ATTEMPTS:
+        if attempts < MAX_ATTEMPTS or keep:
             return False
         written = conn.execute(
             "insert into event_outcomes (transmission_id, outcome, detail) values (%s, 'gave up', %s) "

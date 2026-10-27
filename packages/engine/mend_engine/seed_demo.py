@@ -7,11 +7,12 @@ when it is already done, so a second run changes nothing:
 1. orders: the UCI Online Retail II invoices as the shop's own order records (import_uci)
 2. refunds: its cancellation invoices as the shop's refunds (import_refunds)
 3. facts: the model's measured proof numbers for the landing page (store_facts)
-4. members: the 40 quiet regulars most at risk joined as verified demo members, chosen
-   and joined exactly as prove_m4a does
+4. members: the 40 quiet regulars most at risk, chosen as prove_m4a chooses them, joined
+   as verified demo stand-ins (source 'seed', actor seed_demo) on the current consent
+   wording; stand-ins this seed made earlier are labelled seed and re-consented
 5. receiver: MEND_TEST_RECEIVER, the sandbox account that can really claim a payout,
    joined as a verified member linked to one more quiet regular, chosen as prove_m4b
-   chooses it
+   chooses it; a row the receiver made itself through Log in with PayPal is left as is
 6. receiver first: that member made the most at-risk eligible member, so a default
    demo draft always considers it (seed_receiver_first)
 
@@ -31,14 +32,15 @@ import psycopg
 from psycopg.types.json import Jsonb
 
 from mend_engine import prove_m4a, prove_m4b, store_facts
-from mend_engine.campaigns.eligibility import quiet_regular_members
+from mend_engine.campaigns.eligibility import OWNER_SCOPE, held_members, quiet_regular_members
 from mend_engine.campaigns.scoring import ScoreSet, score_customers
 from mend_engine.config import Config, ConfigError, load_config
 from mend_engine.data.uci import CACHE_DIR, ZIP_NAME, SourceError, ensure_source
 from mend_engine.db.connect import connect
-from mend_engine.members.consent import DEMO_SHOP_NAME
-from mend_engine.members.membership import MembershipRefused, join_member
+from mend_engine.members.consent import ACCEPTED_CONSENT_VERSIONS, DEMO_SHOP_NAME
+from mend_engine.members.membership import SOURCE_SEED, MembershipRefused, join_member
 from mend_engine.paypal.payouts import normalise_email
+from mend_engine.shop.identities import synthetic_email
 from mend_engine.shop.import_orders import REFUNDS_SOURCE_SUFFIX, ImportRefused, import_refunds, import_uci
 
 ENV_PATH = Path(__file__).resolve().parents[3] / ".env"
@@ -96,10 +98,41 @@ def shop_scores(conn: psycopg.Connection) -> ScoreSet:
 
 
 def seed_members(conn: psycopg.Connection, config: Config, scores: ScoreSet) -> str:
+    """Join the 40 demo stand-ins as seed rows on the current wording, labelling any this seed made before members had a source.
+
+    The stand-ins are the synthetic addresses of the 40 demo customers, fixed by
+    customer_ref, so moving the test receiver first (which trades shop emails)
+    never changes the list, and the receiver's own address is never on it. Rows on
+    the list still marked paypal_login are labelled seed first, with one audit_log
+    row of their member ids, so joining them again re-consents them to the current
+    wording (join_member).
+    """
+    receiver = normalise_email(config.test_receiver or "")
+    own = sorted(email for email in (synthetic_email(ref) for ref in prove_m4a.demo_customers(scores)) if email != receiver)
     before = conn.execute("select count(*) from members").fetchone()[0]
-    joined = prove_m4a.join_demo_members(conn, config, prove_m4a.demo_customers(scores))
+    with conn.transaction():
+        labelled = [
+            str(row[0])
+            for row in conn.execute(
+                "update members set source = %s where paypal_email = any(%s) and source <> %s returning member_id",
+                (SOURCE_SEED, own, SOURCE_SEED),
+            )
+        ]
+        if labelled:
+            conn.execute(
+                "insert into audit_log (actor, action, detail) values (%s, %s, %s)",
+                (ACTOR, "members_labelled_seed", Jsonb({"member_ids": sorted(labelled)})),
+            )
+    joined = [
+        join_member(
+            conn, paypal_email=email, paypal_payer_id=None, email_verified=True,
+            shop_name=DEMO_SHOP_NAME, client_id=config.paypal_client_id, actor=ACTOR,
+        )
+        for email in own
+    ]
     after = conn.execute("select count(*) from members").fetchone()[0]
-    return f"members: {len(joined)} demo members ({after - before} new)"
+    line = f"members: {len(joined)} demo members ({after - before} new)"
+    return line + (f", {len(labelled)} labelled as demo stand-ins" if labelled else "")
 
 
 def seed_receiver(conn: psycopg.Connection, config: Config, scores: ScoreSet) -> str:
@@ -113,9 +146,10 @@ def seed_receiver(conn: psycopg.Connection, config: Config, scores: ScoreSet) ->
                 "insert into audit_log (actor, action, detail) values (%s, %s, %s)",
                 (ACTOR, "shop_customer_linked_to_sandbox_receiver", Jsonb({"customer_ref": ref})),
             )
+    # A receiver row this seed makes is a stand-in; one the receiver made by joining with PayPal is left exactly as it is.
     join_member(
         conn, paypal_email=receiver, paypal_payer_id=None, email_verified=True,
-        shop_name=DEMO_SHOP_NAME, client_id=config.paypal_client_id,
+        shop_name=DEMO_SHOP_NAME, client_id=config.paypal_client_id, actor=ACTOR,
     )
     return "receiver: MEND_TEST_RECEIVER is a verified member " + ("linked to one quiet regular" if not linked else "already linked")
 
@@ -133,19 +167,32 @@ def seed_receiver_first(conn: psycopg.Connection, config: Config, scores: ScoreS
     PayPal email (C5 restated).
 
     Ranks with quiet_regular_members at the day scores were computed for. Returns
-    "receiver: already first" and changes nothing when it is; otherwise writes one
-    audit_log row holding from_customer_ref, to_customer_ref and was_rank, never an
-    email. Raises LookupError, changing nothing, when no member is eligible, when the
-    receiver is not an eligible member (a swap would then push the displaced member
-    out of the eligible set), or when either row changed before it could be locked.
+    "receiver: already first" and changes nothing when it is, and "receiver: held by
+    a running measurement", changing nothing, while an owner campaign still holds the
+    receiver (eligibility.held_members); otherwise writes one audit_log row holding
+    from_customer_ref, to_customer_ref and was_rank, never an email. Raises
+    LookupError, changing nothing, when no member is eligible, when the receiver is
+    not an eligible member for another reason (a swap would then push the displaced
+    member out of the eligible set), or when either row changed before it could be locked.
     """
     receiver = normalise_email(config.test_receiver or "")
+    member = conn.execute("select member_id from members where paypal_email = %s", (receiver,)).fetchone()
+    if member is not None and member[0] in held_members(conn, OWNER_SCOPE):
+        # It comes free when that measurement ends; the rest of the seed still holds, so say so and stop here.
+        return "receiver: held by a running measurement"
     ranked = quiet_regular_members(conn, scores, scores.as_of)
     if not ranked:
         raise LookupError("no member is eligible, so the test receiver cannot be moved first")
     emails = {member_id: normalise_email(email) for member_id, email in conn.execute("select member_id, paypal_email from members")}
     at = next((i for i, candidate in enumerate(ranked) if emails.get(candidate.member_id) == receiver), None)
     if at is None:
+        # A real member row on an earlier consent wording is not eligible until its owner
+        # joins again through PayPal; the rest of the seed still holds, so say so and stop here.
+        held = conn.execute(
+            "select consent_version from members where paypal_email = %s and source = 'paypal_login'", (receiver,)
+        ).fetchone()
+        if held is not None and held[0] not in ACCEPTED_CONSENT_VERSIONS:
+            return "receiver: waiting for the test customer to join again under the current consent"
         raise LookupError("the test receiver is not an eligible member; run seed_receiver first")
     if at == 0:
         return "receiver: already first"

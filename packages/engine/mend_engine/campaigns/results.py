@@ -1,24 +1,31 @@
-"""What a campaign achieved: rewarded members against the held-back ones (C6, C8).
+"""What a campaign achieved: rewarded members against the held-back ones (C6, C8, A9).
 
 Real returns and simulated returns are counted apart. Only real returns enter the
 rates, the test and the verdict; simulated ones are shown beside them so a demo
-can be seen working without its button presses passing for lift. Spend is the
-amount of every item PayPal says is SUCCESS or still PENDING (an unknown status
-counts as PENDING), priced from the frozen approved snapshot by sender_item_id.
+can be seen working without its button presses passing for lift.
+
+The test is Fisher's exact test, one-sided, because at 30 members an arm a handful
+of returns is common and the normal approximation then calls a lift where there is
+none: 3 of 30 against 0 of 30 gave a z-test p of 0.038, and the exact p is 0.119.
+A verdict also needs the window closed, 30 members an arm and at least 5 expected
+returns an arm. Until then there is no verdict and no p-value at all, so no number
+is shown for a test that has not earned one (6j).
+
+Spend is the amount of every item PayPal says is SUCCESS or still PENDING (an
+unknown status counts as PENDING), priced from the frozen approved snapshot by sender_item_id.
 The payouts block prices every item of the batch the same way and says where each
 one stands, so a reward that failed, waits unclaimed or came back is shown plainly.
 """
 
 from __future__ import annotations
 
-import math
 import uuid
 from collections import Counter
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 
 import psycopg
-from scipy.stats import norm
+from scipy.stats import fisher_exact
 
 from mend_engine.campaigns.approval import frozen_snapshot
 from mend_engine.campaigns.attribution import attribution_window
@@ -27,8 +34,10 @@ from mend_engine.events.payout_status import effective
 from mend_engine.paypal.payouts import BatchSnapshot
 
 MIN_PER_ARM = 30
+MIN_EXPECTED_RETURNS = 5
 SIGNIFICANCE = 0.05
 TOO_EARLY = "too early to tell"
+TOO_FEW = "too few returns to tell"
 SPENT_STATUSES = ("SUCCESS", "PENDING")
 CLAIMED_STATUSES = ("SUCCESS",)
 UNCLAIMED_STATUSES = ("UNCLAIMED",)
@@ -78,7 +87,7 @@ class ArmResults:
 
 @dataclass(frozen=True)
 class CampaignResults:
-    """Money in USD cents. p_value is None unless both arms have a member; window times are UTC."""
+    """Money in USD cents. p_value is None until the verdict gate passes (see campaign_results); window times are UTC."""
 
     campaign_id: uuid.UUID
     status: str
@@ -97,28 +106,31 @@ class CampaignResults:
 def lift_p_value(rewarded_returns: int, rewarded: int, holdout_returns: int, holdout: int) -> float:
     """One-sided p-value that rewarded members return more often than held-back ones.
 
-    The pooled two-proportion z-test. One-sided, because the question is whether the
-    cashback brought customers back, not whether the arms differ either way. When
-    nobody or everybody returned, the arms cannot differ and z is taken as 0.
-    Raises ValueError unless each arm has at least 1 member and each count is a
-    whole number from 0 up to its arm's size.
+    Fisher's exact test on the two-by-two table of returned and not returned, with
+    the alternative "greater": the chance, if the cashback did nothing, of the
+    rewarded arm holding this many of the returns or more. One-sided, because the
+    question is whether the cashback brought customers back, not whether the arms
+    differ either way. When nobody or everybody returned, the arms cannot differ and
+    the p-value is 1. Raises ValueError unless each arm has at least 1 member and
+    each count is a whole number from 0 up to its arm's size.
     """
     for returns, size in ((rewarded_returns, rewarded), (holdout_returns, holdout)):
         if type(returns) is not int or type(size) is not int or size < 1 or not 0 <= returns <= size:
             raise ValueError("each arm needs at least 1 member and a return count from 0 to its size")
-    pooled = (rewarded_returns + holdout_returns) / (rewarded + holdout)
-    spread = math.sqrt(pooled * (1 - pooled) * (1 / rewarded + 1 / holdout))
-    z = 0.0 if spread == 0 else (rewarded_returns / rewarded - holdout_returns / holdout) / spread
-    return float(norm.sf(z))
+    table = [[rewarded_returns, rewarded - rewarded_returns], [holdout_returns, holdout - holdout_returns]]
+    return float(fisher_exact(table, alternative="greater").pvalue)
 
 
 def campaign_results(conn: psycopg.Connection, campaign_id: uuid.UUID) -> CampaignResults:
     """The campaign's results as they stand now, by the database's clock.
 
-    verdict is "too early to tell" while either arm has fewer than 30 members or
-    the 30-day window has not closed (or never opened); after that, "rewarded
-    customers came back more (one-sided p = ...)" when the one-sided p-value is
-    below 0.05, else "no measurable difference yet (one-sided p = ...)".
+    The verdict gate opens only when the 30-day window has closed, each arm has 30
+    or more members, and each arm would expect at least 5 real returns if the
+    cashback did nothing (its size times the overall return rate). Until then
+    verdict is "too early to tell" while the window is open, "too few returns to tell"
+    once it has closed, and p_value is None. After that, verdict is
+    "rewarded customers came back more (one-sided p = ...)" when Fisher's one-sided
+    p-value is below 0.05, else "no measurable difference yet (one-sided p = ...)".
 
     Raises ValueError for a campaign_id that is not a UUID, LookupError for no such
     campaign, and SnapshotRefused if the frozen snapshot no longer matches its hash.
@@ -148,10 +160,11 @@ def campaign_results(conn: psycopg.Connection, campaign_id: uuid.UUID) -> Campai
     window = attribution_window(conn, campaign_id)
     window_open = window is None or database_now(conn) < window[1]
     p_value = None
-    if rewarded.members >= 1 and holdout.members >= 1:
+    if not window_open and _enough_to_test(rewarded, holdout):
         p_value = lift_p_value(rewarded.real_returns, rewarded.members, holdout.real_returns, holdout.members)
-    if window_open or rewarded.members < MIN_PER_ARM or holdout.members < MIN_PER_ARM or p_value is None:
-        verdict = TOO_EARLY
+    if p_value is None:
+        # A closed window with too few members or expected returns will not get more data.
+        verdict = TOO_EARLY if window_open else TOO_FEW
     elif p_value < SIGNIFICANCE:
         verdict = f"rewarded customers came back more ({_p_text(p_value)})"
     else:
@@ -174,6 +187,16 @@ def campaign_results(conn: psycopg.Connection, campaign_id: uuid.UUID) -> Campai
 
 def _arm(members: int, real: int, simulated: int) -> ArmResults:
     return ArmResults(members, real, real / members if members else None, simulated)
+
+
+def _enough_to_test(rewarded: ArmResults, holdout: ArmResults) -> bool:
+    if rewarded.members < MIN_PER_ARM or holdout.members < MIN_PER_ARM:
+        return False
+    # The smaller arm expects the fewest returns: size * returns / members, kept in
+    # whole numbers so the boundary at exactly 5 is not lost to rounding.
+    returns = rewarded.real_returns + holdout.real_returns
+    members = rewarded.members + holdout.members
+    return min(rewarded.members, holdout.members) * returns >= MIN_EXPECTED_RETURNS * members
 
 
 def _payout_standing(conn: psycopg.Connection, campaign_id: uuid.UUID, snap: BatchSnapshot | None) -> PayoutStanding:

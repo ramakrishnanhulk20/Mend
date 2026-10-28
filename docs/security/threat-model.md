@@ -345,3 +345,42 @@ The review found gaps in section C itself. Each rule below is upheld in code and
 
 **C20, every pool unauthenticated traffic can draw on has a per-address share, with a test.** This includes the certificate download budget (2 a minute per address inside 10 a minute for the process). State a pool protects survives a restart: certificate addresses that verified a genuine delivery are kept in the paypal_certs table and skip the budget. Accepted: when PayPal rotates its certificate (about once a year), a flood from 5 or more addresses can delay the first delivery under the new, never-seen address; PayPal retries it and the C10 job re-reads the statuses meanwhile.
 *Where:* `packages/web/src/server/webhook-signature.ts`, `ratelimit.test.ts` shared-pool test.
+
+## Amendments 27 Oct 2026, after the independent Opus audit
+
+Three fresh auditors read the whole backend at 6cff7df (money and ledger; the website's outer surface and deploy; the AI agent, customer data and this standard). Fifteen distinct findings were fixed, each with a test that failed first. The rules below are the result.
+
+**C4, limits count what is really in flight.** The shop's daily cap and the demo pool count each campaign from its latest move into submitting, and a resend re-checks both under the same locks as a first send, waiting rather than sending over a cap. Every net-paid check (draft, amounts and approval) subtracts all refunds recorded up to now. The scoring day is the shop's own, set by code; a caller's other day is refused. For owner campaigns, a member's rewards sent in the last 365 days plus a new one never exceed what they paid net of refunds.
+*Where:* `campaigns/spend.py`, `campaigns/reconcile.py`, `campaigns/approval.py`, `campaigns/eligibility.py`, `campaigns/scoring.py`, `tasks.py` draft_campaign.
+
+**C6, one measurement at a time.** A member is held by a campaign of the same scope (the owner's campaigns; one demo session's campaigns) from draft until 30 days after it was sent, and is not eligible for another meanwhile, so no held-back member is rewarded elsewhere inside a window.
+*Where:* `campaigns/eligibility.py` quiet_regular_members.
+
+**C3 and C10, every state has a way out.** An item event fills a missing payout batch id once a batch read confirms the batch is ours; a batch event is never given up while its campaign is unresolved, and failed re-reads are spaced in time rather than counted per run. A move to any status reachable along the arrows is recorded (never backwards, never out of a final status). A DENIED batch records its items as FAILED. Accepted: once a batch event's body is purged at 47 hours, an unresolved campaign is only flagged by needs_attention.
+*Where:* `events/process.py`, `events/payout_status.py` _REACHABLE, `jobs.py`.
+
+**C20, the balance floor holds under concurrency.** The balance read, the room check and the claim happen under one lock, and the room subtracts Mend's own outflows of the last 6 hours, so two sends cannot both pass on one reading.
+*Where:* `paypal/balances.py` check_room, BALANCE_LOCK.
+
+**C28, joining and leaving.** Leave finds the member by email or by PayPal payer id, so a changed PayPal email can still leave; a verified sign-in replaces an unverified row holding its email. The consent sentence (version 2026-10-27.1) names every use: cashback, the random hold-back, counting later purchases, AI-written notes from item names, and the PayPal identity kept; only members on an accepted version are eligible. The demo shop's 40 stand-in customers are marked source 'seed', written with actor seed_demo, counted apart from people who joined, and can never be joined over or left through Log in with PayPal.
+*Where:* `tasks.py` join and leave, `members/membership.py`, `members/consent.py`, `seed_demo.py`.
+
+**A9 and 6j, honest numbers.** The model's backtest is measured inside the population campaigns rank (3 or more purchase days, 60 or more days silent) with a 95% bootstrap interval, and that is the headline: it ties recency there (3 of 5 cutoffs, mean -0.005, interval -0.024 to +0.016), and beats it across all customers (5 of 5, +0.052). Four other rankings were tested under a rule fixed in advance and none beat recency, so the ranking stays. Lift uses Fisher's exact test, needs the window closed, 30 members and 5 expected returns per arm, and shows no p-value before then.
+*Where:* `model/backtest.py`, `model/segment.py`, `store_facts.py`, `campaigns/results.py`, `packages/web/src/server/agent.ts` versusRecency.
+
+**C20, storage, concurrency and an attacker budget.** Sized so 50 attacking addresses cannot hold any shared demo pool closed past its own window: each rate-limit row is swept at its bucket's window; the public join routes count in memory; rejection and first-refusal audit rows are capped per reason per minute with the rest counted; at most 2 engine calls are in flight per session; heavy engine reads share 6 of its 16 slots; scores are cached per day and data version; shared pools charge only valid requests and keep a share for sessions that have not drawn on them; the demo Claude pool is hourly; Claude tokens are capped per demo session (200,000 a day), per address (400,000), across demo (5,000,000) and for the owner (2,000,000). PayPal's own deliveries are counted only when they are rejected, and a replay inside the 72-hour window is refused even after the 47-hour purge.
+*Where:* `packages/web/src/server/ratelimit.ts`, `address-limits.ts`, `engine.ts`, `webhooks.ts`, `claude.ts`; `task_server.py`; `campaigns/scoring.py`.
+
+**C18, what a demo visitor may read from PayPal.** Disputes are owner-only; a demo visitor's order lookups work only for orders its own session bought through simulate.
+*Where:* `permissions.ts`, `agent.ts`, `session-orders.ts`, `runs.ts`.
+
+**C22, one database role per service.** mend-engine and mend-jobs connect as mend_engine; mend-web connects as mend_web, which may write only sessions, run_owners, rate_limit_hits, paypal_certs and claude_usage, insert into paypal_events and audit_log, and cannot write payout_batches, payout_items, members, campaigns, campaign_members, event_outcomes, model_facts or approved_snapshots.
+*Where:* `db/migrate.py` grant_engine_role and grant_web_role; `render.mjs` prove "database role".
+
+**Operator tooling never creates or repoints by accident.** render.mjs finds every resource by the id it recorded, stops on a missing or renamed one, creates only with --create into an empty record, and prove only compares; the machine's database allow-list entry is removed at the end of every run.
+
+**Parsers and secrets.** The outbound email detector accepts at least every address the engine pays; format characters are stripped; the note rule reads a bracketed dot or a dot spelled out before a web ending as a link in both the engine and the website; every setting whose name ends in _SECRET, _TOKEN, _KEY or _PASSWORD, or is DATABASE_URL, is scrubbed.
+
+**Closed without change, with reasons.** No global cap on wrong owner passwords: the password is long and random, and a global cap would let anyone lock the owner out. Paying by PAYPAL_ID when the payer id is known, and salting the snapshot hash shown to demo visitors, are design decisions for a real launch, not built here (the demo's emails are synthetic). Renumbering the agent's refs to hide held-back gaps was declined: the agent's tools act by ref, and no tool can act on a held-back member.
+
+**Accepted.** A member who leaves and joins again gets a new id and is not held by a campaign still being measured. Every per-address limit assumes Render's client address, checked live on 26 Oct.

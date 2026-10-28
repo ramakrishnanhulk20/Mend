@@ -200,6 +200,7 @@ ROUTE = {
     "awaiting_approval": ("awaiting_approval",),
     "approved": ("approved",),
     "submitted": ("approved", "submitting", "submitted"),
+    "submission_unknown": ("approved", "submitting", "submission_unknown"),
     "voided": ("voided",),
 }
 
@@ -235,14 +236,15 @@ def campaign_holding(
     return campaign_id
 
 
-def test_a_member_in_a_running_measurement_of_the_same_scope_is_not_eligible(conn: psycopg.Connection) -> None:
+def test_a_member_in_a_running_measurement_of_the_same_scope_is_not_eligible_and_a_draft_holds_nobody(conn: psycopg.Connection) -> None:
     from mend_engine.campaigns.eligibility import DraftScope, drafting_for
 
-    rows = {f"C{n}": (0.01 * n, 5, 100) for n in range(1, 10)}
+    rows = {f"C{n}": (0.01 * n, 5, 100) for n in range(1, 11)}
     for ref in rows:
         customer(conn, ref)
     ids = {ref: member(conn, ref.lower() + "@shop.example") for ref in rows}
     session, other_session = "d" * 64, "e" * 64
+    # A measurement starts at approval, so a draft or one awaiting approval holds nobody.
     campaign_holding(conn, {ids["C1"]: "holdout"}, "draft")
     campaign_holding(conn, {ids["C2"]: "reward"}, "awaiting_approval")
     campaign_holding(conn, {ids["C3"]: "reward"}, "submitted")  # sent just now: its 30-day window is open
@@ -250,7 +252,9 @@ def test_a_member_in_a_running_measurement_of_the_same_scope_is_not_eligible(con
     campaign_holding(conn, {ids["C5"]: "reward"}, "voided")
     campaign_holding(conn, {ids["C6"]: "reward"}, "approved", session=session)
     campaign_holding(conn, {ids["C7"]: "holdout"}, "submitted", session=other_session)
-    # An operator script's draft has no owner row; it is the owner's.
+    campaign_holding(conn, {ids["C9"]: "reward"}, "draft", session=session)
+    campaign_holding(conn, {ids["C10"]: "holdout"}, "submission_unknown")
+    # An operator script's approved campaign has no owner row; it is the owner's.
     unowned = conn.execute(
         "insert into campaigns (shop_name, goal_text, as_of, budget_minor, per_recipient_minor, holdout_share, status) "
         "values ('Shop', 'goal', '2026-10-16', 1000, 100, 0.5, 'draft') returning campaign_id"
@@ -259,17 +263,18 @@ def test_a_member_in_a_running_measurement_of_the_same_scope_is_not_eligible(con
         "insert into campaign_members (campaign_id, ref, member_id, role, rank, score) values (%s, 'R1', %s, 'holdout', 1, 0.1)",
         (unowned, ids["C8"]),
     )
+    conn.execute("update campaigns set status = 'approved' where campaign_id = %s", (unowned,))
 
     def eligible(scope: object = None) -> list[str]:
         found = quiet_regular_members(conn, scores(rows), AS_OF) if scope is None else quiet_regular_members(conn, scores(rows), AS_OF, scope)
         return [c.customer_ref for c in found]
 
-    assert eligible() == ["C4", "C5", "C6", "C7", "C9"]
+    assert eligible() == ["C1", "C2", "C4", "C5", "C6", "C7", "C9"]
     demo = eligible(DraftScope("demo", session))
-    assert demo == ["C1", "C2", "C3", "C4", "C5", "C7", "C8", "C9"]
+    assert demo == ["C1", "C2", "C3", "C4", "C5", "C7", "C8", "C9", "C10"]
     with drafting_for(DraftScope("demo", session)):
         assert eligible() == demo
-    assert eligible() == ["C4", "C5", "C6", "C7", "C9"]
+    assert eligible() == ["C1", "C2", "C4", "C5", "C6", "C7", "C9"]
     with pytest.raises(ValueError):
         DraftScope("demo", None)
 

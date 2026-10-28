@@ -374,9 +374,10 @@ export async function waitForRun(runId: string, timeoutMs: number): Promise<Wait
 
 // Codes meaning the campaign is not in the state the request needs. For an approval: a
 // different hash, a recipient who left (the row is gone, or leaving voided the
-// campaign), or a campaign already approved or past approval, so reviewing it again is
-// the way forward. For pulling back unclaimed rewards: a campaign never sent.
-const CONFLICT_CODES: ReadonlySet<string> = new Set(["hash_mismatch", "recipient_not_member", "voided", "not_open", "approved_before", "not_submitted"]);
+// campaign), a campaign already approved or past approval, or a member another approved
+// campaign is still measuring, so reviewing it again is the way forward. For pulling back
+// unclaimed rewards: a campaign never sent.
+const CONFLICT_CODES: ReadonlySet<string> = new Set(["hash_mismatch", "recipient_not_member", "voided", "not_open", "approved_before", "not_submitted", "member_held"]);
 
 /** The HTTP status a route answers with for an engine refusal code. */
 export function statusForEngineError(code: string): number {

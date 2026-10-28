@@ -251,6 +251,43 @@ def test_an_owner_amount_change_never_takes_a_member_past_the_365_day_line(conn:
     assert set_amount(conn, demo, "R1", 251, CONFIG).applied
 
 
+def approve_as_shown(conn: psycopg.Connection, campaign_id: uuid.UUID) -> None:
+    approve(conn, campaign_id, approver="owner", presented_hash=review_hash(conn, campaign_id), config=CONFIG)
+
+
+def test_a_campaign_sharing_a_member_with_a_running_measurement_is_refused_member_held_until_that_one_lets_go(
+    conn: psycopg.Connection,
+) -> None:
+    ids = members(conn)
+    first, second, third = (draft(conn, ids, [100, 100]) for _ in range(3))
+    approve_as_shown(conn, first)
+
+    with pytest.raises(ApprovalRefused) as refused:
+        approve_as_shown(conn, second)
+
+    assert refused.value.reason == "member_held"
+    assert "@" not in str(refused.value) and not any(str(m) in str(refused.value) for m in ids)
+    assert status(conn, second) == ("draft", None)
+    assert audit(conn, "approval_refused") == [{"campaign_id": str(second), "reason": "member_held"}]
+
+    conn.execute("update campaigns set status = 'voided', void_reason = 'test' where campaign_id = %s", (first,))
+    approve_as_shown(conn, second)
+    assert status(conn, second) == ("approved", None)
+    with pytest.raises(ApprovalRefused) as still_held:
+        approve_as_shown(conn, third)
+    assert still_held.value.reason == "member_held"
+    # The second is sent, and its 30-day window has closed, so it holds nobody now.
+    for step in ("submitting", "submitted"):
+        conn.execute("update campaigns set status = %s where campaign_id = %s", (step, second))
+    conn.execute(
+        "insert into campaign_status_moves (campaign_id, from_status, to_status, moved_at) "
+        "values (%s, 'submitting', 'submitted', now() - interval '31 days')",
+        (second,),
+    )
+    approve_as_shown(conn, third)
+    assert status(conn, third) == ("approved", None)
+
+
 def test_a_hash_that_is_not_the_one_shown_is_refused_even_after_a_small_edit(conn: psycopg.Connection) -> None:
     ids = members(conn)
     campaign_id = draft(conn, ids, [250, 300])

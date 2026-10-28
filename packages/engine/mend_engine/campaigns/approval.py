@@ -23,7 +23,7 @@ from psycopg.types.json import Jsonb
 
 # end_of_day_utc is the boundary paid_net_of_refunds counts refunds up to, so the
 # refunds after it are exactly the ones that function left out.
-from mend_engine.campaigns.eligibility import sent_by_receiver
+from mend_engine.campaigns.eligibility import OWNER_SCOPE, DraftScope, held_members, sent_by_receiver
 from mend_engine.campaigns.scoring import end_of_day_utc, paid_net_of_refunds
 from mend_engine.campaigns.spend import CapExceeded, check_daily_cap, database_now
 from mend_engine.config import Config
@@ -46,6 +46,8 @@ SUBJECT_TEMPLATE = "A thank-you from {shop_name}"
 CHANGED_REASON = "changed after approval"
 ACTOR = "engine"
 OPEN_STATUSES = ("draft", "awaiting_approval")
+# The advisory lock class approvals take per scope; the key inside it is the owner or the demo session.
+APPROVAL_LOCK_CLASS = 773133
 
 _HASH = re.compile(r"[0-9a-f]{64}", re.ASCII)
 # A principal id such as "owner" or "demo:4f2a", never an email address, so no
@@ -127,7 +129,11 @@ def approve(
 
     In one transaction, with the campaign row locked: the campaign must be a draft
     or awaiting approval; the snapshot rebuilt from its rows now must hash to
-    presented_hash; and, against current data, every recipient must still be a
+    presented_hash; under a lock on the campaign's scope (the owner, or the demo
+    session that created it), no member of it, rewarded or held back, may be held by
+    another campaign of that scope (eligibility.held_members), since a measurement
+    starts here, so two approvals sharing a member never both pass ("member_held");
+    and, against current data, every recipient must still be a
     member with a verified email, every amount at most the item cap, the campaign's
     per-recipient amount and what that member paid the shop by the campaign's
     as_of less every refund recorded up to now, less too, for a campaign no demo
@@ -295,8 +301,16 @@ def _approve(conn: psycopg.Connection, campaign_id: uuid.UUID, approver: str, pr
     if not hmac.compare_digest(digest, presented):
         raise ApprovalRefused("hash_mismatch", "the campaign is not the one that was shown; review it again")
 
+    scope = _scope_of(conn, campaign_id)
+    # Held until this transaction ends, so approvals in one scope run one after the other and
+    # two campaigns sharing a member can never both start measuring (C6).
+    conn.execute("select pg_advisory_xact_lock(%s::integer, hashtext(%s))", (APPROVAL_LOCK_CLASS, scope.session or scope.role))
+    members = {m for (m,) in conn.execute("select member_id from campaign_members where campaign_id = %s and member_id is not null", (campaign_id,))}
+    if members & held_members(conn, scope):
+        raise ApprovalRefused("member_held", "a member of this campaign is in another campaign that is still measuring")
+
     paid = _paid_by_member(conn, as_of, [r.member_id for r in recipients], every_refund=True)
-    sent = _owner_sent(conn, campaign_id)
+    sent = sent_by_receiver(conn) if scope.role == "owner" else {}
     for number, recipient in enumerate(recipients, start=1):
         amount = recipient.amount_minor
         if amount > config.item_cap_minor:
@@ -369,13 +383,18 @@ def _snapshot(campaign_id: uuid.UUID, shop_name: str, recipients: list[_Recipien
     )
 
 
-def _owner_sent(conn: psycopg.Connection, campaign_id: uuid.UUID) -> dict[str, int]:
-    """Cents sent to each receiver in the last 365 days if no demo session created the campaign; nothing for one that did (C4).
+def _scope_of(conn: psycopg.Connection, campaign_id: uuid.UUID) -> DraftScope:
+    """The demo session that created the campaign, or the owner's scope for any campaign no demo session created.
 
-    An owner campaign is any campaign no demo session created, the rule eligibility drafts by.
+    The rule eligibility drafts by, so a campaign is approved and paid under the scope it was drafted in.
     """
-    owner_role = conn.execute("select role from campaign_owners where campaign_id = %s", (campaign_id,)).fetchone()
-    return sent_by_receiver(conn) if owner_role is None or owner_role[0] != "demo" else {}
+    owner = conn.execute("select role, session_id from campaign_owners where campaign_id = %s", (campaign_id,)).fetchone()
+    return DraftScope("demo", owner[1]) if owner is not None and owner[0] == "demo" else OWNER_SCOPE
+
+
+def _owner_sent(conn: psycopg.Connection, campaign_id: uuid.UUID) -> dict[str, int]:
+    """Cents sent to each receiver in the last 365 days for an owner campaign; nothing for a demo session's (C4)."""
+    return sent_by_receiver(conn) if _scope_of(conn, campaign_id).role == "owner" else {}
 
 
 def _paid_by_member(

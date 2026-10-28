@@ -3,9 +3,10 @@
 Joins the 40 demo stand-ins (the 40 quiet regulars most at risk on 2026-10-16, by the
 synthetic address each was given) and one stand-in who is no shop customer, all under
 this script's own name, scores the shop, and shows who is eligible and who a running
-measurement still holds. It drafts, shows that a second draft over the same members is
-refused while the first holds them, voids and redraws until the random holdout
-differs, checks every amount against today's caps, tries to break the draft rules,
+measurement still holds. It drafts twice over the same members (a draft holds nobody),
+approves the first and shows that approving the second is refused member_held, voids
+and redraws until the random holdout differs, checks every amount against today's
+caps, tries to break the draft rules,
 and has one stand-in leave. Prints PASS or FAIL per line and a final M4A RESULT line.
 It calls no PayPal API and moves no money. Run python -m mend_engine.seed_demo first,
 so the stand-ins are labelled and on the current consent wording. The 40 stand-ins
@@ -27,6 +28,7 @@ from pathlib import Path
 import psycopg
 from psycopg.types.json import Jsonb
 
+from mend_engine.campaigns.approval import ApprovalRefused, approve, review_hash
 from mend_engine.campaigns.drafts import DraftRefused, DraftSettings, build_draft, draft_view
 from mend_engine.campaigns.eligibility import (
     REGULAR_MIN_DAYS,
@@ -66,17 +68,18 @@ CHECKS = 11
 # A fixed holdout would match on every draw; a random one over even 2 members differs
 # within 16 draws except about once in 65,000 runs.
 MAX_REDRAWS = 16
-# The owner's campaigns that still hold their members, written out again from the rule
-# (voided, or 30 days after first sent, lets them go; first sent is the first move to
-# submitted, else the first batch row) rather than imported, so the eligibility check
-# is compared with a second reading of it.
+# The owner's campaigns that hold their members, written out again from the rule rather
+# than imported, so the eligibility check is compared with a second reading of it: from
+# approval on, until voided, or for a sent one until 30 days after it was first sent
+# (the first move to submitted, else the first batch row). Drafts hold nobody.
 HELD_BY_OWNER_CAMPAIGNS = (
     "select distinct cm.member_id from campaign_members cm join campaigns c on c.campaign_id = cm.campaign_id "
     "left join campaign_owners o on o.campaign_id = c.campaign_id "
-    "where cm.member_id is not null and o.role is distinct from 'demo' and c.status <> 'voided' "
-    "and coalesce(coalesce((select min(s.moved_at) from campaign_status_moves s where s.campaign_id = c.campaign_id "
-    "and s.to_status = 'submitted'), (select min(b.created_at) from payout_batches b where b.campaign_id = c.campaign_id::text)) "
-    "> now() - interval '30 days', true)"
+    "where cm.member_id is not null and o.role is distinct from 'demo' "
+    "and c.status not in ('draft', 'awaiting_approval', 'voided') "
+    "and (c.status not in ('submitted', 'completed') or coalesce(coalesce((select min(s.moved_at) from campaign_status_moves s "
+    "where s.campaign_id = c.campaign_id and s.to_status = 'submitted'), (select min(b.created_at) from payout_batches b "
+    "where b.campaign_id = c.campaign_id::text)) > now() - interval '30 days', true))"
 )
 
 _UUID_SHAPE = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}", re.IGNORECASE)
@@ -98,7 +101,7 @@ class Proof:
 
 def describe(exc: BaseException) -> str:
     # Database errors can quote row values, so only the engine's own messages are shown.
-    if isinstance(exc, (DraftRefused, MembershipRefused, ConfigError)):
+    if isinstance(exc, (ApprovalRefused, DraftRefused, MembershipRefused, ConfigError)):
         return f"{type(exc).__name__}: {exc}"
     return type(exc).__name__
 
@@ -218,25 +221,24 @@ def check_eligible(
     return candidates
 
 
-def check_one_at_a_time(
-    proof: Proof, conn: psycopg.Connection, config: Config, settings: DraftSettings, first: uuid.UUID, eligible: int, created: list
-) -> None:
-    """A second draft while the first holds its members: refused when fewer than 2 are left, never sharing one otherwise (C6)."""
-    taken = set(roles(conn, first))
-    left = eligible - len(taken)
+def check_one_at_a_time(proof: Proof, conn: psycopg.Connection, config: Config, settings: DraftSettings, first: uuid.UUID, created: list) -> None:
+    """A draft holds nobody, so a second draft shares the first's members; once the first is approved the second is refused (C6)."""
+    second = build_draft(conn, config, settings).campaign_id
+    created.append(second)
+    shared = set(roles(conn, second)) & set(roles(conn, first))
+    approve(conn, first, approver=ACTOR, presented_hash=review_hash(conn, first), config=config)
     try:
-        second = build_draft(conn, config, settings).campaign_id
-        created.append(second)
-        outcome, shared = "drafted", set(roles(conn, second)) & taken
-    except DraftRefused as refused:
-        outcome, shared = refused.reason, set()
-    if left < 2:
-        ok = outcome == "too_few_candidates"
-        text = f"one at a time: a second draft while the first holds its {len(taken)} members is refused (too_few_candidates)"
-    else:
-        ok = outcome == "drafted" and not shared
-        text = f"one at a time: a second draft takes only the {left} members the first does not hold"
-    proof.line(ok, text + ("" if ok else f" (got {outcome}, {len(shared)} shared)"))
+        approve(conn, second, approver=ACTOR, presented_hash=review_hash(conn, second), config=config)
+        outcome = "approved"
+    except ApprovalRefused as refused:
+        outcome = refused.reason
+    status = conn.execute("select status from campaigns where campaign_id = %s", (second,)).fetchone()[0]
+    ok = bool(shared) and outcome == "member_held" and status == "draft"
+    proof.line(
+        ok,
+        f"one at a time: a second draft shares {len(shared)} members with the first; once the first is approved, "
+        "approving the second is refused member_held" + ("" if ok else f" (got {outcome}, status {status})"),
+    )
 
 
 def check_holdout(
@@ -443,7 +445,7 @@ def run() -> bool:
                 return False
             created.append(first)
             first_roles = roles(conn, first)
-            check_one_at_a_time(proof, conn, config, settings, first, len(candidates), created)
+            check_one_at_a_time(proof, conn, config, settings, first, created)
             current = check_holdout(proof, conn, config, settings, first, first_roles, created)
             check_amounts(proof, conn, config, current, settings, candidates)
             check_refusals(proof, conn, config, settings)

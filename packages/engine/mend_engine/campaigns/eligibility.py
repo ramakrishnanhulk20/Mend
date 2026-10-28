@@ -6,8 +6,10 @@ the one normaliser, and only when PayPal verified that email and the member agre
 to a consent wording in ACCEPTED_CONSENT_VERSIONS; the payout receiver still comes
 only from the member row.
 
-A member is in one measurement at a time (C4, C6). While a campaign of the same
-scope still holds them, in either arm, they are not a candidate for another one.
+A member is in one measurement at a time (C4, C6). A measurement starts at approval:
+while an approved, in-flight or still-measuring campaign of the same scope holds them,
+in either arm, they are not a candidate for another one. Drafts hold nobody, so two
+drafts may share members, and approval refuses the second ("member_held").
 The scope is the owner's campaigns for an owner draft and one demo session's own
 campaigns for that session's draft (C19), so a visitor's toy campaign never shrinks
 the owner's pool or another visitor's. An owner draft also never takes a member past
@@ -47,15 +49,18 @@ _SENT_AT_SQL = (
     "coalesce((select min(s.moved_at) from campaign_status_moves s where s.campaign_id = c.campaign_id "
     "and s.to_status = 'submitted'), (select min(b.created_at) from payout_batches b where b.campaign_id = c.campaign_id::text))"
 )
-# Every member a campaign of the scope still holds, in either arm. A campaign lets go
-# of its members only when it is voided, or once its attribution window has closed,
-# 30 days after it was first sent (campaigns.attribution). Every other status holds
-# them, including one in flight, one added later, or one with no send time at all,
-# so a new status or a missing record fails closed.
+# Every member a campaign of the scope holds, in either arm. A measurement starts at
+# approval, so a draft or a campaign awaiting approval holds nobody and an abandoned
+# draft never locks anyone out; approval itself refuses a campaign whose member is held
+# (approval.approve, "member_held"). A sent campaign holds until its attribution window
+# closes, 30 days after it was first sent (campaigns.attribution), or for good with no
+# send time on record. Every other status holds, one in flight or one added later
+# included, so a new status fails closed.
 _HELD_SQL = (
     "select distinct cm.member_id from campaign_members cm join campaigns c on c.campaign_id = cm.campaign_id "
     "left join campaign_owners o on o.campaign_id = c.campaign_id "
-    "where cm.member_id is not null and {scope} and c.status <> 'voided' and not coalesce(" + _SENT_AT_SQL + " <= now() - %s, false)"
+    "where cm.member_id is not null and {scope} and c.status not in ('draft', 'awaiting_approval', 'voided') "
+    "and not (c.status in ('submitted', 'completed') and coalesce(" + _SENT_AT_SQL + " <= now() - %s, false))"
 )
 # The owner's campaigns are every campaign no demo session created, so one an operator
 # script drafted with no owner row counts as the owner's.

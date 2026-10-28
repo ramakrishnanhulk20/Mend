@@ -371,6 +371,7 @@ describe("statusForEngineError", () => {
     ["not_open", 409],
     ["approved_before", 409],
     ["not_submitted", 409],
+    ["member_held", 409],
     ["member_left", 422],
   ])("answers %s with %i", (code, status) => {
     expect(statusForEngineError(code)).toBe(status);

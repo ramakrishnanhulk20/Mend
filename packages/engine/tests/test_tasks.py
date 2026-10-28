@@ -257,30 +257,52 @@ def members_of(conn: psycopg.Connection, campaign_id: str) -> set[uuid.UUID]:
     return {r[0] for r in conn.execute("select member_id from campaign_members where campaign_id = %s", (uuid.UUID(campaign_id),))}
 
 
-def test_two_owner_drafts_at_once_never_share_a_member_and_a_demo_visitors_draft_is_its_own(
+def review(campaign_id: str, who: dict) -> str:
+    return tasks.view_campaign(campaign_id, who)["review_hash"]
+
+
+def test_a_demo_sessions_second_draft_shares_the_first_drafts_members_until_the_first_is_approved(
+    conn: psycopg.Connection, paypal: FakePayPal
+) -> None:
+    seed_shop(conn)
+    demo = actor(conn, "demo")
+    first, second = (tasks.draft_campaign(DEMO_SETTINGS, demo)["campaign_id"] for _ in range(2))
+    # An unapproved draft measures nothing yet, so it holds nobody (C6).
+    assert len(members_of(conn, first)) == 10 and members_of(conn, second) == members_of(conn, first)
+
+    assert tasks.approve_campaign(first, demo, review(first, demo))["ok"] is True
+    third = tasks.draft_campaign(DEMO_SETTINGS, demo)["campaign_id"]
+    assert len(members_of(conn, third)) == 10 and not members_of(conn, third) & members_of(conn, first)
+    assert refused(tasks.approve_campaign(second, demo, review(second, demo)), "member_held")
+    assert campaign_status(conn, second) == "draft"
+    # Another visitor's measurement is its own, so it starts from the same most-at-risk members.
+    other = actor(conn, "demo")
+    assert members_of(conn, tasks.draft_campaign(DEMO_SETTINGS, other)["campaign_id"]) == members_of(conn, first)
+
+
+def test_two_owner_approvals_of_drafts_sharing_members_at_the_same_moment_never_both_pass(
     conn: psycopg.Connection, paypal: FakePayPal
 ) -> None:
     seed_shop(conn)
     owner = actor(conn, "owner")
+    drafts = [tasks.draft_campaign(DEMO_SETTINGS, owner)["campaign_id"] for _ in range(2)]
+    assert members_of(conn, drafts[0]) == members_of(conn, drafts[1])
+    shown = {cid: review(cid, owner) for cid in drafts}
     gate = threading.Barrier(2)
     answers: list[dict] = []
 
-    def draft() -> None:
-        gate.wait()
-        answers.append(tasks.draft_campaign(DEMO_SETTINGS, owner))
+    def approve_one(campaign_id: str) -> None:
+        gate.wait()  # each task opens its own connection, so the two approvals race on separate connections
+        answers.append(tasks.approve_campaign(campaign_id, owner, shown[campaign_id]))
 
-    workers = [threading.Thread(target=draft) for _ in range(2)]
+    workers = [threading.Thread(target=approve_one, args=(cid,)) for cid in drafts]
     for worker in workers:
         worker.start()
     for worker in workers:
         worker.join(timeout=120)
 
-    assert len(answers) == 2 and all(answer["ok"] for answer in answers), answers
-    first, second = (members_of(conn, answer["campaign_id"]) for answer in answers)
-    assert len(first) == len(second) == 10 and not first & second
-    # A demo visitor's measurement is its own, so it starts from the same most-at-risk members.
-    demo = members_of(conn, tasks.draft_campaign(DEMO_SETTINGS, actor(conn, "demo"))["campaign_id"])
-    assert demo in (first, second)
+    assert sorted(answer.get("error", "approved") for answer in answers) == ["approved", "member_held"], answers
+    assert sorted(campaign_status(conn, cid) for cid in drafts) == ["approved", "draft"]
 
 
 def test_a_draft_for_any_day_but_the_shops_own_is_refused_before_anything_is_scored(

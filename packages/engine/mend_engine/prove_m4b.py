@@ -282,17 +282,17 @@ def receiver_unavailable(conn: psycopg.Connection, scores: ScoreSet, receiver_id
     """Why the test receiver cannot be drafted for the owner now, or None when it can."""
     if receiver_id in {c.member_id for c in quiet_regular_members(conn, scores, AS_OF)}:
         return None
-    # First sent is the first move to submitted, else the first batch row, as eligibility reads it.
+    # Drafts hold nobody; first sent is the first move to submitted, else the first batch row, as eligibility reads it.
     unsent, closes = conn.execute(
         "select bool_or(sent is null), max(sent + interval '30 days') from (select coalesce((select min(s.moved_at) "
         "from campaign_status_moves s where s.campaign_id = c.campaign_id and s.to_status = 'submitted'), "
         "(select min(b.created_at) from payout_batches b where b.campaign_id = c.campaign_id::text)) as sent "
         "from campaign_members cm join campaigns c using (campaign_id) left join campaign_owners o using (campaign_id) "
-        "where cm.member_id = %s and c.status <> 'voided' and o.role is distinct from 'demo') held",
+        "where cm.member_id = %s and c.status not in ('voided', 'draft', 'awaiting_approval') and o.role is distinct from 'demo') held",
         (receiver_id,),
     ).fetchone()
     if unsent:
-        return "the test receiver is held by an owner campaign not yet sent, which holds it until voided"
+        return "the test receiver is held by an approved owner campaign not yet sent, which holds it until voided"
     if closes is not None and closes > database_now(conn):
         return f"the test receiver is held by a running measurement until {closes.astimezone(timezone.utc):%Y-%m-%d %H:%M} UTC"
     return "the test receiver is not an eligible quiet regular (unlinked, or nothing left to be paid)"

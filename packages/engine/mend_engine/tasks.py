@@ -237,9 +237,10 @@ def draft_campaign(settings: object, actor: object) -> dict:
     person, from at most 20 candidates, at most 5 campaigns per session in any 24
     hours, and the demo pool of 5000 cents per rolling day; a demo max_candidates
     above 20 is refused before anything is scored. Candidates are drafted for the
-    actor's scope (eligibility.DraftScope): a member another open or still-measuring
-    campaign of the same scope holds is left out, and two drafts of one scope run one
-    after the other. The campaign is recorded against the actor's session in
+    actor's scope (eligibility.DraftScope): a member an approved or still-measuring
+    campaign of the same scope holds is left out. A draft holds nobody, so two drafts
+    may share members; approve_campaign lets only one of them start measuring. A demo
+    session's drafts run one after the other. The campaign is recorded against the actor's session in
     campaign_owners in the same transaction as the draft. Returns campaign_id and
     counts; refusals carry build_draft's reason, "invalid_input", "over_cap",
     "limit_reached" or "over_demo_daily_cap".
@@ -254,14 +255,10 @@ def draft_campaign(settings: object, actor: object) -> dict:
         if role == "demo" and draft_settings.max_candidates > DEMO_MAX_CANDIDATES:
             raise _Refused("over_cap", f"a demo draft may consider at most {DEMO_MAX_CANDIDATES} candidates")
         with conn.transaction():
-            # Held until commit, so two drafts of one scope run one after the other: the
-            # second sees the first's members as taken (C6), and a demo session's two
-            # drafts cannot both pass its daily count.
             scope = DraftScope("demo", session) if role == "demo" else OWNER_SCOPE
-            conn.execute(
-                "select pg_advisory_xact_lock(%s::integer, hashtext(%s))", (DRAFT_LOCK_CLASS, session if role == "demo" else role)
-            )
             if role == "demo":
+                # Held until commit, so two drafts from one session cannot both pass the count.
+                conn.execute("select pg_advisory_xact_lock(%s::integer, hashtext(%s))", (DRAFT_LOCK_CLASS, session))
                 made = conn.execute(
                     "select count(*) from campaign_owners o join campaigns c on c.campaign_id = o.campaign_id "
                     "where o.session_id = %s and c.created_at > now() - %s",
@@ -335,7 +332,9 @@ def approve_campaign(campaign_id: object, actor: object, presented_hash: object)
     """Approve the actor's campaign exactly as shown, under the actor's caps (C2, C4).
 
     A demo actor approves only under the demo caps and only if the campaign's total
-    still fits the demo pool. Refusals carry approve()'s reason or "over_demo_daily_cap".
+    still fits the demo pool. Refusals carry approve()'s reason or "over_demo_daily_cap";
+    "member_held" means a member of this campaign is in another of the same scope that
+    was approved first and is still measuring, so this one cannot start (C6).
     """
 
     def work(config: Config, conn: psycopg.Connection) -> dict:

@@ -302,6 +302,8 @@ def test_moving_first_says_the_receiver_is_held_while_a_running_measurement_hold
         "insert into campaign_members (campaign_id, ref, member_id, role, rank, score) values (%s, 'R1', %s, 'holdout', 1, 0.1)",
         (running, receiver_member(conn)),
     )
+    # A measurement starts at approval; a draft holds nobody.
+    conn.execute("update campaigns set status = 'approved' where campaign_id = %s", (running,))
     before = state(conn)
 
     assert seed_demo.seed_receiver_first(conn, config, scores) == "receiver: held by a running measurement"

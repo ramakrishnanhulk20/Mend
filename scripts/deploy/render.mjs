@@ -3,20 +3,29 @@
  * private service), the scheduled jobs (mend-jobs, a cron job), their database (mend-db),
  * and the PayPal sandbox webhook that points at the web app.
  *
- *   node scripts/deploy/render.mjs status            read-only: what exists and how it is set
- *   node scripts/deploy/render.mjs up [--migrate]    find or create everything; safe to rerun
- *   node scripts/deploy/render.mjs prove             the live proof: a demo visitor's whole campaign on the live site
+ *   node scripts/deploy/render.mjs status                       read-only: each recorded resource and how it is set
+ *   node scripts/deploy/render.mjs up [--create] [--migrate]    bring the recorded resources to their decided settings
+ *   node scripts/deploy/render.mjs prove                        the live proof: compare only, never a change
+ *
+ * Every resource is found by the id render-state.json records for it. A recorded resource
+ * that is missing, renamed or on another plan stops the run before anything changes, and a
+ * resource is created only with --create and only when no id is recorded for it, so no
+ * command can create a paid resource or point a service at another database by accident.
  *
  * Only `up --migrate` changes mend-db: it runs the engine's own migrate command (schema.sql
- * as checked out here) and then its seed command, both from this machine over TLS. Without
- * --migrate nothing touches mend-db's structure or data, so prove, which reruns `up`, can
- * never apply a half-edited schema.
+ * as checked out here, and the services' roles mend_engine and mend_web) as mend-db's owner
+ * and then its seed command as mend_engine, both from this machine over TLS.
+ *
+ * prove changes no resource and no setting: Render and PayPal writes are refused in code.
+ * Its one exception, shared with up, is this machine's own entry on mend-db's allow list,
+ * added at the start of a run and removed at its end, whatever happens in between.
  *
  * Secrets come from the repo's .env or are generated here (MEND_CSRF_SECRET,
- * MEND_ENGINE_TOKEN) and go only to the Render API and PayPal's sandbox API. A generated
- * secret lives only in Render and is read back from Render on the next run. No service is
- * given RENDER_API_KEY. No secret value is printed or written to disk: every output line
- * passes through say(), which withholds any line that carries one and fails the run.
+ * MEND_ENGINE_TOKEN, MEND_ENGINE_DB_PASSWORD, MEND_WEB_DB_PASSWORD) and go only to the Render
+ * API and PayPal's sandbox API. A generated secret lives only in Render and is read back from
+ * Render on the next run. No service is given RENDER_API_KEY. No secret value is printed or
+ * written to disk: every output line passes through say(), which withholds any line that
+ * carries one and fails the run.
  */
 import { spawn, spawnSync } from "node:child_process";
 import { randomBytes } from "node:crypto";
@@ -40,8 +49,12 @@ const WORKSPACE_NAME = "My Workspace";
 const REPO_URL = "https://github.com/ramakrishnanhulk20/Mend";
 const BRANCH = "main";
 const REGION = "virginia";
-// The limited login role every service connects as; mend_engine.db.migrate creates it (C22).
-const APP_DB_ROLE = "mend_app";
+// The login role each service connects as; mend_engine.db.migrate creates both (C22).
+// mend_web cannot write the payout ledger, members or campaigns.
+const DB_ROLES = { web: "mend_web", engine: "mend_engine", jobs: "mend_engine" };
+const ROLE_PASSWORD_ENV = { mend_engine: "MEND_ENGINE_DB_PASSWORD", mend_web: "MEND_WEB_DB_PASSWORD" };
+// The single role every service used to share; a migrate run drops it once no service uses it.
+const LEGACY_DB_ROLE = "mend_app";
 
 // Render renamed its plans without changing prices (render.com/docs/compute-plans), and the
 // API may report either name. The first name in each list is the one this script asks for.
@@ -175,8 +188,7 @@ const PRINTABLE = /^[\x21-\x7e]+$/;
  * The settings this script needs, validated. Errors name the key, never its value.
  * PAYPAL_ENV must be exactly "sandbox" (C16), whatever command runs.
  */
-function loadSettings() {
-  const env = readDotEnv();
+function loadSettings(env = readDotEnv()) {
   const missing = ["RENDER_API_KEY", "PAYPAL_CLIENT_ID", "PAYPAL_CLIENT_SECRET"].filter(
     (key) => typeof env[key] !== "string" || !NO_WHITESPACE.test(env[key]),
   );
@@ -200,22 +212,44 @@ function checkDeploySettings() {
 }
 
 let settings;
+let statePath = STATE_PATH;
+// prove's mode: every Render and PayPal write is refused in code, except this machine's
+// allow-list entry (openMachineAccess, closeMachineAccess).
+let compareOnly = false;
 
 function readState() {
-  if (!existsSync(STATE_PATH)) return {};
-  return JSON.parse(readFileSync(STATE_PATH, "utf8"));
+  if (!existsSync(statePath)) return {};
+  return JSON.parse(readFileSync(statePath, "utf8"));
 }
 
-/** Writes render-state.json only when its content changes, so a repeat run leaves it alone. */
+/**
+ * Writes render-state.json only when its content changes, so a repeat run leaves it alone,
+ * and returns whether it differed. A plan-only run only reports whether it would write.
+ */
 function writeState(state) {
   const text = `${JSON.stringify(state, null, 2)}\n`;
   if (carriesSecret(text)) throw new DeployError("refusing to write a secret into render-state.json");
-  if (existsSync(STATE_PATH) && readFileSync(STATE_PATH, "utf8") === text) return false;
-  writeFileSync(STATE_PATH, text, "utf8");
+  if (existsSync(statePath) && readFileSync(statePath, "utf8") === text) return false;
+  if (options.planOnly) return true;
+  if (compareOnly) throw new DeployError("compare-only: refused to write render-state.json");
+  writeFileSync(statePath, text, "utf8");
   return true;
 }
 
-async function renderCall(method, apiPath, body) {
+/** Records the id of a resource the moment it is created, so a run that stops later never creates a second one. */
+function recordId(update) {
+  const state = readState();
+  writeState({ ...state, ...update, services: { ...(state.services ?? {}), ...(update.services ?? {}) } });
+}
+
+function isAllowListOnly(method, apiPath, body) {
+  return method === "PATCH" && /^\/postgres\/dpg-[a-z0-9-]{1,64}$/.test(apiPath) && body !== null && typeof body === "object" && Object.keys(body).join() === "ipAllowList";
+}
+
+async function renderCall(method, apiPath, body, { allowList = false } = {}) {
+  if (compareOnly && method !== "GET" && !(allowList && isAllowListOnly(method, apiPath, body))) {
+    throw new DeployError(`compare-only: refused Render ${method} ${apiPath.split("?")[0]}`);
+  }
   const headers = { Authorization: `Bearer ${settings.RENDER_API_KEY}`, Accept: "application/json" };
   if (body !== undefined) headers["Content-Type"] = "application/json";
   // Only reads are retried: a create that timed out may have happened, and a rerun of
@@ -252,8 +286,8 @@ async function renderCall(method, apiPath, body) {
   }
 }
 
-async function renderOk(method, apiPath, body, expected = [200]) {
-  const reply = await renderCall(method, apiPath, body);
+async function renderOk(method, apiPath, body, expected = [200], callOptions = {}) {
+  const reply = await renderCall(method, apiPath, body, callOptions);
   if (!expected.includes(reply.status)) {
     const message = typeof reply.body?.message === "string" ? reply.body.message.slice(0, 300) : "no message";
     throw new DeployError(`Render ${method} ${apiPath.split("?")[0]} answered ${reply.status}: ${message}`);
@@ -302,6 +336,93 @@ async function findService(ownerId, spec) {
 async function latestDeploy(serviceId) {
   const rows = await renderOk("GET", `/services/${serviceId}/deploys?limit=1`);
   return rows[0]?.deploy ?? null;
+}
+
+function stop(message) {
+  return new DeployError(`${message}; nothing was changed`);
+}
+
+/** The resource at apiPath, only when Render answers 200 with an object carrying exactly the recorded id. */
+async function recorded(what, apiPath, id) {
+  const reply = await renderCall("GET", apiPath);
+  if (reply.status !== 200 || reply.body === null || typeof reply.body !== "object" || reply.body.id !== id) {
+    throw stop(`the recorded ${what} ${id} is missing (Render answered ${reply.status}${reply.body === null ? " with no body" : ""})`);
+  }
+  return reply.body;
+}
+
+async function resolveWorkspace(state) {
+  const id = state.workspace?.id;
+  if (!id) return findWorkspace();
+  const owner = await recorded("workspace", `/owners/${id}`, id);
+  if (owner.name !== WORKSPACE_NAME || owner.type !== "team") throw stop(`the recorded workspace ${id} is "${owner.name}", not "${WORKSPACE_NAME}"`);
+  return { id: owner.id, name: owner.name };
+}
+
+async function resolveDatabase(state, workspace) {
+  const id = state.database?.id;
+  if (id) {
+    const db = await recorded(DATABASE.name, `/postgres/${id}`, id);
+    if (db.name !== DATABASE.name) throw stop(`the recorded ${DATABASE.name} ${id} was renamed to "${db.name}"`);
+    if (db.owner?.id !== workspace.id) throw stop(`the recorded ${DATABASE.name} ${id} belongs to another workspace`);
+    checkDatabaseSettings(db);
+    return { found: db };
+  }
+  const named = await findDatabase(workspace.id);
+  if (named !== null) throw stop(`${DATABASE.name} ${named.id} exists but render-state.json records no id for it; record it as database.id`);
+  if (!options.create) throw stop(`render-state.json records no ${DATABASE.name}; pass --create to create it (about USD 6 a month)`);
+  return { create: true };
+}
+
+async function resolveService(state, workspace, spec) {
+  const id = state.services?.[spec.key]?.id;
+  if (id) {
+    const service = await recorded(spec.name, `/services/${id}`, id);
+    if (service.name !== spec.name) throw stop(`the recorded ${spec.name} ${id} was renamed to "${service.name}"`);
+    if (service.ownerId !== workspace.id) throw stop(`the recorded ${spec.name} ${id} belongs to another workspace`);
+    checkServiceSettings(spec, service);
+    return { found: service };
+  }
+  const named = await findService(workspace.id, spec);
+  if (named !== null) throw stop(`${spec.name} ${named.id} exists but render-state.json records no id for it; record it as services.${spec.key}.id`);
+  if (!options.create) throw stop(`render-state.json records no ${spec.name}; pass --create to create it (${spec.cost})`);
+  return { create: true };
+}
+
+async function resolveWebhook(state, web) {
+  const expected = web.found ? webhookUrlFor(serviceOrigin(web.found)) : null;
+  const id = state.webhook?.id;
+  if (id) {
+    const reply = await paypalCall("GET", webhookPath(id));
+    if (reply.status !== 200 || reply.body?.id !== id) throw stop(`the recorded PayPal webhook ${id} is missing (PayPal answered ${reply.status})`);
+    if (expected === null || !sameUrl(reply.body.url, expected)) throw stop(`the recorded PayPal webhook ${id} points at ${reply.body.url}, not at mend-web`);
+    return { found: reply.body };
+  }
+  const ours = expected === null ? [] : (await listWebhooks()).filter((hook) => sameUrl(hook.url, expected));
+  if (ours.length > 0) throw stop(`PayPal webhook ${ours[0].id} points at mend-web but render-state.json records no id for it; record it as webhook.id`);
+  if (!options.create) throw stop("render-state.json records no PayPal webhook; pass --create to register one");
+  return { create: true };
+}
+
+/**
+ * Every resource this deploy manages, found by the id render-state.json records, before
+ * anything is changed. Each is { found } or, only with --create and no recorded id,
+ * { create: true }. Throws, having changed nothing, for a recorded resource that is missing,
+ * renamed, in another workspace or off its decided settings, and for an unrecorded one that
+ * exists under the expected name or may not be created.
+ */
+async function resolveResources(state) {
+  const workspace = await resolveWorkspace(state);
+  const db = await resolveDatabase(state, workspace);
+  const services = {};
+  for (const spec of Object.values(SERVICES)) services[spec.key] = await resolveService(state, workspace, spec);
+  // A new, empty database under services that already run would repoint them at it.
+  const running = Object.values(SERVICES).filter((spec) => services[spec.key].found);
+  if (db.create && running.length > 0) {
+    throw stop(`${DATABASE.name} is not recorded but ${running.map((spec) => spec.name).join(", ")} are; a new ${DATABASE.name} would point them at an empty database`);
+  }
+  const webhook = await resolveWebhook(state, services.web);
+  return { workspace, db, services, webhook };
 }
 
 /**
@@ -358,6 +479,7 @@ function webhookUrlFor(origin) {
 let paypalToken = null;
 
 async function paypalCall(method, apiPath, body, extraHeaders = {}) {
+  if (compareOnly && method !== "GET") throw new DeployError(`compare-only: refused PayPal ${method} ${apiPath}`);
   if (!apiPath.startsWith("/") || apiPath.startsWith("//")) throw new DeployError("PayPal path must start with a single /");
   const url = new URL(`${PAYPAL_API}${apiPath}`);
   if (url.origin !== PAYPAL_API) throw new DeployError("refused a PayPal call that left the sandbox host");
@@ -425,56 +547,46 @@ function sameUrl(a, b) {
   }
 }
 
+/** Read-only: each resource render-state.json records, found by its id, with any problem the next `up` would stop on. */
 async function status() {
   const state = readState();
-  const workspace = await findWorkspace();
-  say(`status: workspace "${workspace.name}" (${workspace.id})`);
-
-  const db = await findDatabase(workspace.id);
-  say(
-    db === null
-      ? "status: database mend-db does not exist"
-      : `status: database ${db.name} ${db.id} is ${db.status}, plan ${db.plan}, region ${db.region}, Postgres ${db.version}, ${db.diskSizeGB ?? "?"} GB`,
-  );
-
-  const live = { database: db?.id ?? null, webhook: null };
-  let webhookUrl = null;
-  for (const spec of Object.values(SERVICES)) {
-    const service = await findService(workspace.id, spec);
-    live[spec.key] = service?.id ?? null;
-    if (service === null) {
-      say(`status: ${spec.name} does not exist`);
-      continue;
+  if (!existsSync(statePath)) say("status: no render-state.json yet");
+  const report = async (label, work) => {
+    try {
+      say(`status: ${await work()}`);
+    } catch (error) {
+      say(`status: ${label}: ${error instanceof Error ? error.message : "unreadable"}`);
     }
-    const details = service.serviceDetails ?? {};
-    const deploy = await latestDeploy(service.id);
-    const where = spec.key === "web" ? details.url : spec.key === "engine" ? `${engineAddress(service) ?? "no address yet"} (private)` : `schedule ${details.schedule}, last good run ${details.lastSuccessfulRunAt ?? "none yet"}`;
-    say(
-      `status: ${spec.name} ${service.id} ${where}, plan ${details.plan}, region ${details.region}, ${service.suspended}, latest deploy ${deploy ? `${deploy.id} ${deploy.status}` : "none"}`,
-    );
-    if (spec.key === "web") webhookUrl = webhookUrlFor(serviceOrigin(service));
+  };
+  let workspace = null;
+  await report("workspace", async () => {
+    workspace = await resolveWorkspace(state);
+    return `workspace "${workspace.name}" ${workspace.id}`;
+  });
+  if (workspace === null) return;
+  await report(DATABASE.name, async () => {
+    const db = await resolveDatabase(state, workspace);
+    if (db.create) return `${DATABASE.name} is not recorded and does not exist`;
+    return `${DATABASE.name} ${db.found.id} is ${db.found.status}, plan ${db.found.plan}, region ${db.found.region}, Postgres ${db.found.version}, ${db.found.diskSizeGB ?? "?"} GB, ${(db.found.ipAllowList ?? []).length} allow-list entries`;
+  });
+  let web = { create: true };
+  for (const spec of Object.values(SERVICES)) {
+    await report(spec.name, async () => {
+      const resolved = await resolveService(state, workspace, spec);
+      if (spec.key === "web") web = resolved;
+      if (resolved.create) return `${spec.name} is not recorded and does not exist`;
+      const service = resolved.found;
+      const details = service.serviceDetails ?? {};
+      const deploy = await latestDeploy(service.id);
+      const role = databaseUser((await serviceEnv(service.id)).DATABASE_URL ?? "") || "none";
+      const where = spec.key === "web" ? details.url : spec.key === "engine" ? `${engineAddress(service) ?? "no address yet"} (private)` : `schedule ${details.schedule}, last good run ${details.lastSuccessfulRunAt ?? "none yet"}`;
+      return `${spec.name} ${service.id} ${where}, plan ${details.plan}, region ${details.region}, ${service.suspended}, database role ${role}, latest deploy ${deploy ? `${deploy.id} ${deploy.status}` : "none"}`;
+    });
   }
-
-  const webhooks = await listWebhooks();
-  const ours = webhookUrl === null ? [] : webhooks.filter((hook) => sameUrl(hook.url, webhookUrl));
-  const tunnels = webhooks.filter((hook) => hostOf(hook.url).endsWith(".trycloudflare.com"));
-  live.webhook = ours[0]?.id ?? null;
-  say(
-    ours.length === 0
-      ? `status: no PayPal webhook points at mend-web (${webhooks.length} webhooks on the app, ${tunnels.length} on trycloudflare.com)`
-      : `status: PayPal webhook ${ours[0].id} points at ${ours[0].url} with ${ours[0].event_types?.length ?? 0} event types (${webhooks.length} webhooks on the app, ${tunnels.length} on trycloudflare.com)`,
-  );
-
-  const recorded = { database: state.database?.id ?? null, webhook: state.webhook?.id ?? null };
-  for (const key of Object.keys(SERVICES)) recorded[key] = state.services?.[key]?.id ?? null;
-  const differs = Object.keys(live).filter((key) => live[key] !== recorded[key]);
-  say(
-    !existsSync(STATE_PATH)
-      ? "status: no render-state.json yet"
-      : differs.length === 0
-        ? "status: render-state.json matches what exists"
-        : `status: render-state.json differs from what exists for ${differs.join(", ")}`,
-  );
+  await report("PayPal webhook", async () => {
+    const hook = await resolveWebhook(state, web);
+    return hook.create ? "PayPal webhook is not recorded and none points at mend-web" : `PayPal webhook ${hook.found.id} points at ${hook.found.url} with ${hook.found.event_types?.length ?? 0} event types`;
+  });
   for (const [key, since] of Object.entries(state.pending ?? {})) {
     say(`status: an env var change on ${SERVICES[key]?.name ?? key} from ${since} has not been seen live; the next \`up\` redeploys it`);
   }
@@ -539,10 +651,11 @@ function certifiPath() {
  * it writes. The database URL travels in the child's environment only. The rest of the
  * engine's settings come from the repo's .env, as for any local engine command.
  */
-function runEngineCommand(module, externalUrl, timeoutMs, extraEnv = {}) {
+function runEngineCommand(module, externalUrl, timeoutMs, extraEnv = {}, args = []) {
+  if (compareOnly || options.planOnly) throw new DeployError(`refused to run python -m ${module} in a run that may not change anything`);
   const env = { ...process.env, ...extraEnv, DATABASE_URL: externalUrl, PGSSLMODE: "verify-full", PGSSLROOTCERT: certifiPath(), PYTHONUNBUFFERED: "1" };
   return new Promise((resolve, reject) => {
-    const child = spawn(ENGINE_PYTHON, ["-m", module], { cwd: ENGINE_DIR, env, windowsHide: true });
+    const child = spawn(ENGINE_PYTHON, ["-m", module, ...args], { cwd: ENGINE_DIR, env, windowsHide: true });
     const lines = [];
     const timer = setTimeout(() => child.kill(), timeoutMs);
     for (const stream of [child.stdout, child.stderr]) {
@@ -575,31 +688,42 @@ async function publicTables(externalUrl) {
   return databaseRows(externalUrl, "select table_name from information_schema.tables where table_schema = 'public' order by 1").map((row) => row.table_name);
 }
 
-function appLoginWorks(appExternalUrl) {
+function loginWorks(externalUrl) {
   try {
-    databaseRows(appExternalUrl, "select 1 as ok");
+    databaseRows(externalUrl, "select 1 as ok");
     return true;
   } catch {
     return false;
   }
 }
 
+function reportedRole(lines, role) {
+  const pattern = new RegExp(`^db role ${role}: (.+)$`);
+  return lines.map((text) => pattern.exec(text)?.[1]).find(Boolean) ?? null;
+}
+
 /**
  * `up --migrate`: the engine's migrate command as mend-db's owner (the only step that is),
- * then its seed command as mend_app. The password goes to migrate only when mend_app
- * cannot already log in with it, so a repeat run leaves the role as it is. Records what changed.
+ * then its seed command as mend_engine. Each role's password goes to migrate only when that
+ * role cannot already log in with it, so a repeat run leaves the roles as they are. Records
+ * what changed.
  */
-async function migrateAndSeed(connection, app, appPassword, changes) {
+async function migrateAndSeed(connection, roleConnections, passwords, changes) {
   const before = await publicTables(connection.external);
-  const extra = appLoginWorks(app.external) ? {} : { MEND_APP_DB_PASSWORD: appPassword };
+  const extra = {};
+  for (const role of Object.keys(ROLE_PASSWORD_ENV)) {
+    if (!loginWorks(roleConnections[role].external)) extra[ROLE_PASSWORD_ENV[role]] = passwords[role];
+  }
   const migrated = await runEngineCommand("mend_engine.db.migrate", connection.external, MIGRATE_TIMEOUT_MS, extra);
   if (migrated.code !== 0) throw new DeployError(`python -m mend_engine.db.migrate exited ${migrated.code}`);
   const sha = migrated.lines.map((text) => /^schema sha256 ([0-9a-f]{64})$/.exec(text)?.[1]).find(Boolean) ?? null;
-  const role = migrated.lines.map((text) => /^app role mend_app: (created|password set|kept)$/.exec(text)?.[1]).find(Boolean) ?? null;
-  if (role === null) throw new DeployError("migrate did not report the mend_app role");
-  if (role !== "kept") {
-    changes.push(`app role ${APP_DB_ROLE} ${role}`);
-    say(`action: migrate ${role === "created" ? `created the ${APP_DB_ROLE} role` : `set the ${APP_DB_ROLE} role's password`}`);
+  for (const role of Object.keys(ROLE_PASSWORD_ENV)) {
+    const outcome = reportedRole(migrated.lines, role);
+    if (!["created", "password set", "kept"].includes(outcome)) throw new DeployError(`migrate did not report the ${role} role (${outcome ?? "no line"})`);
+    if (outcome !== "kept") {
+      changes.push(`db role ${role} ${outcome}`);
+      say(`action: migrate ${outcome === "created" ? `created the ${role} role` : `set the ${role} role's password`}`);
+    }
   }
   const created = (await publicTables(connection.external)).filter((name) => !before.includes(name));
   if (created.length > 0) {
@@ -608,13 +732,39 @@ async function migrateAndSeed(connection, app, appPassword, changes) {
   } else {
     say("schema: migrate created no new tables");
   }
-  const seeded = await runEngineCommand("mend_engine.seed_demo", app.external, SEED_TIMEOUT_MS);
+  const seeded = await runEngineCommand("mend_engine.seed_demo", roleConnections.mend_engine.external, SEED_TIMEOUT_MS);
   if (seeded.code !== 0 || !seeded.lines.includes("SEED RESULT: PASS")) throw new DeployError(`python -m mend_engine.seed_demo exited ${seeded.code}`);
   const wrote = seeded.lines.filter(
     (text) => /^(orders: imported|refunds: imported|facts: stored|receiver: .*linked to one quiet regular|receiver: moved to rank 1)/.test(text) || /^members: .*\(([1-9][0-9]*) new\)/.test(text),
   );
   if (wrote.length > 0) changes.push(`seeded mend-db (${wrote.map((text) => text.split(":")[0]).join(", ")})`);
   return sha;
+}
+
+/**
+ * `up --migrate`, once every service's DATABASE_URL names its own role: a second migrate
+ * run drops mend_app. migrate keeps it while any connection as mend_app is open (an old
+ * instance still shutting down), and a later `up --migrate` then drops it.
+ */
+async function dropLegacyRole(connection, serviceIds, changes) {
+  for (const [key, id] of Object.entries(serviceIds)) {
+    const user = databaseUser((await serviceEnv(id)).DATABASE_URL ?? "");
+    if (user !== DB_ROLES[key]) {
+      say(`database: ${LEGACY_DB_ROLE} kept, ${SERVICES[key].name} still connects as ${user || "nothing"}`);
+      return;
+    }
+  }
+  const run = await runEngineCommand("mend_engine.db.migrate", connection.external, MIGRATE_TIMEOUT_MS, {}, ["--drop-legacy-role"]);
+  if (run.code !== 0) throw new DeployError(`python -m mend_engine.db.migrate --drop-legacy-role exited ${run.code}`);
+  const outcome = reportedRole(run.lines, LEGACY_DB_ROLE);
+  if (outcome === "dropped") {
+    changes.push(`db role ${LEGACY_DB_ROLE} dropped`);
+    say(`action: migrate dropped the ${LEGACY_DB_ROLE} role, which no service uses any more`);
+  } else if (outcome?.startsWith("in use")) {
+    say(`database: ${LEGACY_DB_ROLE} kept for now, ${outcome}; a later \`up --migrate\` drops it`);
+  } else if (outcome !== "absent") {
+    throw new DeployError(`migrate did not report the ${LEGACY_DB_ROLE} role (${outcome ?? "no line"})`);
+  }
 }
 
 function settingsProblem(name, wrong) {
@@ -650,36 +800,33 @@ async function waitForDatabase(id) {
   }
 }
 
-async function ensureDatabase(ownerId, changes) {
-  let db = await findDatabase(ownerId);
-  if (db === null) {
-    say(
-      `action: create Render Postgres ${DATABASE.name}: plan ${DATABASE.plans[0]}, ${DATABASE.diskSizeGB} GB, Postgres ${DATABASE.version}, region ${REGION} (about USD 6 a month)`,
-    );
-    db = await renderOk(
-      "POST",
-      "/postgres",
-      {
-        name: DATABASE.name,
-        ownerId,
-        databaseName: DATABASE.databaseName,
-        plan: DATABASE.plans[0],
-        version: DATABASE.version,
-        region: REGION,
-        diskSizeGB: DATABASE.diskSizeGB,
-        enableHighAvailability: false,
-        enableDiskAutoscaling: false,
-      },
-      [201],
-    );
-    changes.push(`created database ${db.id}`);
-    say(`action: Render created ${db.name} ${db.id}`);
-  } else {
-    say(`database: found ${db.name} ${db.id}`);
-  }
-  const ready = await waitForDatabase(db.id);
-  checkDatabaseSettings(ready);
-  return ready;
+/** Only for `up --create` with no database recorded (resolveDatabase decided); its id is recorded at once. */
+async function createDatabase(workspace, changes) {
+  const db = await act(
+    changes,
+    `create Render Postgres ${DATABASE.name}: plan ${DATABASE.plans[0]}, ${DATABASE.diskSizeGB} GB, Postgres ${DATABASE.version}, region ${REGION} (about USD 6 a month)`,
+    () =>
+      renderOk(
+        "POST",
+        "/postgres",
+        {
+          name: DATABASE.name,
+          ownerId: workspace.id,
+          databaseName: DATABASE.databaseName,
+          plan: DATABASE.plans[0],
+          version: DATABASE.version,
+          region: REGION,
+          diskSizeGB: DATABASE.diskSizeGB,
+          enableHighAvailability: false,
+          enableDiskAutoscaling: false,
+        },
+        [201],
+      ),
+  );
+  if (db === null) throw stop(`a plan-only run cannot go on without ${DATABASE.name}`);
+  recordId({ workspace, database: { id: db.id, name: db.name } });
+  say(`action: Render created ${db.name} ${db.id}, recorded in render-state.json`);
+  return db;
 }
 
 const ALLOW_LIST_LABEL = "mend deploy machine";
@@ -694,24 +841,56 @@ async function publicIpv4() {
   return ip;
 }
 
+const machineAccess = { dbId: null, depth: 0 };
+let cleanupFailed = false;
+
 /**
  * Render creates an API-made database with an empty allow list, which turns external access
- * off. The schema apply, the seed and the proof run from this machine, so exactly its
- * address (/32) is allowed, under one label that is replaced when the address changes.
- * Entries with any other label are left as they are.
+ * off, and that is how it stays between runs. For one run, exactly this machine's address
+ * (/32) is added under one label; entries with any other label are left as they are. This
+ * and closeMachineAccess are the only writes prove may make.
  */
-async function ensureExternalAccess(db, changes) {
+async function openMachineAccess(db) {
   const block = `${await publicIpv4()}/32`;
   const current = db.ipAllowList ?? [];
-  if (current.some((entry) => entry.cidrBlock === block)) {
-    say(`database: external access already allows this machine only (${current.length} allow-list entries)`);
-    return db;
-  }
   const next = [...current.filter((entry) => entry.description !== ALLOW_LIST_LABEL), { cidrBlock: block, description: ALLOW_LIST_LABEL }];
-  say(`action: allow this machine's public IPv4 address (/32 only) to reach mend-db from outside Render (${next.length} allow-list entries)`);
-  const updated = await renderOk("PATCH", `/postgres/${db.id}`, { ipAllowList: next });
-  changes.push("updated the mend-db allow list");
-  return updated;
+  const same = current.length === next.length && next.every((entry) => current.some((had) => had.cidrBlock === entry.cidrBlock && had.description === entry.description));
+  if (!same) await renderOk("PATCH", `/postgres/${db.id}`, { ipAllowList: next }, [200], { allowList: true });
+  say(`database: this machine's public IPv4 address (/32 only) may reach ${DATABASE.name} for this run`);
+}
+
+async function closeMachineAccess(dbId) {
+  try {
+    const db = await renderOk("GET", `/postgres/${dbId}`);
+    const current = db.ipAllowList ?? [];
+    const next = current.filter((entry) => entry.description !== ALLOW_LIST_LABEL);
+    if (next.length !== current.length) await renderOk("PATCH", `/postgres/${dbId}`, { ipAllowList: next }, [200], { allowList: true });
+    say(`database: this machine's allow-list entry is removed (${next.length} entries left)`);
+  } catch (error) {
+    cleanupFailed = true;
+    say(`FAIL  this machine's allow-list entry on ${DATABASE.name} could not be removed (${error instanceof Error ? error.message : "unknown"}); remove it in the Render dashboard`);
+  }
+}
+
+/** Runs work with this machine allowed on mend-db, and removes the entry afterwards however work ends. Nested calls share one entry. */
+async function withMachineAccess(db, work) {
+  if (machineAccess.depth > 0 && machineAccess.dbId === db.id) {
+    machineAccess.depth += 1;
+    try {
+      return await work();
+    } finally {
+      machineAccess.depth -= 1;
+    }
+  }
+  Object.assign(machineAccess, { dbId: db.id, depth: 1 });
+  try {
+    // Inside the try: a PATCH that timed out may still have added the entry.
+    await openMachineAccess(db);
+    return await work();
+  } finally {
+    Object.assign(machineAccess, { dbId: null, depth: 0 });
+    await closeMachineAccess(db.id);
+  }
 }
 
 /** An allow-list change takes a moment to reach Render's proxy, so the first TLS connection is retried for up to three minutes. */
@@ -766,29 +945,30 @@ function sameDatabase(a, b) {
   }
 }
 
-/** The same database as connection, reached as the services' limited role (C22). */
-function appConnection(connection, password) {
+/** The same database as connection, reached as one service role (C22). */
+function roleConnection(connection, role, password) {
   const as = (text) => {
     const url = new URL(text);
-    url.username = APP_DB_ROLE;
+    url.username = role;
     url.password = password;
     return url.href;
   };
-  const app = { internal: as(connection.internal), external: as(connection.external) };
-  addSecret(app.internal);
-  addSecret(app.external);
-  return app;
+  const reached = { internal: as(connection.internal), external: as(connection.external) };
+  addSecret(reached.internal);
+  addSecret(reached.external);
+  return reached;
 }
 
-function engineSettings(app) {
-  const env = { PAYPAL_ENV: "sandbox", PAYPAL_CLIENT_ID: settings.PAYPAL_CLIENT_ID, PAYPAL_CLIENT_SECRET: settings.PAYPAL_CLIENT_SECRET, DATABASE_URL: app.internal };
+function engineSettings(reached) {
+  const env = { PAYPAL_ENV: "sandbox", PAYPAL_CLIENT_ID: settings.PAYPAL_CLIENT_ID, PAYPAL_CLIENT_SECRET: settings.PAYPAL_CLIENT_SECRET, DATABASE_URL: reached.internal };
   for (const key of CAP_KEYS) env[key] = settings[key];
   return env;
 }
 
 /** Every env var a service should carry. Values come from .env, Render or this run's generated secrets, never from this file. */
 function desiredEnv(spec, values) {
-  const { app, engineToken, csrfSecret, engineUrl, webhookId, origin } = values;
+  const { roleConnections, engineToken, csrfSecret, engineUrl, webhookId, origin } = values;
+  const app = roleConnections[DB_ROLES[spec.key]];
   if (spec.key === "web") {
     const env = {
       ...spec.buildEnv,
@@ -867,22 +1047,23 @@ function createBody(spec, ownerId, env) {
   };
 }
 
-async function ensureService(ownerId, spec, env, changes) {
-  const found = await findService(ownerId, spec);
-  if (found !== null) {
-    say(`service: found ${found.name} ${found.id}`);
-    checkServiceSettings(spec, found);
-    return { service: found, deployId: null };
+/** The service resolveService found by its recorded id, or, only for `up --create` with none recorded, a new one whose id is recorded at once. */
+async function placeService(workspace, resolved, spec, env, changes) {
+  if (resolved.found) {
+    say(`service: found ${resolved.found.name} ${resolved.found.id} by its recorded id`);
+    return { service: resolved.found, deployId: null };
   }
   const extra = spec.type === "cron_job" ? `, schedule ${spec.schedule}` : "";
-  say(
-    `action: create Render ${spec.type.replace("_", " ")} ${spec.name}: plan ${STARTER[0]}, region ${REGION}, ${REPO_URL} branch ${BRANCH}, root ${spec.rootDir}${extra} (${spec.cost}); env vars by name: ${Object.keys(env).join(", ")}`,
+  const created = await act(
+    changes,
+    `create Render ${spec.type.replace("_", " ")} ${spec.name}: plan ${STARTER[0]}, region ${REGION}, ${REPO_URL} branch ${BRANCH}, root ${spec.rootDir}${extra} (${spec.cost}); env vars by name: ${Object.keys(env).join(", ")}`,
+    () => renderOk("POST", "/services", createBody(spec, workspace.id, env), [201]),
   );
-  const created = await renderOk("POST", "/services", createBody(spec, ownerId, env), [201]);
+  if (created === null) throw stop(`a plan-only run cannot go on without ${spec.name}`);
+  recordId({ services: { [spec.key]: { id: created.service.id, name: created.service.name } } });
   // A new cron job comes back with an empty deployId; ensureLive then finds its first deploy.
   const deployId = typeof created.deployId === "string" && created.deployId !== "" ? created.deployId : null;
-  changes.push(`created service ${created.service.id}`);
-  say(`action: Render created ${created.service.name} ${created.service.id}, first deploy ${deployId ?? "not named yet"}`);
+  say(`action: Render created ${created.service.name} ${created.service.id}, recorded in render-state.json, first deploy ${deployId ?? "not named yet"}`);
   checkServiceSettings(spec, created.service);
   return { service: created.service, deployId };
 }
@@ -903,16 +1084,16 @@ async function syncEnv(spec, serviceId, desired, changes) {
   let changed = false;
   for (const [key, value] of Object.entries(desired)) {
     if (current[key] === value) continue;
-    say(`action: set env var ${key} on ${spec.name} (${key in current ? "changed" : "new"})`);
-    await renderOk("PUT", `/services/${serviceId}/env-vars/${key}`, { value });
-    changes.push(`set env var ${key} on ${spec.name}`);
+    await act(changes, `set env var ${key} on ${spec.name} (${key in current ? "changed" : "new"})`, () =>
+      renderOk("PUT", `/services/${serviceId}/env-vars/${key}`, { value }),
+    );
     changed = true;
   }
   for (const key of spec.forbidden) {
     if (!(key in current)) continue;
-    say(`action: remove env var ${key} from ${spec.name} (it must never be on that service)`);
-    await renderOk("DELETE", `/services/${serviceId}/env-vars/${key}`, undefined, [200, 204]);
-    changes.push(`removed env var ${key} from ${spec.name}`);
+    await act(changes, `remove env var ${key} from ${spec.name} (it must never be on that service)`, () =>
+      renderOk("DELETE", `/services/${serviceId}/env-vars/${key}`, undefined, [200, 204]),
+    );
     changed = true;
   }
   if (!changed) say(`env: ${spec.name} already has every env var it needs (${Object.keys(desired).length} keys)`);
@@ -940,10 +1121,11 @@ async function waitForDeploy(serviceId, deployId) {
 }
 
 async function triggerDeploy(spec, serviceId, reason, changes) {
-  say(`action: start a new deploy of ${spec.name} (${reason})`);
-  const deploy = await renderOk("POST", `/services/${serviceId}/deploys`, { clearCache: "do_not_clear" }, [201, 202]);
-  changes.push(`deployed ${spec.name} ${deploy.id}`);
-  return waitForDeploy(serviceId, deploy.id);
+  return act(changes, `start a new deploy of ${spec.name} (${reason})`, async () => {
+    const deploy = await renderOk("POST", `/services/${serviceId}/deploys`, { clearCache: "do_not_clear" }, [201, 202]);
+    say(`deploy: started ${deploy.id} of ${spec.name}`);
+    return waitForDeploy(serviceId, deploy.id);
+  });
 }
 
 /** Waits out a deploy already running, then makes sure one deploy is live, starting one only if none is. */
@@ -989,10 +1171,10 @@ function webhookPath(id) {
 }
 
 async function deleteWebhook(id, why, changes) {
-  say(`action: delete PayPal webhook ${id} (${why})`);
-  const reply = await paypalCall("DELETE", webhookPath(id));
-  if (reply.status !== 204) throw new DeployError(`PayPal webhook delete answered ${paypalProblem(reply)}`);
-  changes.push(`deleted webhook ${id}`);
+  await act(changes, `delete PayPal webhook ${id} (${why})`, async () => {
+    const reply = await paypalCall("DELETE", webhookPath(id));
+    if (reply.status !== 204) throw new DeployError(`PayPal webhook delete answered ${paypalProblem(reply)}`);
+  });
 }
 
 function eventNames(hook) {
@@ -1001,42 +1183,43 @@ function eventNames(hook) {
 
 /**
  * The PayPal sandbox webhook for mend-web, at the URL built from Render's reported origin
- * (C24). Reused when one already points there, otherwise registered. Leftovers from earlier
- * tunnel proofs (trycloudflare.com) are deleted. A webhook on any other host is never
- * touched unless it is a second copy of ours. The event list is set to exactly EVENT_TYPES.
+ * (C24): the one resolveWebhook found by its recorded id or, only for `up --create` with
+ * none recorded, a new one whose id is recorded at once. Leftovers from earlier tunnel
+ * proofs (trycloudflare.com) are deleted; no other webhook is touched. The event list is
+ * set to exactly EVENT_TYPES.
  */
-async function ensureWebhook(origin, knownId, changes) {
+async function placeWebhook(origin, resolved, changes) {
   const url = webhookUrlFor(origin);
-  const hooks = await listWebhooks();
-  for (const hook of hooks.filter((entry) => hostOf(entry.url).endsWith(".trycloudflare.com"))) {
+  for (const hook of (await listWebhooks()).filter((entry) => hostOf(entry.url).endsWith(".trycloudflare.com"))) {
     await deleteWebhook(hook.id, "a leftover pointing at a trycloudflare.com tunnel", changes);
   }
-  // The copy recorded in render-state.json is the one kept.
-  const ours = hooks.filter((entry) => sameUrl(entry.url, url)).sort((a, b) => Number(b.id === knownId) - Number(a.id === knownId));
-  let hook = ours[0] ?? null;
-  for (const copy of ours.slice(1)) await deleteWebhook(copy.id, `a second copy of ${hook.id} for the same URL`, changes);
-
   const wanted = [...EVENT_TYPES].sort().join(",");
   const subscriptions = EVENT_TYPES.map((name) => ({ name }));
+  let hook = resolved.found ?? null;
   if (hook === null) {
-    say(`action: register a PayPal sandbox webhook for ${url} with ${EVENT_TYPES.length} event types`);
-    const reply = await paypalCall("POST", "/v1/notifications/webhooks", { url, event_types: subscriptions });
-    if (reply.status !== 201) throw new DeployError(`PayPal webhook create answered ${paypalProblem(reply)}`);
-    hook = reply.body;
-    webhookPath(hook?.id);
-    changes.push(`registered webhook ${hook.id}`);
-    say(`action: PayPal registered webhook ${hook.id}`);
+    hook = await act(changes, `register a PayPal sandbox webhook for ${url} with ${EVENT_TYPES.length} event types`, async () => {
+      const reply = await paypalCall("POST", "/v1/notifications/webhooks", { url, event_types: subscriptions });
+      if (reply.status !== 201) throw new DeployError(`PayPal webhook create answered ${paypalProblem(reply)}`);
+      webhookPath(reply.body?.id);
+      recordId({ webhook: { id: reply.body.id, url, eventTypes: EVENT_TYPES.length } });
+      say(`action: PayPal registered webhook ${reply.body.id}, recorded in render-state.json`);
+      return reply.body;
+    });
+    if (hook === null) throw stop("a plan-only run cannot go on without the PayPal webhook");
   } else {
-    say(`webhook: found ${hook.id} for ${url}`);
+    say(`webhook: found ${hook.id} by its recorded id`);
   }
   if (eventNames(hook) !== wanted) {
-    say(`action: set the event types of PayPal webhook ${hook.id} to the ${EVENT_TYPES.length} Mend listens for`);
-    const reply = await paypalCall("PATCH", webhookPath(hook.id), [{ op: "replace", path: "/event_types", value: subscriptions }]);
-    if (reply.status !== 200) throw new DeployError(`PayPal webhook update answered ${paypalProblem(reply)}`);
-    hook = reply.body;
-    changes.push(`updated webhook ${hook.id} event types`);
+    const updated = await act(changes, `set the event types of PayPal webhook ${hook.id} to the ${EVENT_TYPES.length} Mend listens for`, async () => {
+      const reply = await paypalCall("PATCH", webhookPath(hook.id), [{ op: "replace", path: "/event_types", value: subscriptions }]);
+      if (reply.status !== 200) throw new DeployError(`PayPal webhook update answered ${paypalProblem(reply)}`);
+      return reply.body;
+    });
+    if (updated !== null) hook = updated;
   }
-  if (eventNames(hook) !== wanted || !sameUrl(hook.url, url)) throw new DeployError(`PayPal webhook ${hook.id} does not match the URL and events asked for`);
+  if ((!options.planOnly && eventNames(hook) !== wanted) || !sameUrl(hook.url, url)) {
+    throw new DeployError(`PayPal webhook ${hook.id} does not match the URL and events asked for`);
+  }
   webhookPath(hook.id);
   return { id: hook.id, url, eventTypes: EVENT_TYPES.length };
 }
@@ -1052,32 +1235,48 @@ function usable(value) {
 /**
  * The secrets this script generates, reused from Render when they are already there:
  * MEND_CSRF_SECRET from mend-web; MEND_ENGINE_TOKEN only when mend-web and mend-engine hold
- * the same usable value, otherwise a new one for both; MEND_APP_DB_PASSWORD from the
- * mend_app password inside the services' DATABASE_URL, the only place it is kept. A new
- * role password is made only with --migrate, because only migrate can set it on mend-db.
+ * the same usable value, otherwise a new one for both; each role's database password from
+ * the DATABASE_URL of the services that connect as that role, the only place it is kept. A
+ * new role password is made only with --migrate, because only migrate can set it on mend-db.
+ * envs holds each service's env vars as Render has them ({} for one not created yet).
  * Never printed or stored locally.
  */
-async function generatedSecrets(webId, engineId, jobsId) {
-  const web = webId === null ? {} : await serviceEnv(webId);
-  const engine = engineId === null ? {} : await serviceEnv(engineId);
-  const jobs = jobsId === null ? {} : await serviceEnv(jobsId);
-  const csrfSecret = usable(web.MEND_CSRF_SECRET) ? web.MEND_CSRF_SECRET : newSecret();
-  const shared = usable(web.MEND_ENGINE_TOKEN) && web.MEND_ENGINE_TOKEN === engine.MEND_ENGINE_TOKEN;
-  const engineToken = shared ? web.MEND_ENGINE_TOKEN : newSecret();
-  const kept = [engine, web, jobs]
-    .map((env) => env.DATABASE_URL)
-    .filter((text) => typeof text === "string" && databaseUser(text) === APP_DB_ROLE)
-    .map(databasePassword)
-    .find(usable);
-  if (kept === undefined && !options.migrate) {
-    throw new DeployError(`the services do not use the ${APP_DB_ROLE} role yet; run \`up --migrate\` once so migrate can create it`);
+function generatedSecrets(envs) {
+  const csrfSecret = usable(envs.web.MEND_CSRF_SECRET) ? envs.web.MEND_CSRF_SECRET : newSecret();
+  const shared = usable(envs.web.MEND_ENGINE_TOKEN) && envs.web.MEND_ENGINE_TOKEN === envs.engine.MEND_ENGINE_TOKEN;
+  const engineToken = shared ? envs.web.MEND_ENGINE_TOKEN : newSecret();
+  const passwords = {};
+  for (const role of Object.keys(ROLE_PASSWORD_ENV)) {
+    const kept = Object.keys(envs)
+      .filter((key) => DB_ROLES[key] === role)
+      .map((key) => envs[key].DATABASE_URL)
+      .filter((text) => typeof text === "string" && databaseUser(text) === role)
+      .map(databasePassword)
+      .find(usable);
+    if (kept === undefined && !options.migrate) {
+      throw stop(`no service connects as ${role} yet; run \`up --migrate\` once so migrate can create it`);
+    }
+    passwords[role] = kept ?? newSecret();
+    if (kept === undefined) say(`secret: generated a new ${ROLE_PASSWORD_ENV[role]} (48 random bytes) for the ${role} role`);
   }
-  const appPassword = kept ?? newSecret();
-  for (const value of [csrfSecret, engineToken, appPassword]) addSecret(value);
-  if (!usable(web.MEND_CSRF_SECRET)) say("secret: generated a new MEND_CSRF_SECRET (48 random bytes) for mend-web");
+  for (const value of [csrfSecret, engineToken, ...Object.values(passwords)]) addSecret(value);
+  if (!usable(envs.web.MEND_CSRF_SECRET)) say("secret: generated a new MEND_CSRF_SECRET (48 random bytes) for mend-web");
   if (!shared) say("secret: generated a new MEND_ENGINE_TOKEN (48 random bytes) for mend-web and mend-engine");
-  if (kept === undefined) say(`secret: generated a new MEND_APP_DB_PASSWORD (48 random bytes) for the ${APP_DB_ROLE} role`);
-  return { csrfSecret, engineToken, appPassword };
+  return { csrfSecret, engineToken, passwords };
+}
+
+/**
+ * One step that changes something. A plan-only run (prove's drift check) records what it
+ * would do and does nothing; otherwise the step runs and is logged as an action.
+ */
+async function act(changes, description, work) {
+  changes.push(description);
+  if (options.planOnly) {
+    say(`would: ${description}`);
+    return null;
+  }
+  say(`action: ${description}`);
+  return work();
 }
 
 // Saved before a redeploy starts and cleared once it is live, so a run that dies in between
@@ -1118,7 +1317,7 @@ function stateFor(workspace, db, services, origin, engineUrl, webhook, schemaSha
       postgres: db.version,
       diskSizeGB: db.diskSizeGB,
       schemaSha256,
-      servicesConnectAs: APP_DB_ROLE,
+      roles: { ...DB_ROLES },
       dashboardUrl: db.dashboardUrl,
     },
     services: {
@@ -1130,36 +1329,58 @@ function stateFor(workspace, db, services, origin, engineUrl, webhook, schemaSha
   };
 }
 
-/** Finds or creates every piece, in order, and returns the list of things it changed (empty on a repeat run). */
+/**
+ * Brings every recorded resource to its decided settings, creating one only with --create
+ * and only when none is recorded, and returns the list of things it changed (empty on a
+ * repeat run). Every resource is found by its recorded id before anything is changed. With
+ * planOnly set, nothing is changed and the list says what would be.
+ */
 async function up() {
   if (!existsSync(ENGINE_PYTHON)) throw new DeployError("the engine's virtual environment is missing (packages/engine/.venv)");
   checkDeploySettings();
   const changes = [];
   const previous = readState();
   const pending = { ...(previous.pending ?? {}) };
-  const workspace = await findWorkspace();
+  const plan = await resolveResources(previous);
+  const workspace = plan.workspace;
   say(`workspace: "${workspace.name}" ${workspace.id}`);
-
-  const found = await ensureDatabase(workspace.id, changes);
-  const db = await ensureExternalAccess(found, changes);
+  if (plan.db.found) say(`database: found ${plan.db.found.name} ${plan.db.found.id} by its recorded id`);
+  const placed = plan.db.found ?? (await createDatabase(workspace, changes));
+  const db = await waitForDatabase(placed.id);
+  checkDatabaseSettings(db);
   const connection = await connectionInfo(db.id);
+  const envs = {};
+  for (const key of Object.keys(SERVICES)) envs[key] = plan.services[key].found ? await serviceEnv(plan.services[key].found.id) : {};
+  checkServiceDatabases(envs, connection);
+  return withMachineAccess(db, () => upWithAccess(plan, db, connection, envs, previous, pending, changes));
+}
+
+/** A service already connected to some other database stops the run: `up` never repoints one. */
+function checkServiceDatabases(envs, connection) {
+  for (const [key, env] of Object.entries(envs)) {
+    if (env.DATABASE_URL !== undefined && !sameDatabase(env.DATABASE_URL, connection.internal)) {
+      throw stop(`${SERVICES[key].name} connects to another database than the recorded ${DATABASE.name}`);
+    }
+  }
+}
+
+async function upWithAccess(plan, db, connection, envs, previous, pending, changes) {
+  const workspace = plan.workspace;
   await waitForExternalConnection(connection.external);
 
-  const existingWeb = await findService(workspace.id, SERVICES.web);
-  const existingEngine = await findService(workspace.id, SERVICES.engine);
-  const existingJobs = await findService(workspace.id, SERVICES.jobs);
-  const { csrfSecret, engineToken, appPassword } = await generatedSecrets(existingWeb?.id ?? null, existingEngine?.id ?? null, existingJobs?.id ?? null);
-  const app = appConnection(connection, appPassword);
-  const values = { app, engineToken, csrfSecret, engineUrl: null, webhookId: null, origin: null };
+  const { csrfSecret, engineToken, passwords } = generatedSecrets(envs);
+  const roleConnections = {};
+  for (const role of Object.keys(ROLE_PASSWORD_ENV)) roleConnections[role] = roleConnection(connection, role, passwords[role]);
+  const values = { roleConnections, engineToken, csrfSecret, engineUrl: null, webhookId: null, origin: null };
 
   let schemaSha256 = previous.database?.schemaSha256 ?? null;
   if (options.migrate) {
-    schemaSha256 = (await migrateAndSeed(connection, app, appPassword, changes)) ?? schemaSha256;
+    schemaSha256 = (await migrateAndSeed(connection, roleConnections, passwords, changes)) ?? schemaSha256;
   } else {
-    say("database: left as it is (pass --migrate to apply schema.sql and the mend_app role, and seed the demo shop)");
+    say("database: left as it is (pass --migrate to apply schema.sql and the services' roles, and seed the demo shop)");
   }
 
-  const engine = await ensureService(workspace.id, SERVICES.engine, desiredEnv(SERVICES.engine, values), changes);
+  const engine = await placeService(workspace, plan.services.engine, SERVICES.engine, desiredEnv(SERVICES.engine, values), changes);
   await ensureLive(SERVICES.engine, engine.service.id, engine.deployId, changes);
   await settle(SERVICES.engine, engine.service, desiredEnv(SERVICES.engine, values), pending, changes);
   const engineService = await renderOk("GET", `/services/${engine.service.id}`);
@@ -1168,22 +1389,31 @@ async function up() {
   if (engineService.serviceDetails?.url?.startsWith?.("https://")) throw new DeployError("mend-engine reports a public https address; it must be private");
   say(`engine: mend-engine answers on Render's private network at ${values.engineUrl}`);
 
-  const jobs = await ensureService(workspace.id, SERVICES.jobs, desiredEnv(SERVICES.jobs, values), changes);
+  const jobs = await placeService(workspace, plan.services.jobs, SERVICES.jobs, desiredEnv(SERVICES.jobs, values), changes);
   await ensureLive(SERVICES.jobs, jobs.service.id, jobs.deployId, changes);
   await settle(SERVICES.jobs, jobs.service, desiredEnv(SERVICES.jobs, values), pending, changes);
 
-  const web = await ensureService(workspace.id, SERVICES.web, desiredEnv(SERVICES.web, values), changes);
+  const web = await placeService(workspace, plan.services.web, SERVICES.web, desiredEnv(SERVICES.web, values), changes);
   values.origin = serviceOrigin(web.service);
   await ensureLive(SERVICES.web, web.service.id, web.deployId, changes);
   await waitForHealth(values.origin);
-  const webhook = await ensureWebhook(values.origin, previous.webhook?.id ?? null, changes);
+  const webhook = await placeWebhook(values.origin, plan.webhook, changes);
   values.webhookId = webhook.id;
   await settle(SERVICES.web, web.service, desiredEnv(SERVICES.web, values), pending, changes);
   await waitForHealth(values.origin);
   say(`health: ${new URL(SERVICES.web.healthCheckPath, values.origin).href} says ok`);
 
+  if (options.migrate) await dropLegacyRole(connection, { web: web.service.id, engine: engine.service.id, jobs: jobs.service.id }, changes);
+
   const services = { web: web.service, engine: engineService, jobs: jobs.service };
-  if (writeState(stateFor(workspace, db, services, values.origin, values.engineUrl, webhook, schemaSha256))) say("state: wrote scripts/deploy/render-state.json");
+  if (writeState(stateFor(workspace, db, services, values.origin, values.engineUrl, webhook, schemaSha256))) {
+    if (options.planOnly) changes.push("update render-state.json");
+    say(`state: ${options.planOnly ? "would update" : "wrote"} scripts/deploy/render-state.json`);
+  }
+  if (options.planOnly) {
+    say(`plan-only: \`up\` would make ${changes.length} changes`);
+    return changes;
+  }
   say(
     `D2 UP: ${values.origin.origin} live; mend-engine live at ${values.engineUrl} (private); mend-jobs every 5 minutes; database ${db.name} ${db.status}; webhook ${webhook.id} registered`,
   );
@@ -1339,13 +1569,8 @@ with psycopg.connect(os.environ["MEND_D1_DATABASE_URL"], sslmode="verify-full", 
 // Each attempt runs in a transaction that is always rolled back, so even a privilege that
 // were wrongly granted could not change mend-db during the proof.
 const ROLE_PROBE_SCRIPT = `
-import json, os, certifi, psycopg
-attempts = [
-    ("disable_trigger", "alter table audit_log disable trigger audit_log_append_only"),
-    ("update_audit_log", "update audit_log set actor = actor where false"),
-    ("create_table", "create table mend_role_probe (id integer)"),
-    ("select", "select count(*) from audit_log"),
-]
+import json, os, sys, certifi, psycopg
+attempts = json.loads(sys.argv[1])
 out = {}
 with psycopg.connect(os.environ["MEND_D1_DATABASE_URL"], sslmode="verify-full", sslrootcert=certifi.where(), connect_timeout=15, autocommit=True) as conn:
     out["user"] = conn.execute("select current_user").fetchone()[0]
@@ -1383,8 +1608,25 @@ function campaignCountedMinor(externalUrl, campaignId) {
   return Number(value);
 }
 
-function roleProbe(externalUrl) {
-  return JSON.parse(engineScript(ROLE_PROBE_SCRIPT, [], externalUrl, "what mend_app may do"));
+// What each service role is tried with. Every statement either reads or is refused, and runs
+// in a rolled-back transaction either way.
+const ROLE_ATTEMPTS = {
+  mend_engine: [
+    ["disable_trigger", "alter table audit_log disable trigger audit_log_append_only"],
+    ["update_audit_log", "update audit_log set actor = actor where false"],
+    ["create_table", "create table mend_role_probe (id integer)"],
+    ["select", "select count(*) from audit_log"],
+  ],
+  mend_web: [
+    ["update_payout_items", "update payout_items set status = status where false"],
+    ["update_audit_log", "update audit_log set actor = actor where false"],
+    ["create_table", "create table mend_role_probe (id integer)"],
+    ["select", "select count(*) from sessions"],
+  ],
+};
+
+function roleProbe(externalUrl, role) {
+  return JSON.parse(engineScript(ROLE_PROBE_SCRIPT, [JSON.stringify(ROLE_ATTEMPTS[role])], externalUrl, `what ${role} may do`));
 }
 
 /** One visitor's browser: a cookie jar, the CSRF token its pages hold, and the same-origin header a browser sends. */
@@ -1461,8 +1703,13 @@ function digitsIn(text, count) {
  * campaign pays 10.00 USD of sandbox rewards (5 customers at 2.00 USD) plus 1.25 USD of
  * PayPal sandbox fees per run; one simulated return purchase is a 12.50 USD sandbox card
  * order into the shop.
+ *
+ * Compare-only: every Render and PayPal write is refused in code, render-state.json is never
+ * written, and the idempotent check runs `up` in plan-only mode. The one write is this
+ * machine's allow-list entry on mend-db, removed at the end of the run whatever happens.
  */
 async function prove() {
+  compareOnly = true;
   checkDeploySettings();
   const receiver = settings.MEND_TEST_RECEIVER.trim().toLowerCase();
   const state = readState();
@@ -1470,27 +1717,39 @@ async function prove() {
     throw new DeployError("render-state.json is incomplete; run `up --migrate` first");
   }
   const startedAt = new Date();
-  const workspace = await findWorkspace();
+  // Found by recorded id, with the same stops as `up`, before anything else is read.
+  const plan = await resolveResources(state);
+  const workspace = plan.workspace;
   const services = {};
-  for (const spec of Object.values(SERVICES)) services[spec.key] = await renderOk("GET", `/services/${state.services[spec.key].id}`);
-  const db = await renderOk("GET", `/postgres/${state.database.id}`);
+  for (const spec of Object.values(SERVICES)) services[spec.key] = plan.services[spec.key].found;
+  const db = plan.db.found;
   // C24: every address under test comes from Render's own report, not from the state file.
   const origin = serviceOrigin(services.web);
   const engineUrl = engineAddress(services.engine);
   const webhookUrl = webhookUrlFor(origin);
   const connection = await connectionInfo(db.id);
-  // This machine's address changes from day to day; pin it before the first database read.
-  await ensureExternalAccess(db, []);
-  await waitForExternalConnection(connection.external);
   const envs = {};
   for (const key of Object.keys(SERVICES)) envs[key] = await serviceEnv(services[key].id);
-  // The proof reads mend-db with the services' own credentials, over the external host.
-  const appPassword = databasePassword(envs.engine.DATABASE_URL ?? "");
-  if (databaseUser(envs.engine.DATABASE_URL ?? "") !== APP_DB_ROLE || !usable(appPassword)) {
-    throw new DeployError(`mend-engine does not connect as ${APP_DB_ROLE}; run \`up --migrate\` first`);
+  // The proof reads mend-db with the services' own credentials (C22), over the external host.
+  const reached = {};
+  for (const key of ["engine", "web"]) {
+    const role = DB_ROLES[key];
+    const url = envs[key].DATABASE_URL ?? "";
+    if (databaseUser(url) !== role || !usable(databasePassword(url))) {
+      throw new DeployError(`${SERVICES[key].name} does not connect as ${role}; run \`up --migrate\` first`);
+    }
+    reached[role] = roleConnection(connection, role, databasePassword(url));
   }
-  const app = appConnection(connection, appPassword);
-  const rows = (sql, params = []) => databaseRows(app.external, sql, params);
+  const context = { receiver, startedAt, workspace, services, db, origin, engineUrl, webhookUrl, connection, envs, reached };
+  await withMachineAccess(db, () => proveChecks(context));
+  const passed = allPassed && !leakedLine && !cleanupFailed;
+  say(`D2 RESULT: ${passed ? "PASS" : "FAIL"}`);
+  if (!passed) process.exitCode = 1;
+}
+
+async function proveChecks({ receiver, startedAt, workspace, services, db, origin, engineUrl, webhookUrl, connection, envs, reached }) {
+  await waitForExternalConnection(connection.external);
+  const rows = (sql, params = []) => databaseRows(reached.mend_engine.external, sql, params);
 
   await check("health", async () => {
     const url = new URL(SERVICES.web.healthCheckPath, origin);
@@ -1527,9 +1786,12 @@ async function prove() {
       const forbidden = spec.forbidden.filter((key) => key in env);
       if (forbidden.length > 0) problems.push(`${spec.name} carries ${forbidden.join(", ")}`);
       if (env.PAYPAL_ENV !== "sandbox") problems.push(`${spec.name} PAYPAL_ENV is not sandbox`);
-      if (databaseUser(env.DATABASE_URL) === databaseUser(connection.internal)) problems.push(`${spec.name} DATABASE_URL uses mend-db's owner role`);
-      if (env.DATABASE_URL !== app.internal || !sameDatabase(env.DATABASE_URL, connection.internal)) {
-        problems.push(`${spec.name} DATABASE_URL is not mend-db's internal address as ${APP_DB_ROLE}`);
+      const role = DB_ROLES[spec.key];
+      const user = databaseUser(env.DATABASE_URL);
+      if (user === databaseUser(connection.internal)) problems.push(`${spec.name} DATABASE_URL uses mend-db's owner role`);
+      if (user === LEGACY_DB_ROLE) problems.push(`${spec.name} still connects as ${LEGACY_DB_ROLE}`);
+      if (env.DATABASE_URL !== reached[role].internal || !sameDatabase(env.DATABASE_URL, connection.internal)) {
+        problems.push(`${spec.name} DATABASE_URL is not mend-db's internal address as ${role}`);
       }
     }
     if (envs.web.MEND_ENGINE_TOKEN !== envs.engine.MEND_ENGINE_TOKEN) problems.push("mend-web and mend-engine hold different engine tokens");
@@ -1539,7 +1801,7 @@ async function prove() {
     if (hooks.length !== 1 || hooks[0].id !== envs.web.PAYPAL_WEBHOOK_ID) problems.push("PAYPAL_WEBHOOK_ID is not the one PayPal webhook for the live URL");
     line(
       problems.length === 0,
-      `env: all three services hold exactly what they need, PAYPAL_ENV sandbox everywhere, one engine token shared by mend-web and mend-engine only, every DATABASE_URL as ${APP_DB_ROLE} and none as mend-db's owner${problems.length ? ` (${problems.join("; ")})` : ""}`,
+      `env: all three services hold exactly what they need, PAYPAL_ENV sandbox everywhere, one engine token shared by mend-web and mend-engine only, every DATABASE_URL on mend-db as the service's own role (mend-web as mend_web, mend-engine and mend-jobs as mend_engine) and none as mend-db's owner or ${LEGACY_DB_ROLE}${problems.length ? ` (${problems.join("; ")})` : ""}`,
     );
   });
 
@@ -1549,11 +1811,17 @@ async function prove() {
   });
 
   await check("database role", async () => {
-    const tried = roleProbe(app.external);
-    const refused = (name) => tried[name] === INSUFFICIENT_PRIVILEGE;
+    const engine = roleProbe(reached.mend_engine.external, "mend_engine");
+    const web = roleProbe(reached.mend_web.external, "mend_web");
+    const refused = (tried, names) => names.every((name) => tried[name] === INSUFFICIENT_PRIVILEGE);
     line(
-      tried.user === APP_DB_ROLE && refused("disable_trigger") && refused("update_audit_log") && refused("create_table") && tried.select === "ok",
-      `database role: connected as ${tried.user} with the services' credentials, ALTER TABLE audit_log DISABLE TRIGGER, UPDATE audit_log and CREATE TABLE are refused (SQLSTATE ${tried.disable_trigger}, ${tried.update_audit_log}, ${tried.create_table}) and a SELECT works (${tried.select})`,
+      engine.user === "mend_engine" &&
+        refused(engine, ["disable_trigger", "update_audit_log", "create_table"]) &&
+        engine.select === "ok" &&
+        web.user === "mend_web" &&
+        refused(web, ["update_payout_items", "update_audit_log", "create_table"]) &&
+        web.select === "ok",
+      `database role: as ${engine.user} with mend-engine's credentials, ALTER TABLE audit_log DISABLE TRIGGER, UPDATE audit_log and CREATE TABLE are refused (SQLSTATE ${engine.disable_trigger}, ${engine.update_audit_log}, ${engine.create_table}) and a SELECT works (${engine.select}); as ${web.user} with mend-web's credentials, UPDATE payout_items, UPDATE audit_log and CREATE TABLE are refused (SQLSTATE ${web.update_payout_items}, ${web.update_audit_log}, ${web.create_table}) and a SELECT on sessions works (${web.select})`,
     );
   });
 
@@ -1715,9 +1983,9 @@ async function prove() {
       const polled = await journey.browser.settle(await journey.browser.send("GET", resultsUrl));
       return polled.body.payouts?.byStatus?.UNCLAIMED === others ? polled.body.payouts : null;
     });
-    pool.before = campaignCountedMinor(app.external, journey.campaignId);
+    pool.before = campaignCountedMinor(reached.mend_engine.external, journey.campaignId);
     const cancelled = await journey.browser.settle(await journey.browser.send("POST", cancelUrl));
-    pool.after = campaignCountedMinor(app.external, journey.campaignId);
+    pool.after = campaignCountedMinor(reached.mend_engine.external, journey.campaignId);
     const after = (await journey.browser.settle(await journey.browser.send("GET", resultsUrl))).body.payouts ?? {};
     line(
       cancelled.status === 200 &&
@@ -1826,13 +2094,19 @@ async function prove() {
   });
 
   await check("idempotent", async () => {
-    const before = readFileSync(STATE_PATH, "utf8");
-    say("idempotent: running `up` again (without --migrate)");
-    const changes = await up();
-    const unchanged = readFileSync(STATE_PATH, "utf8") === before;
+    const before = readFileSync(statePath, "utf8");
+    say("idempotent: comparing every resource with what `up` would set, in plan-only mode");
+    options.planOnly = true;
+    let changes;
+    try {
+      changes = await up();
+    } finally {
+      options.planOnly = false;
+    }
+    const unchanged = readFileSync(statePath, "utf8") === before;
     line(
       changes.length === 0 && unchanged,
-      `idempotent: running \`up\` again changed nothing (no new service, database or webhook)${changes.length ? ` (changed: ${changes.join("; ")})` : ""}${unchanged ? "" : " (render-state.json changed)"}`,
+      `idempotent: \`up\` would change nothing (no new resource, setting, env var, deploy or webhook, and render-state.json as it is)${changes.length ? ` (would: ${changes.join("; ")})` : ""}${unchanged ? "" : " (render-state.json changed)"}`,
     );
   });
 
@@ -1840,7 +2114,7 @@ async function prove() {
     const since = new Date(Math.min(startedAt.getTime(), Date.now() - 60 * 60 * 1000));
     let entries = [];
     for (const service of Object.values(services)) entries = entries.concat(await serviceLogs(workspace.id, service.id, since));
-    const haystacks = [transcript.join("\n"), readFileSync(STATE_PATH, "utf8"), ...answers, ...entries.map((entry) => String(entry.message ?? ""))];
+    const haystacks = [transcript.join("\n"), readFileSync(statePath, "utf8"), ...answers, ...entries.map((entry) => String(entry.message ?? ""))];
     const found = haystacks.some((text) => carriesSecret(text) || SECRET_SHAPES.some((shape) => shape.test(text)));
     // If PayPal's token shape ever changes, the shape search above would quietly stop working.
     const shapeChecked = typeof paypalToken === "string" && SECRET_SHAPES[0].test(paypalToken);
@@ -1849,20 +2123,19 @@ async function prove() {
       `secrets: no secret value or key shape appears in the script output, render-state.json, ${answers.length} answers from mend-web, or ${entries.length} log lines of mend-web, mend-engine and mend-jobs${shapeChecked ? "" : "; PayPal token shape not recognised"}`,
     );
   });
-
-  say(`D2 RESULT: ${allPassed && !leakedLine ? "PASS" : "FAIL"}`);
-  if (!(allPassed && !leakedLine)) process.exitCode = 1;
 }
 
 const COMMANDS = { status, up, prove };
 
-const options = { migrate: false };
+// planOnly is never an option: only prove's idempotent check sets it, for one `up` call.
+const options = { create: false, migrate: false, planOnly: false };
+const UP_OPTIONS = { "--create": "create", "--migrate": "migrate" };
 
-/** Reads the options after the command. Unknown options, or --migrate on anything but up, stop the run before anything is called. */
+/** Reads the options after the command. Unknown options, or any option on anything but up, stop the run before anything is called. */
 function readOptions(command, args) {
   for (const arg of args) {
-    if (arg === "--migrate" && command === "up") {
-      options.migrate = true;
+    if (command === "up" && Object.hasOwn(UP_OPTIONS, arg)) {
+      options[UP_OPTIONS[arg]] = true;
     } else {
       throw new DeployError(`unknown option for ${command}: ${arg}`);
     }
@@ -1872,19 +2145,54 @@ function readOptions(command, args) {
 async function main() {
   const command = process.argv[2];
   if (!Object.hasOwn(COMMANDS, command)) {
-    console.log("usage: node scripts/deploy/render.mjs status | up [--migrate] | prove");
+    console.log("usage: node scripts/deploy/render.mjs status | up [--create] [--migrate] | prove");
     process.exitCode = 2;
     return;
   }
   readOptions(command, process.argv.slice(3));
   settings = loadSettings();
+  // Ctrl-C skips every finally, so this machine's allow-list entry is removed here as well.
+  process.once("SIGINT", () => {
+    const open = machineAccess.dbId === null ? Promise.resolve() : closeMachineAccess(machineAccess.dbId);
+    open.finally(() => process.exit(130));
+  });
   await COMMANDS[command]();
-  if (leakedLine) process.exitCode = 1;
+  if (leakedLine || cleanupFailed) process.exitCode = 1;
 }
 
-main().catch((error) => {
-  // say() still guards this line, so an error message cannot carry a secret out.
-  say(`FAIL  ${error instanceof DeployError ? error.message : `unexpected error: ${error?.name ?? "unknown"}: ${error?.message ?? ""}`}`);
-  if (process.argv[2] === "prove") say("D2 RESULT: FAIL");
-  process.exitCode = 1;
-});
+/** For scripts/deploy/render.test.mjs, which runs these with fetch replaced. */
+export const testing = {
+  DeployError,
+  SERVICES,
+  setSettings(env) {
+    settings = loadSettings(env);
+  },
+  setStatePath(file) {
+    statePath = file;
+  },
+  setOptions(values) {
+    Object.assign(options, values);
+  },
+  setCompareOnly(on) {
+    compareOnly = on;
+  },
+  resolveResources,
+  up,
+  renderCall,
+  paypalCall,
+  withMachineAccess,
+  act,
+};
+
+const invokedPath = process.argv[1] ? path.resolve(process.argv[1]) : "";
+const thisPath = fileURLToPath(import.meta.url);
+const invokedDirectly = process.platform === "win32" ? invokedPath.toLowerCase() === thisPath.toLowerCase() : invokedPath === thisPath;
+
+if (invokedDirectly) {
+  main().catch((error) => {
+    // say() still guards this line, so an error message cannot carry a secret out.
+    say(`FAIL  ${error instanceof DeployError ? error.message : `unexpected error: ${error?.name ?? "unknown"}: ${error?.message ?? ""}`}`);
+    if (process.argv[2] === "prove") say("D2 RESULT: FAIL");
+    process.exitCode = 1;
+  });
+}

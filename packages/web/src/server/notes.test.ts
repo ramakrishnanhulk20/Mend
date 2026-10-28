@@ -67,7 +67,8 @@ vi.mock("@/server/notes", async () => await import("./notes"));
 vi.mock("@/server/permissions", async () => await import("./permissions"));
 vi.mock("@/server/ratelimit", async () => await import("./ratelimit"));
 
-const { customerData, hasLongDigitRun, noteProblem, tidyNote, writeNotes } = await import("./notes");
+const { customerData, hasLongDigitRun, NOTE_CONCURRENCY, noteProblem, tidyNote, writeNotes } = await import("./notes");
+const { MAX_IN_FLIGHT } = await import("./engine");
 const { ClaudeSession, MODEL } = await import("./claude");
 const { csrfTokenForSession } = await import("./csrf");
 const { POST } = await import("../app/api/campaigns/[id]/notes/route");
@@ -232,6 +233,10 @@ describe("noteProblem", () => {
 });
 
 describe("writeNotes", () => {
+  it("never runs more rows at once than the engine lets one session have calls in flight", () => {
+    expect(NOTE_CONCURRENCY).toBeLessThanOrEqual(MAX_IN_FLIGHT);
+  });
+
   it("writes one note per rewarded customer from that customer's own items, and never touches a held-back row", async () => {
     const session = new ClaudeSession(OWNER, randomUUID(), 10_000, ADDRESS);
     const result = await writeNotes(OWNER, CAMPAIGN, session);

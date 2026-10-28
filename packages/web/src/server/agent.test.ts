@@ -614,7 +614,9 @@ describe("runAgent", () => {
     expect(answer).toEqual({ kind: "replied", reply: "The shop has 1357 quiet regulars.  Ask me to draft a campaign.", toolsUsed: ["shop_summary"], stopped: null, aiCalls: 2 });
     const [first, second] = state.claude;
     expect(first).toMatchObject({ model: "claude-haiku-5-5", max_tokens: 4000, output_config: { effort: "medium" } });
-    for (const banned of ["temperature", "top_p", "top_k", "thinking", "tool_choice"]) expect(first, banned).not.toHaveProperty(banned);
+    for (const banned of ["temperature", "top_p", "top_k", "thinking"]) expect(first, banned).not.toHaveProperty(banned);
+    // One tool per reply, so a turn never has more engine calls in flight than its session may.
+    expect(first.tool_choice).toEqual({ type: "auto", disable_parallel_tool_use: true });
     expect((first.system as { cache_control: unknown }[]).at(-1)?.cache_control).toEqual({ type: "ephemeral" });
     expect((first.tools as { name: string }[]).map((candidate) => candidate.name)).toEqual([...MEND_TOOLS, ...PAYPAL_TOOLS]);
     expect(JSON.stringify(first)).not.toContain("boss@shop.example");

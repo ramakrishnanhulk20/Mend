@@ -14,14 +14,15 @@
 import { zodOutputFormat } from "@anthropic-ai/sdk/helpers/zod";
 import { z } from "zod";
 import { cachedSystem, ClaudeSession, claudeClient, failureOf, MODEL, type Failure, type Stop } from "./claude";
+import { MAX_IN_FLIGHT } from "./engine";
 import { askEngine, type Asked } from "./goal";
 import { writeLog } from "./log";
 import type { SignedIn } from "./permissions";
 
 export const MAX_NOTE_CHARS = 300;
-// Four rows at a time, each doing one engine call or one Claude call at a time, so at
-// most four of either are ever in flight for one campaign.
-const NOTE_CONCURRENCY = 4;
+// As many rows at a time as the engine lets one session have calls in flight, each row
+// doing one engine call or one Claude call at a time, so no row is ever refused for it.
+export const NOTE_CONCURRENCY = MAX_IN_FLIGHT;
 const VIEW_WAIT_MS = 20_000;
 const STEP_WAIT_MS = 20_000;
 

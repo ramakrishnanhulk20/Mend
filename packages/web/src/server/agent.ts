@@ -512,6 +512,8 @@ export async function runAgent(principal: SignedIn, message: string, history: re
         system: cachedSystem(AGENT_SYSTEM),
         messages: conversation(message, history),
         tools: agentTools(turn),
+        // One tool at a time: the engine lets a session have only MAX_IN_FLIGHT calls in flight.
+        tool_choice: { type: "auto", disable_parallel_tool_use: true },
         output_config: { effort: "medium" },
         max_iterations: MAX_ROUNDS,
       },

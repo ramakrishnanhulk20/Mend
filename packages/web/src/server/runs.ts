@@ -46,7 +46,7 @@ const displayName = z.string().min(1).max(80).regex(/^[^\p{Cc}\p{Cf}@]+$/u);
 // No character from Unicode's "other" group (controls, invisible format marks,
 // private-use, unassigned), the same rule the engine applies to a shop name.
 const shopName = z.string().min(1).max(100).regex(/^\P{C}+$/u);
-const consentText = z.string().min(1).max(400).regex(/^\P{C}+$/u);
+const consentText = z.string().min(1).max(1000).regex(/^\P{C}+$/u);
 const sha256Hex = z.string().regex(/^[0-9a-f]{64}$/);
 // The engine's name for the members a demo script joined, whom no person agreed to be (tasks.py SEEDED_LABEL).
 // Kept apart from the people who joined, and never added to them.

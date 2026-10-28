@@ -6,7 +6,7 @@
 // NOT cover: the route handlers themselves (npm run prove:m7b polls a run from a second
 // session), Render's own run store (engine.test.ts fakes it), or the agent reading those
 // orders (agent.test.ts).
-import { spawn } from "node:child_process";
+import { execFileSync, spawn } from "node:child_process";
 import { once } from "node:events";
 import { readFileSync } from "node:fs";
 import path from "node:path";
@@ -161,6 +161,21 @@ beforeEach(() => {
     return true;
   }) as typeof process.stdout.write);
   return () => vi.restoreAllMocks();
+});
+
+describe("the consent the engine really sends", () => {
+  it("passes the engine's own consent sentence and hash, whatever its length", () => {
+    const python = path.join(ENGINE_DIR, ".venv", process.platform === "win32" ? "Scripts/python.exe" : "bin/python");
+    const code = [
+      "import json",
+      "from mend_engine.members.consent import DEMO_SHOP_NAME, consent_hash, consent_text_for",
+      "text = consent_text_for(DEMO_SHOP_NAME)",
+      "print(json.dumps({'ok': True, 'shop_name': DEMO_SHOP_NAME, 'text': text, 'hash': consent_hash(text)}))",
+    ].join("; ");
+    const answer = JSON.parse(execFileSync(python, ["-c", code], { cwd: ENGINE_DIR, encoding: "utf8", windowsHide: true })) as EngineAnswer;
+    const response = finished("consent_text", answer);
+    expect(response.status).toBe(200);
+  });
 });
 
 describe("run ownership", () => {

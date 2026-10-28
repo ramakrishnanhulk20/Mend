@@ -14,6 +14,13 @@
  * Redirects are refused, so a reply cannot move a request elsewhere. One session per
  * call, 15 seconds for the whole exchange, at most 1 MB and 200 events of stream.
  *
+ * The token comes from the read-only sandbox app when its keys are set (config.ts
+ * readOnlyCredentials): PayPal refuses that app's token on the Payouts API. When PayPal's
+ * MCP server fails in its own setup, cannot be reached or breaks the protocol, and at least
+ * 5 seconds of the call are left, the same read goes straight to PayPal's sandbox REST API
+ * under the same rules (paypal-read.ts). Every answer says which way it came: via
+ * "paypal_mcp" or via "paypal_rest".
+ *
  * Answers are rebuilt from a fixed list of fields per tool, each checked for shape;
  * nothing else is copied. So no payer, payee, shipping, payment source, address, email,
  * phone or person's name reaches the caller from any depth, and PayPal's data is not
@@ -28,6 +35,7 @@
 import { z } from "zod";
 import { withoutEmails } from "./claude";
 import { loadConfig, type PayPalCredentials } from "./config";
+import { writeLog } from "./log";
 import { HostRefused, sandboxUrl, TOKEN_REFRESH_MARGIN_MS, type FetchFn } from "./paypal";
 
 export const MCP_HOST = "mcp.sandbox.paypal.com";
@@ -35,6 +43,10 @@ export const MCP_SSE_URL = `https://${MCP_HOST}/sse`;
 export const MCP_CALL_TIMEOUT_MS = 15_000;
 export const MAX_STREAM_BYTES = 1024 * 1024;
 export const MAX_STREAM_EVENTS = 200;
+/** The least time left in a call for which a failed MCP read is retried on PayPal's REST API. */
+export const MIN_FALLBACK_MS = 5_000;
+// What PayPal's MCP server answers when its own setup is broken (AI-Toolkit issue 34); it says nothing about the thing asked for.
+const SETUP_ERROR_CODE = "PAYPAL_API_SETUP_ERROR";
 // The version the probe of 24 Oct saw PayPal agree to. A server that cannot speak it
 // answers with another, and the call is refused rather than guessed at.
 const PROTOCOL_VERSION = "2025-06-18";
@@ -80,7 +92,11 @@ export type ReadTool = keyof typeof READ_TOOL_INPUTS;
 export const READ_TOOLS: readonly ReadTool[] = Object.freeze(["get_order", "list_disputes", "get_dispute", "show_product_details"]);
 
 export type RefusedReason = "not_allowed" | "invalid_input";
-export type FailedReason = "timeout" | "unreachable" | "too_large" | "protocol" | "not_found" | "paypal_error" | "tool_error";
+export type FailedReason = "timeout" | "unreachable" | "too_large" | "protocol" | "not_found" | "paypal_error" | "tool_error" | "server_setup";
+
+// Failures that say PayPal's MCP server is broken, not that the read itself was refused or
+// too slow, so the same read is worth trying on PayPal's REST API.
+const FALLBACK_REASONS: ReadonlySet<FailedReason> = new Set(["server_setup", "unreachable", "protocol"]);
 
 /** The call was refused before a token was fetched or anything was sent. */
 export class McpRefused extends Error {
@@ -218,7 +234,7 @@ export function sandboxTokens(credentials: PayPalCredentials, options: SandboxTo
 let appTokens: TokenSource | undefined;
 
 function defaultTokens(): TokenSource {
-  appTokens ??= sandboxTokens(loadConfig().paypal);
+  appTokens ??= sandboxTokens(loadConfig().paypalRead);
   return appTokens;
 }
 
@@ -302,9 +318,12 @@ export function viewOf(tool: ReadTool, answer: unknown): PayPalView {
 
 type StreamEvent = { readonly event: string; readonly data: string };
 
-// Rejects as soon as signal aborts, so a stream that never sends cannot hold the call
-// past its time limit whatever the fetch implementation does with the signal.
-function untilAborted<T>(work: Promise<T>, signal: AbortSignal): Promise<T> {
+/**
+ * work's outcome, or McpFailed("timeout") as soon as signal aborts, so a stream that never
+ * sends cannot hold a call past its time limit whatever the fetch implementation does with
+ * the signal. Shared with paypal-read.ts.
+ */
+export function untilAborted<T>(work: Promise<T>, signal: AbortSignal): Promise<T> {
   return new Promise<T>((resolve, reject) => {
     const stop = () => reject(new McpFailed("timeout"));
     signal.addEventListener("abort", stop, { once: true });
@@ -439,6 +458,7 @@ function answerOf(result: unknown): unknown {
   // PayPal's server wraps a REST error as {ok: false, status, code, message}; only the status is kept.
   if (field(answer, "ok") === false) {
     const status = field(answer, "status");
+    if (field(answer, "code") === SETUP_ERROR_CODE) throw new McpFailed("server_setup", status);
     throw new McpFailed(status === 404 ? "not_found" : "paypal_error", status);
   }
   return answer;
@@ -485,22 +505,45 @@ async function converse(fetchFn: FetchFn, token: string, tool: ReadTool, input: 
 export type McpOptions = {
   /** Test seam; production leaves it unset and uses the global fetch at call time. */
   readonly fetch?: FetchFn;
-  /** Production leaves it unset and uses the app's own sandbox credentials. */
+  /** Production leaves it unset and uses the read-only app's sandbox keys, or the main app's when none are set. */
   readonly tokens?: TokenSource;
   readonly timeoutMs?: number;
   /** Ends the call early, for example when the agent's turn runs out of time. */
   readonly signal?: AbortSignal;
 };
 
+async function throughMcp(tool: ReadTool, input: unknown, tokens: TokenSource, fetchFn: FetchFn, limitMs: number, caller: AbortSignal | undefined): Promise<PayPalView> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), limitMs);
+  const signal = caller === undefined ? controller.signal : AbortSignal.any([controller.signal, caller]);
+  let token: string | null = null;
+  try {
+    token = await untilAborted(tokens.get(), signal);
+    return viewOf(tool, await converse(fetchFn, token, tool, input, signal));
+  } catch (error) {
+    if (error instanceof McpFailed && error.status === 401 && token !== null) tokens.drop(token);
+    if (error instanceof McpFailed || error instanceof HostRefused) throw error;
+    throw new McpFailed(signal.aborted || timedOut(error) ? "timeout" : "unreachable");
+  } finally {
+    clearTimeout(timer);
+    controller.abort();
+  }
+}
+
 /**
  * Call one of PayPal's four read tools through PayPal's sandbox MCP server, in a session
- * of its own, and return the answer rebuilt from that tool's listed fields.
+ * of its own, and return the answer rebuilt from that tool's listed fields, with via
+ * "paypal_mcp". When the MCP read fails with server_setup, unreachable or protocol and at
+ * least MIN_FALLBACK_MS of the call's time is left, logs one paypal_read_fallback line and
+ * returns paypal-read.ts readDirect's answer for the same tool and input, with via
+ * "paypal_rest", or its failure.
  *
  * Throws McpRefused when name is not one of the four or the arguments fail its strict
  * schema (nothing fetched, nothing sent); HostRefused when a URL, including the endpoint
- * the server names, is not on mcp.sandbox.paypal.com (nothing sent there); McpFailed on
- * a timeout (15 s for the whole exchange), a connection failure, a stream over 1 MB or
- * 200 events, an answer that does not follow the protocol, or PayPal's refusal.
+ * the server names, is not on mcp.sandbox.paypal.com (nothing sent there, no fallback);
+ * McpFailed on a timeout (15 s for the whole exchange, fallback included), a stream over
+ * 1 MB or 200 events, PayPal's refusal or a tool error (none of these fall back), or a
+ * fallback reason with too little time left to read directly.
  */
 export async function callPayPalTool(name: string, args: unknown, options: McpOptions = {}): Promise<PayPalView> {
   if (!Object.hasOwn(READ_TOOL_INPUTS, name)) throw new McpRefused("not_allowed");
@@ -510,19 +553,19 @@ export async function callPayPalTool(name: string, args: unknown, options: McpOp
   mcpUrl(MCP_SSE_URL);
   const tokens = options.tokens ?? defaultTokens();
   const fetchFn: FetchFn = options.fetch ?? ((url, init) => globalThis.fetch(url, init));
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), options.timeoutMs ?? MCP_CALL_TIMEOUT_MS);
-  const signal = options.signal === undefined ? controller.signal : AbortSignal.any([controller.signal, options.signal]);
-  let token: string | null = null;
+  const limitMs = options.timeoutMs ?? MCP_CALL_TIMEOUT_MS;
+  const startedAt = Date.now();
+  let failed: McpFailed;
   try {
-    token = await untilAborted(tokens.get(), signal);
-    return viewOf(tool, await converse(fetchFn, token, tool, input.data, signal));
+    return { ...(await throughMcp(tool, input.data, tokens, fetchFn, limitMs, options.signal)), via: "paypal_mcp" };
   } catch (error) {
-    if (error instanceof McpFailed && error.status === 401 && token !== null) tokens.drop(token);
-    if (error instanceof McpFailed || error instanceof HostRefused) throw error;
-    throw new McpFailed(signal.aborted || timedOut(error) ? "timeout" : "unreachable");
-  } finally {
-    clearTimeout(timer);
-    controller.abort();
+    if (!(error instanceof McpFailed)) throw error;
+    failed = error;
   }
+  const leftMs = limitMs - (Date.now() - startedAt);
+  if (!FALLBACK_REASONS.has(failed.reason) || leftMs < MIN_FALLBACK_MS) throw failed;
+  writeLog({ kind: "paypal_read_fallback", tool, reason: failed.reason });
+  // Loaded here, not at the top: paypal-read.ts builds on this module, so a static import both ways would be a cycle.
+  const { readDirect } = await import("./paypal-read");
+  return readDirect(tool, input.data, { tokens, fetch: fetchFn, signal: options.signal, timeoutMs: leftMs });
 }

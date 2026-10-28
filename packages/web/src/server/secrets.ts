@@ -7,8 +7,9 @@
  * A setting is secret when it is on the list below, or when its name ends in _SECRET,
  * _TOKEN, _KEY or _PASSWORD in any case, or it is DATABASE_URL. The name rule catches a
  * secret added later without anyone remembering the list; the list keeps the settings
- * whose names the rule does not reach. PAYPAL_CLIENT_ID is not secret by itself, but it
- * is half of the credential pair, so it is kept out of logs and prompts as well.
+ * whose names the rule does not reach. PAYPAL_CLIENT_ID and PAYPAL_READ_CLIENT_ID are not
+ * secret by themselves, but each is half of a credential pair, so they are kept out of
+ * logs and prompts as well.
  *
  * Covers each value exactly as it sits in the environment. Does not cover values made
  * from them, such as the OAuth access tokens PayPal issues for the client secret, or a
@@ -18,6 +19,8 @@ export const SECRET_SETTINGS: readonly string[] = Object.freeze([
   "ANTHROPIC_API_KEY",
   "PAYPAL_CLIENT_ID",
   "PAYPAL_CLIENT_SECRET",
+  "PAYPAL_READ_CLIENT_ID",
+  "PAYPAL_READ_CLIENT_SECRET",
   "MEND_OWNER_PASSWORD",
   "MEND_CSRF_SECRET",
   "MEND_BRIDGE_TOKEN",

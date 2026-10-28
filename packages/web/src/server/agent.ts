@@ -268,10 +268,12 @@ const PAYPAL_REFUSALS: Readonly<Record<RefusedReason | FailedReason | "host_refu
   protocol: "PayPal answered in a way Mend cannot read. Try again later.",
   paypal_error: "PayPal refused that lookup. Try again later.",
   tool_error: "PayPal could not run that lookup. Try again later.",
+  server_setup: "PayPal's lookup service is not working right now. Try again in a few minutes.",
   host_refused: "PayPal's server pointed somewhere Mend does not send requests, so nothing was sent there.",
 };
 
 const PAYPAL_MONEY = "PayPal amounts are a currency code and a decimal value in that currency, for example 12.50 USD is twelve dollars fifty, not cents.";
+const PAYPAL_VIA = "Its via field says how it was read: paypal_mcp through PayPal's MCP server, or paypal_rest straight from PayPal's API while that server is down.";
 
 const DEMO_ORDER_REFUSAL = "A demo visitor can read only orders this demo session bought with the simulate button. Buy one with the simulate button first.";
 
@@ -302,7 +304,7 @@ export function paypalReadTools(turn: Turn): AgentTool[] {
     guardedTool(turn, {
       name: "get_order",
       action: "paypal.read",
-      description: `Call when the owner asks what happened with a PayPal order and gives its order id. Reads it from PayPal and returns its status, when it was created and last updated, the amount, item names and quantities, and each capture's id and status; never who paid or where it ships. ${PAYPAL_MONEY} Read only.`,
+      description: `Call when the owner asks what happened with a PayPal order and gives its order id. Reads it from PayPal and returns its status, when it was created and last updated, the amount, item names and quantities, and each capture's id and status; never who paid or where it ships. ${PAYPAL_MONEY} ${PAYPAL_VIA} Read only.`,
       input: READ_TOOL_INPUTS.get_order,
       run: async (input) => {
         if (turn.principal.role !== "owner" && !sessionBoughtOrder(turn.principal.sessionId, input.id)) throw new ToolRefusal(DEMO_ORDER_REFUSAL);
@@ -312,21 +314,21 @@ export function paypalReadTools(turn: Turn): AgentTool[] {
     guardedTool(turn, {
       name: "list_disputes",
       action: "paypal.read_disputes",
-      description: `Call when the owner asks whether the shop has any PayPal disputes, chargebacks or buyer complaints. Returns up to 20 disputes, each with its id, reason, status, stage, amount, dates and the date a reply is due; never the buyer. ${PAYPAL_MONEY} Read only.`,
+      description: `Call when the owner asks whether the shop has any PayPal disputes, chargebacks or buyer complaints. Returns up to 20 disputes, each with its id, reason, status, stage, amount, dates and the date a reply is due; never the buyer. ${PAYPAL_MONEY} ${PAYPAL_VIA} Read only.`,
       input: READ_TOOL_INPUTS.list_disputes,
       run: (input) => read("list_disputes", input),
     }),
     guardedTool(turn, {
       name: "get_dispute",
       action: "paypal.read_disputes",
-      description: `Call when the owner asks about one PayPal dispute and gives its id. Returns its reason, status, stage, amount, dates and the date a reply is due; never the buyer or the messages. ${PAYPAL_MONEY} Read only.`,
+      description: `Call when the owner asks about one PayPal dispute and gives its id. Returns its reason, status, stage, amount, dates and the date a reply is due; never the buyer or the messages. ${PAYPAL_MONEY} ${PAYPAL_VIA} Read only.`,
       input: READ_TOOL_INPUTS.get_dispute,
       run: (input) => read("get_dispute", input),
     }),
     guardedTool(turn, {
       name: "show_product_details",
       action: "paypal.read",
-      description: "Call when the owner asks about a product in the shop's PayPal catalog and gives its product id. Returns its name, description, type and category. Read only.",
+      description: `Call when the owner asks about a product in the shop's PayPal catalog and gives its product id. Returns its name, description, type and category. ${PAYPAL_VIA} Read only.`,
       input: READ_TOOL_INPUTS.show_product_details,
       run: (input) => read("show_product_details", input),
     }),

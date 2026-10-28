@@ -74,6 +74,7 @@ const SAFE_TOOLS = new Set(["request_approval", "view_campaign", "campaign_resul
 const MCP_SESSION_STEPS = new Set(["initialize", "notifications/initialized"]);
 // Written from the work order's list, not from paypal-mcp.ts, so the check is independent of the code it checks.
 const ORDER_FIELDS = new Set([
+  "via",
   "id",
   "status",
   "create_time",

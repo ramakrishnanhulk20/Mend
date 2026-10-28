@@ -355,6 +355,20 @@ describe("the agent's tools", () => {
     expect(logged).toContain('"outcome":"host_refused"');
   });
 
+  it("tell the model in a fixed sentence when PayPal's lookup service itself is broken", async () => {
+    const current = turn();
+    const getOrder = tool(agentTools(current), "get_order");
+    vi.spyOn(process.stdout, "write").mockImplementation((() => true) as typeof process.stdout.write);
+    state.paypal = new McpFailed("server_setup");
+    const error = await getOrder({ id: ORDER_ID }).then(
+      () => null,
+      (thrown: unknown) => thrown,
+    );
+    current.session.close();
+    expect(error).toBeInstanceOf(Error);
+    expect((error as Error).message).toBe("PayPal's lookup service is not working right now. Try again in a few minutes.");
+  });
+
   it("let a demo visitor read only orders its own session bought with the simulate button, products, and never the shop's disputes", async () => {
     const visitor = freshSession();
     const own = "1AB23456CD789012E";

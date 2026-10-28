@@ -24,6 +24,9 @@ export type PayPalCredentials = {
 export type Config = {
   readonly paypalApiHost: typeof SANDBOX_API_HOST;
   readonly paypal: PayPalCredentials;
+  /** The agent's PayPal reads: a second sandbox app without Payouts when one is set, otherwise the main app. */
+  readonly paypalRead: PayPalCredentials;
+  readonly paypalReadSeparate: boolean;
   readonly webhookId: string;
   readonly databaseUrl: string;
 };
@@ -88,11 +91,40 @@ export function readCredentials(env: Env): PayPalCredentials {
   });
 }
 
+const READ_ID = "PAYPAL_READ_CLIENT_ID";
+const READ_SECRET = "PAYPAL_READ_CLIENT_SECRET";
+
+/**
+ * The credentials the agent's PayPal reads use. A separate sandbox app, made without the
+ * Payouts permission, keeps a leaked or misused read token from ever paying anyone; PayPal
+ * itself refuses its token on the Payouts API.
+ *
+ * Both PAYPAL_READ_CLIENT_ID and PAYPAL_READ_CLIENT_SECRET set with no whitespace: that
+ * app, separate true. Neither set (an empty value counts as unset): main, separate false.
+ * Throws ConfigError naming the missing or invalid setting when only one is usable, and
+ * when the read client id is main's, since that is the same app with the same permissions.
+ * The secret is hidden from JSON, inspect and spreads as main's is.
+ */
+export function readOnlyCredentials(env: Env, main: PayPalCredentials): { credentials: PayPalCredentials; separate: boolean } {
+  const id = env[READ_ID];
+  const secret = env[READ_SECRET];
+  const unset = (value: string | undefined) => value === undefined || value === "";
+  if (unset(id) && unset(secret)) return { credentials: main, separate: false };
+  const bad = [READ_ID, READ_SECRET].filter((name) => !NO_WHITESPACE.test(env[name] ?? ""));
+  if (bad.length > 0) throw new ConfigError(`missing or invalid setting: ${bad.join(", ")}`);
+  if (id === main.clientId) throw new ConfigError(`${READ_ID} must belong to a different PayPal app`);
+  return {
+    credentials: withHidden({ clientId: id } as PayPalCredentials, { clientSecret: secret as string }),
+    separate: true,
+  };
+}
+
 /**
  * Validate a whole environment into a Config. Throws ConfigError unless PAYPAL_ENV is
  * exactly "sandbox", both PayPal keys are set, PAYPAL_WEBHOOK_ID is letters and digits
- * (at most 50) and DATABASE_URL is a postgres:// or postgresql:// URL with a host (or
- * a host parameter naming a socket directory).
+ * (at most 50), DATABASE_URL is a postgres:// or postgresql:// URL with a host (or a
+ * host parameter naming a socket directory), and the read-only pair passes
+ * readOnlyCredentials.
  */
 export function parseConfig(env: Env): Config {
   const parsed = configSchema.safeParse(env);
@@ -100,8 +132,15 @@ export function parseConfig(env: Env): Config {
     throw refusal(parsed.error.issues);
   }
   const paypal = readCredentials(env);
+  const read = readOnlyCredentials(env, paypal);
   return withHidden(
-    { paypalApiHost: SANDBOX_API_HOST, paypal, webhookId: parsed.data.PAYPAL_WEBHOOK_ID } as Config,
+    {
+      paypalApiHost: SANDBOX_API_HOST,
+      paypal,
+      paypalRead: read.credentials,
+      paypalReadSeparate: read.separate,
+      webhookId: parsed.data.PAYPAL_WEBHOOK_ID,
+    } as Config,
     { databaseUrl: parsed.data.DATABASE_URL },
   );
 }

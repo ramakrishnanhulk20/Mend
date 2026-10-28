@@ -3,10 +3,11 @@
 // running database (webhooks.test.ts and the live proof do that).
 import { inspect } from "node:util";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { ConfigError, parseConfig, readCredentials, SANDBOX_API_HOST } from "./config";
+import { ConfigError, parseConfig, readCredentials, readOnlyCredentials, SANDBOX_API_HOST } from "./config";
 
 const SECRET = "test-secret-value-1234";
 const DB_PASSWORD = "db-password-5678";
+const READ_SECRET = "read-only-secret-value-9012";
 
 const goodEnv = {
   PAYPAL_ENV: "sandbox",
@@ -106,6 +107,70 @@ describe("readCredentials", () => {
 
   it("refuses live", () => {
     expect(() => readCredentials({ ...goodEnv, PAYPAL_ENV: "live" })).toThrow(ConfigError);
+  });
+});
+
+describe("readOnlyCredentials", () => {
+  const main = readCredentials(goodEnv);
+  const readEnv = { ...goodEnv, PAYPAL_READ_CLIENT_ID: "read-only-client-id", PAYPAL_READ_CLIENT_SECRET: READ_SECRET };
+
+  function refusal(env: Record<string, string | undefined>): ConfigError {
+    try {
+      readOnlyCredentials(env, main);
+    } catch (error) {
+      if (error instanceof ConfigError) return error;
+      throw error;
+    }
+    throw new Error("expected a ConfigError");
+  }
+
+  it("uses the read-only app when both of its keys are set", () => {
+    const { credentials, separate } = readOnlyCredentials(readEnv, main);
+    expect(separate).toBe(true);
+    expect(credentials.clientId).toBe("read-only-client-id");
+    expect(credentials.clientSecret).toBe(READ_SECRET);
+  });
+
+  it.each([{}, { PAYPAL_READ_CLIENT_ID: "", PAYPAL_READ_CLIENT_SECRET: "" }])("falls back to the main app when neither key is set (%j)", (extra) => {
+    const { credentials, separate } = readOnlyCredentials({ ...goodEnv, ...extra }, main);
+    expect(separate).toBe(false);
+    expect(credentials).toBe(main);
+  });
+
+  it.each([
+    ["PAYPAL_READ_CLIENT_SECRET", { PAYPAL_READ_CLIENT_ID: "read-only-client-id" }],
+    ["PAYPAL_READ_CLIENT_ID", { PAYPAL_READ_CLIENT_SECRET: READ_SECRET }],
+    ["PAYPAL_READ_CLIENT_ID", { PAYPAL_READ_CLIENT_ID: "has space", PAYPAL_READ_CLIENT_SECRET: READ_SECRET }],
+  ])("refuses a half-set pair, naming %s and never a value", (name, extra) => {
+    const error = refusal({ ...goodEnv, ...extra });
+    expect(error.message).toBe(`missing or invalid setting: ${name}`);
+    expect(error.message).not.toContain(READ_SECRET);
+  });
+
+  it("refuses a read-only client id that is the main app's", () => {
+    const error = refusal({ ...readEnv, PAYPAL_READ_CLIENT_ID: goodEnv.PAYPAL_CLIENT_ID });
+    expect(error.message).toBe("PAYPAL_READ_CLIENT_ID must belong to a different PayPal app");
+    expect(error.message).not.toContain(goodEnv.PAYPAL_CLIENT_ID);
+  });
+
+  it("keeps the read-only secret out of keys, JSON and inspect output", () => {
+    const { credentials } = readOnlyCredentials(readEnv, main);
+    expect(Object.keys(credentials)).toEqual(["clientId"]);
+    expect(Object.isFrozen(credentials)).toBe(true);
+    for (const text of [JSON.stringify(credentials), inspect(credentials, { depth: 10 }), JSON.stringify({ ...credentials })]) expect(text).not.toContain(READ_SECRET);
+  });
+
+  it("is what parseConfig gives the agent's PayPal reads", () => {
+    const separate = parseConfig(readEnv);
+    expect(separate.paypalReadSeparate).toBe(true);
+    expect(separate.paypalRead.clientId).toBe("read-only-client-id");
+    expect(separate.paypal.clientId).toBe(goodEnv.PAYPAL_CLIENT_ID);
+    expect(JSON.stringify(separate)).not.toContain(READ_SECRET);
+    expect(inspect(separate, { depth: 10 })).not.toContain(READ_SECRET);
+    const shared = parseConfig(goodEnv);
+    expect(shared.paypalReadSeparate).toBe(false);
+    expect(shared.paypalRead).toBe(shared.paypal);
+    expect(() => parseConfig({ ...goodEnv, PAYPAL_READ_CLIENT_ID: "read-only-client-id" })).toThrow("missing or invalid setting: PAYPAL_READ_CLIENT_SECRET");
   });
 });
 

@@ -70,7 +70,7 @@ const DATABASE = {
 };
 // Never on any service: Render keys are account-wide, and the rest are local development settings.
 const NEVER_ON_RENDER = ["RENDER_API_KEY", "MEND_DEV", "MEND_TEST_RECEIVER", "MEND_BRIDGE_URL", "MEND_BRIDGE_TOKEN", "MEND_WORKFLOW_SLUG"];
-const WEB_ONLY = ["MEND_OWNER_PASSWORD", "ANTHROPIC_API_KEY", "MEND_CSRF_SECRET"];
+const WEB_ONLY = ["MEND_OWNER_PASSWORD", "ANTHROPIC_API_KEY", "MEND_CSRF_SECRET", "PAYPAL_READ_CLIENT_ID", "PAYPAL_READ_CLIENT_SECRET"];
 const SERVICES = {
   web: {
     key: "web",
@@ -126,11 +126,15 @@ const EVENT_TYPES = [
   "PAYMENT.CAPTURE.COMPLETED",
 ];
 const CAP_KEYS = ["MEND_PAYOUT_ITEM_CAP_MINOR", "MEND_CAMPAIGN_CAP_MINOR", "MEND_DAILY_CAP_MINOR"];
+// The agent's PayPal reads use a second sandbox app made without the Payouts permission; only mend-web holds it.
+const READ_KEYS = ["PAYPAL_READ_CLIENT_ID", "PAYPAL_READ_CLIENT_SECRET"];
 // The keys packages/web/src/server reads in production (config.ts, auth.ts, csrf.ts, claude.ts, engine.ts).
 const WEB_APP_KEYS = [
   "PAYPAL_ENV",
   "PAYPAL_CLIENT_ID",
   "PAYPAL_CLIENT_SECRET",
+  "PAYPAL_READ_CLIENT_ID",
+  "PAYPAL_READ_CLIENT_SECRET",
   "DATABASE_URL",
   "PAYPAL_WEBHOOK_ID",
   "MEND_BASE_URL",
@@ -195,8 +199,11 @@ function loadSettings(env = readDotEnv()) {
   if (!/^[1-9][0-9]{0,8}$/.test(env.MEND_PAYOUT_ITEM_CAP_MINOR ?? "")) missing.push("MEND_PAYOUT_ITEM_CAP_MINOR");
   if (missing.length > 0) throw new DeployError(`missing or invalid in .env: ${missing.join(", ")}`);
   if (env.PAYPAL_ENV !== "sandbox") throw new DeployError("PAYPAL_ENV in .env must be exactly 'sandbox'");
-  for (const key of ["RENDER_API_KEY", "PAYPAL_CLIENT_SECRET", "MEND_OWNER_PASSWORD", "ANTHROPIC_API_KEY"]) addSecret(env[key]);
+  for (const key of ["RENDER_API_KEY", "PAYPAL_CLIENT_SECRET", "MEND_OWNER_PASSWORD", "ANTHROPIC_API_KEY", ...READ_KEYS]) addSecret(env[key]);
   addSecret(Buffer.from(`${env.PAYPAL_CLIENT_ID}:${env.PAYPAL_CLIENT_SECRET}`).toString("base64"));
+  if (typeof env.PAYPAL_READ_CLIENT_ID === "string" && typeof env.PAYPAL_READ_CLIENT_SECRET === "string") {
+    addSecret(Buffer.from(`${env.PAYPAL_READ_CLIENT_ID}:${env.PAYPAL_READ_CLIENT_SECRET}`).toString("base64"));
+  }
   return env;
 }
 
@@ -208,7 +215,10 @@ function checkDeploySettings() {
   // packages/web/src/server/claude.ts accepts 20 to 512 printable characters.
   if (!/^[\x21-\x7e]{20,512}$/.test(settings.ANTHROPIC_API_KEY ?? "")) bad.push("ANTHROPIC_API_KEY");
   if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(settings.MEND_TEST_RECEIVER ?? "")) bad.push("MEND_TEST_RECEIVER");
+  // packages/web/src/server/config.ts readOnlyCredentials: the agent's read-only PayPal app.
+  bad.push(...READ_KEYS.filter((key) => typeof settings[key] !== "string" || !NO_WHITESPACE.test(settings[key])));
   if (bad.length > 0) throw new DeployError(`missing or invalid in .env: ${bad.join(", ")}`);
+  if (settings.PAYPAL_READ_CLIENT_ID === settings.PAYPAL_CLIENT_ID) throw new DeployError("PAYPAL_READ_CLIENT_ID in .env must belong to a different PayPal app");
 }
 
 let settings;
@@ -975,6 +985,8 @@ function desiredEnv(spec, values) {
       PAYPAL_ENV: "sandbox",
       PAYPAL_CLIENT_ID: settings.PAYPAL_CLIENT_ID,
       PAYPAL_CLIENT_SECRET: settings.PAYPAL_CLIENT_SECRET,
+      PAYPAL_READ_CLIENT_ID: settings.PAYPAL_READ_CLIENT_ID,
+      PAYPAL_READ_CLIENT_SECRET: settings.PAYPAL_READ_CLIENT_SECRET,
       DATABASE_URL: app.internal,
       MEND_OWNER_PASSWORD: settings.MEND_OWNER_PASSWORD,
       MEND_CSRF_SECRET: csrfSecret,
@@ -1072,7 +1084,7 @@ async function serviceEnv(serviceId) {
   const rows = await renderList(`/services/${serviceId}/env-vars`, "envVar");
   const env = {};
   for (const row of rows) env[row.key] = row.value;
-  for (const key of ["DATABASE_URL", "MEND_ENGINE_TOKEN", "MEND_CSRF_SECRET", "PAYPAL_CLIENT_SECRET", "MEND_OWNER_PASSWORD", "ANTHROPIC_API_KEY", "RENDER_API_KEY"]) {
+  for (const key of ["DATABASE_URL", "MEND_ENGINE_TOKEN", "MEND_CSRF_SECRET", "PAYPAL_CLIENT_SECRET", ...READ_KEYS, "MEND_OWNER_PASSWORD", "ANTHROPIC_API_KEY", "RENDER_API_KEY"]) {
     addSecret(env[key]);
   }
   return env;
@@ -1529,6 +1541,54 @@ async function check(label, run) {
   }
 }
 
+// A payout batch PayPal holds for the shop, read when this run sent none.
+const KNOWN_BATCH_ID = "JKEUJEAFGHFUN";
+
+/** A client-credentials token for the read-only app in .env, with the scopes PayPal says it carries. The token is never printed. */
+async function readAppToken() {
+  const basic = Buffer.from(`${settings.PAYPAL_READ_CLIENT_ID}:${settings.PAYPAL_READ_CLIENT_SECRET}`).toString("base64");
+  const response = await fetch(`${PAYPAL_API}/v1/oauth2/token`, {
+    method: "POST",
+    headers: { Authorization: `Basic ${basic}`, "Content-Type": "application/x-www-form-urlencoded", Accept: "application/json" },
+    body: "grant_type=client_credentials",
+    redirect: "error",
+    signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
+  });
+  const body = await response.json().catch(() => null);
+  if (response.status !== 200 || typeof body?.access_token !== "string") throw new ProofFailed(`the read-only app's token request answered ${response.status}`);
+  addSecret(body.access_token);
+  return { token: body.access_token, scopes: typeof body.scope === "string" ? body.scope.split(" ").filter(Boolean) : [] };
+}
+
+/**
+ * prove's "read keys" check: mend-web holds both read-only settings (names only, never
+ * values), the read-only app's token from .env carries no scope naming payouts, and PayPal
+ * answers 403 when that token asks for a payout batch (this run's, or KNOWN_BATCH_ID).
+ * A token PayPal names no scopes for fails, so an empty answer cannot pass. Returns
+ * { passed, text }; the text holds the scope count and PayPal's status, nothing else.
+ */
+async function readKeysCheck(webEnv, batchId) {
+  const problems = [];
+  const missing = READ_KEYS.filter((key) => typeof webEnv[key] !== "string" || webEnv[key] === "");
+  if (missing.length > 0) problems.push(`mend-web lacks ${missing.join(", ")}`);
+  const { token, scopes } = await readAppToken();
+  const payoutScopes = scopes.filter((scope) => /payout/i.test(scope)).length;
+  if (scopes.length === 0) problems.push("PayPal named no scopes for the token");
+  if (payoutScopes > 0) problems.push(`${payoutScopes} of them for payouts`);
+  const id = typeof batchId === "string" && /^[A-Z0-9]{1,32}$/.test(batchId) ? batchId : KNOWN_BATCH_ID;
+  const response = await fetch(`${PAYPAL_API}/v1/payments/payouts/${id}`, {
+    headers: { Authorization: `Bearer ${token}`, Accept: "application/json" },
+    redirect: "error",
+    signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
+  });
+  await response.body?.cancel().catch(() => undefined);
+  if (response.status !== 403) problems.push(`the payout batch read answered ${response.status}, not 403`);
+  return {
+    passed: problems.length === 0,
+    text: `read keys: mend-web holds both read-only settings; the read-only app's token carries ${scopes.length} scopes, none for payouts, and PayPal answers ${response.status} when it asks for a payout batch${problems.length ? ` (${problems.join("; ")})` : ""}`,
+  };
+}
+
 async function otherPaidResources(ownerId, ours) {
   const paid = [];
   for (const service of await renderList(`/services?ownerId=${ownerId}`, "service")) {
@@ -1919,6 +1979,11 @@ async function proveChecks({ receiver, startedAt, workspace, services, db, origi
     return { ...planned, browser, batchId, submittedAt };
   });
 
+  await check("read keys", async () => {
+    const result = await readKeysCheck(envs.web, journey?.batchId);
+    line(result.passed, result.text);
+  });
+
   let delivered = null;
   if (journey === null) line(false, "delivery: skipped, no batch was sent");
   else delivered = await check("delivery", async () => {
@@ -2182,6 +2247,10 @@ export const testing = {
   paypalCall,
   withMachineAccess,
   act,
+  checkDeploySettings,
+  desiredEnv,
+  carriesSecret,
+  readKeysCheck,
 };
 
 const invokedPath = process.argv[1] ? path.resolve(process.argv[1]) : "";

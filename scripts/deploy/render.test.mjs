@@ -1,8 +1,9 @@
 // Tests render.mjs's own decisions with fetch replaced, so nothing reaches Render or PayPal:
 // resources are found by their recorded id or the run stops, nothing is created without
-// --create, prove's compare-only guard, and this machine's allow-list entry being removed.
-// Does NOT cover Render's real answers, the migrate and seed commands, or the live proof
-// (node scripts/deploy/render.mjs prove does).
+// --create, prove's compare-only guard, this machine's allow-list entry being removed, and
+// the read-only PayPal app: copied to mend-web only, required for up, swept as a secret, and
+// prove's "read keys" check. Does NOT cover Render's real answers, PayPal's real scopes, the
+// migrate and seed commands, or the live proof (node scripts/deploy/render.mjs prove does).
 //   node --test scripts/deploy/render.test.mjs
 import assert from "node:assert/strict";
 import { mkdtempSync, writeFileSync } from "node:fs";
@@ -15,6 +16,8 @@ const SETTINGS = {
   RENDER_API_KEY: "rnd.test.key.not.real.0000",
   PAYPAL_CLIENT_ID: "test-client-id",
   PAYPAL_CLIENT_SECRET: "test.client.secret.not.real",
+  PAYPAL_READ_CLIENT_ID: "test-read-client-id",
+  PAYPAL_READ_CLIENT_SECRET: "test.read.client.secret.not.real",
   PAYPAL_ENV: "sandbox",
   MEND_PAYOUT_ITEM_CAP_MINOR: "1000",
   MEND_CAMPAIGN_CAP_MINOR: "10000",
@@ -237,5 +240,78 @@ describe("prove is compare-only", () => {
     });
     assert.equal(ran, false);
     assert.deepEqual(changes, ["set env var DATABASE_URL on mend-web"]);
+  });
+});
+
+describe("the read-only PayPal app", () => {
+  const READ_BASIC = `Basic ${Buffer.from(`${SETTINGS.PAYPAL_READ_CLIENT_ID}:${SETTINGS.PAYPAL_READ_CLIENT_SECRET}`).toString("base64")}`;
+  const READ_TOKEN = "fake.read.only.token.not.real.0000";
+  const WEB_ENV = { PAYPAL_READ_CLIENT_ID: "on-render", PAYPAL_READ_CLIENT_SECRET: "on-render" };
+
+  // PayPal as the live check of 28 Oct saw it: the read-only token has no payouts scope and is refused a payout batch.
+  function readPayPal({ scope = "https://uri.paypal.com/services/payments/refund openid", payoutStatus = 403 } = {}) {
+    routes["POST /oauth2/token"] = (init) =>
+      init.headers.Authorization === READ_BASIC
+        ? json(200, { access_token: READ_TOKEN, expires_in: 32000, ...(scope === null ? {} : { scope }) })
+        : json(200, { access_token: "fake.paypal.token.not.real.0000", expires_in: 32000 });
+    for (const id of ["JKEUJEAFGHFUN", "RUNBATCH123"]) {
+      routes[`GET /payments/payouts/${id}`] = (init) => json(init.headers.Authorization === `Bearer ${READ_TOKEN}` ? payoutStatus : 200, { name: "NOT_AUTHORIZED" });
+    }
+  }
+
+  it("is copied from .env to mend-web only", () => {
+    const values = { roleConnections: { mend_web: { internal: "postgresql://mend_web:x@dpg-test-a/mend" }, mend_engine: { internal: "postgresql://mend_engine:x@dpg-test-a/mend" } }, engineToken: "t", csrfSecret: "c" };
+    const web = testing.desiredEnv(testing.SERVICES.web, values);
+    assert.equal(web.PAYPAL_READ_CLIENT_ID, SETTINGS.PAYPAL_READ_CLIENT_ID);
+    assert.equal(web.PAYPAL_READ_CLIENT_SECRET, SETTINGS.PAYPAL_READ_CLIENT_SECRET);
+    for (const key of ["engine", "jobs"]) {
+      const env = testing.desiredEnv(testing.SERVICES[key], values);
+      assert.equal("PAYPAL_READ_CLIENT_ID" in env || "PAYPAL_READ_CLIENT_SECRET" in env, false, key);
+    }
+  });
+
+  it("is required for up and prove, naming the missing setting and never a value", () => {
+    for (const key of ["PAYPAL_READ_CLIENT_ID", "PAYPAL_READ_CLIENT_SECRET"]) {
+      testing.setSettings({ ...SETTINGS, [key]: undefined });
+      assert.throws(() => testing.checkDeploySettings(), (error) => error instanceof testing.DeployError && error.message === `missing or invalid in .env: ${key}`);
+    }
+    testing.setSettings({ ...SETTINGS, PAYPAL_READ_CLIENT_ID: SETTINGS.PAYPAL_CLIENT_ID });
+    assert.throws(() => testing.checkDeploySettings(), (error) => /must belong to a different PayPal app/.test(error.message) && !error.message.includes(SETTINGS.PAYPAL_CLIENT_ID));
+    testing.setSettings(SETTINGS);
+    assert.doesNotThrow(() => testing.checkDeploySettings());
+  });
+
+  it("is swept as a secret: both values and their base64 pair", () => {
+    for (const value of [SETTINGS.PAYPAL_READ_CLIENT_ID, SETTINGS.PAYPAL_READ_CLIENT_SECRET, READ_BASIC.slice("Basic ".length)]) {
+      assert.equal(testing.carriesSecret(`a line holding ${value}`), true, value);
+    }
+  });
+
+  it("passes the read keys check when mend-web holds both names and PayPal refuses the token a payout batch", async () => {
+    readPayPal();
+    const result = await testing.readKeysCheck(WEB_ENV, null);
+    assert.equal(result.passed, true, result.text);
+    assert.match(result.text, /carries 2 scopes, none for payouts, and PayPal answers 403/);
+    assert.ok(calls.some((call) => call.url.endsWith("/v1/payments/payouts/JKEUJEAFGHFUN")));
+    assert.equal(testing.carriesSecret(result.text), false);
+    assert.equal(testing.carriesSecret(`Bearer ${READ_TOKEN}`), true);
+    await testing.readKeysCheck(WEB_ENV, "RUNBATCH123");
+    assert.ok(calls.some((call) => call.url.endsWith("/v1/payments/payouts/RUNBATCH123")));
+    assert.deepEqual(writes(), []);
+  });
+
+  it("fails the read keys check on a missing name, a payouts scope, no scopes at all, or a payout batch PayPal hands over", async () => {
+    readPayPal();
+    const missing = await testing.readKeysCheck({ PAYPAL_READ_CLIENT_ID: "on-render" }, null);
+    assert.equal(missing.passed, false);
+    assert.match(missing.text, /mend-web lacks PAYPAL_READ_CLIENT_SECRET/);
+    readPayPal({ scope: "https://uri.paypal.com/services/payments/payouts openid" });
+    assert.equal((await testing.readKeysCheck(WEB_ENV, null)).passed, false);
+    readPayPal({ scope: null });
+    assert.equal((await testing.readKeysCheck(WEB_ENV, null)).passed, false);
+    readPayPal({ payoutStatus: 200 });
+    const handedOver = await testing.readKeysCheck(WEB_ENV, null);
+    assert.equal(handedOver.passed, false);
+    assert.match(handedOver.text, /answered 200, not 403/);
   });
 });

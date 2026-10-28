@@ -10,8 +10,12 @@
     "region": "virginia",
     "postgres": "18",
     "diskSizeGB": 1,
-    "schemaSha256": "f91c435a21215be076d64f1208d27c1b668d6db3c016bf348c27930ccde0e6f6",
-    "servicesConnectAs": "mend_app",
+    "schemaSha256": "c3df4e87610c89d8e0b501acc119b3c6debaf37482880031c8a8af18171df974",
+    "roles": {
+      "web": "mend_web",
+      "engine": "mend_engine",
+      "jobs": "mend_engine"
+    },
     "dashboardUrl": "https://dashboard.render.com/d/dpg-dbe3hq8m7kps73c7ap6g-a"
   },
   "services": {

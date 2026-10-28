@@ -15,8 +15,10 @@ import pgserver
 import psycopg
 import pytest
 from psycopg import sql
+from psycopg.types.json import Jsonb
 
 from mend_engine import prove_m4a, seed_demo, store_facts
+from mend_engine.campaigns.eligibility import REGULAR_MIN_DAYS, SILENT_MIN_DAYS
 from mend_engine.campaigns.eligibility import quiet_regular_members
 from mend_engine.campaigns.scoring import score_customers
 from mend_engine.config import SANDBOX_API_HOST, Config, ConfigError
@@ -44,6 +46,10 @@ UCI = {
     "deciles": [{"decile": 1, "customers": 40, "returned_share": 0.6}],
     "passed": True,
 }
+GROUP_CUTOFFS = [{"cutoff": "2026-07-17", "customers": 400, "returned": 100, "auc_model": 0.71, "auc_recency": 0.66, "difference": 0.05, "interval_low": 0.01, "interval_high": 0.09}]
+GROUP = {"confidence": store_facts.CONFIDENCE, "resamples": store_facts.RESAMPLES, "valid_cutoffs": 1, "model_wins": 1, "mean_auc_difference": 0.05, "interval_low": 0.01, "interval_high": 0.09, "cutoffs": GROUP_CUTOFFS}
+UCI["headline"] = {**GROUP, "group": store_facts.LIVE_SEGMENT, "regular_min_days": REGULAR_MIN_DAYS, "silent_min_days": SILENT_MIN_DAYS}
+UCI["all_customers"] = {**GROUP, "group": store_facts.ALL_CUSTOMERS, "regular_min_days": None, "silent_min_days": None}
 
 
 def synthetic_shop(conn: psycopg.Connection) -> None:
@@ -210,6 +216,24 @@ def test_a_second_run_changes_nothing(seeded: tuple, capsys: pytest.CaptureFixtu
         "receiver: already first",
     ):
         assert line in out
+
+
+def test_a_backtest_stored_before_the_segment_headline_is_computed_again(seeded: tuple, capsys: pytest.CaptureFixture[str]) -> None:
+    conn, config, stand = seeded
+    assert seed_demo.run(config) is True
+    old_shape = conn.execute("select value from model_facts where key = %s", (store_facts.UCI_KEY,)).fetchone()[0]
+    for key in store_facts.UCI_GROUP_KEYS:
+        old_shape.pop(key, None)
+    with conn.transaction():
+        conn.execute("update model_facts set value = %s where key = %s", (Jsonb(old_shape), store_facts.UCI_KEY))
+    capsys.readouterr()
+
+    assert seed_demo.run(config) is True
+
+    assert stand.calls == ["orders", "refunds", "cdnow", "uci", "uci"]
+    assert "facts: stored uci_backtest" in capsys.readouterr().out
+    stored = conn.execute("select value from model_facts where key = %s", (store_facts.UCI_KEY,)).fetchone()[0]
+    assert store_facts.UCI_GROUP_KEYS <= stored.keys()
 
 
 def test_moving_the_receiver_first_trades_two_order_histories_and_changes_nothing_else(seeded: tuple) -> None:

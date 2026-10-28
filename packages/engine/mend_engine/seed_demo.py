@@ -80,11 +80,17 @@ def seed_refunds(conn: psycopg.Connection) -> str:
 
 
 def seed_facts(conn: psycopg.Connection) -> str:
-    """Computes and stores only the facts that are missing, so a stored fact keeps its time."""
+    """Computes and stores only the facts that are missing or out of date, so a current fact keeps its time.
+
+    A backtest stored before the live-segment headline existed is out of date: the landing
+    page would show it without the result campaigns actually depend on.
+    """
     present = store_facts.read_facts(conn)
     stored = []
     for key, compute in FACTS:
-        if present[key] is None:
+        fact = present[key]
+        outdated = key == store_facts.UCI_KEY and fact is not None and not store_facts.UCI_GROUP_KEYS <= fact.keys()
+        if fact is None or outdated:
             store_facts.store(conn, key, getattr(store_facts, compute)())
             stored.append(key)
     return f"facts: stored {', '.join(stored)}" if stored else "facts: already stored"

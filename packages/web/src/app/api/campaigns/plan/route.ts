@@ -25,7 +25,7 @@ const BODY = z.strictObject({
 });
 
 const count = z.number().int().min(0);
-const GOAL_STATUS = z.enum(["read", "unclear", "no_key", "limit_reached", "outbound_refused", "timed_out", "declined", "busy", "unavailable", "unreadable"]);
+const GOAL_STATUS = z.enum(["read", "unclear", "no_key", "limit_reached", "claude_token_cap", "outbound_refused", "timed_out", "declined", "busy", "unavailable", "unreadable"]);
 const PLAN = z.strictObject({
   settings: z
     .strictObject({

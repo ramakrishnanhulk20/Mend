@@ -18,8 +18,7 @@
 import type { PoolClient } from "pg";
 import { database } from "./db";
 import { writeLog } from "./log";
-import { MIN_SECRET_CHARS } from "./permissions";
-import { SECRET_SETTINGS } from "./secrets";
+import { secretValues } from "./secrets";
 
 export type AuditDetail = Readonly<Record<string, string | number | boolean | null>>;
 
@@ -38,10 +37,7 @@ export class AuditRefused extends Error {
 }
 
 function holdsSecret(text: string): boolean {
-  return SECRET_SETTINGS.some((name) => {
-    const value = process.env[name];
-    return value !== undefined && value.length >= MIN_SECRET_CHARS && text.includes(value);
-  });
+  return secretValues().some((value) => text.includes(value));
 }
 
 function check(action: string, detail: AuditDetail): void {

@@ -132,8 +132,9 @@ describe("the permission table", () => {
     }
   });
 
-  it("lets demo and owner read PayPal through the assistant's MCP tools, and nobody signed out", () => {
+  it("lets demo and owner read orders and products through the assistant's PayPal tools, only the owner read the shop's disputes, and nobody signed out", () => {
     expect([isAllowed("paypal.read", "anonymous"), isAllowed("paypal.read", "demo"), isAllowed("paypal.read", "owner")]).toEqual([false, true, true]);
+    expect([isAllowed("paypal.read_disputes", "anonymous"), isAllowed("paypal.read_disputes", "demo"), isAllowed("paypal.read_disputes", "owner")]).toEqual([false, false, true]);
   });
 
   it("lets demo and owner pull back unclaimed rewards, and nobody signed out", () => {
@@ -141,9 +142,9 @@ describe("the permission table", () => {
     expect([isAllowed(action, "anonymous"), isAllowed(action, "demo"), isAllowed(action, "owner")]).toEqual([false, true, true]);
   });
 
-  it("gives the owner every action and the demo role every action but the scheduled jobs", () => {
+  it("gives the owner every action and the demo role every action but the scheduled jobs and the shop's PayPal disputes", () => {
     expect(ACTIONS.filter((action) => !isAllowed(action, "owner"))).toEqual([]);
-    expect(ACTIONS.filter((action) => !isAllowed(action, "demo"))).toEqual(["admin.events", "admin.reconcile", "admin.purge"]);
+    expect(ACTIONS.filter((action) => !isAllowed(action, "demo"))).toEqual(["admin.events", "admin.reconcile", "admin.purge", "paypal.read_disputes"]);
   });
 });
 

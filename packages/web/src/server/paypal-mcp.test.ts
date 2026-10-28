@@ -2,9 +2,14 @@
 // same SSE protocol the live probe recorded: the exact-host guard on the SSE URL and on
 // the endpoint the server names, the four-tool allowlist, strict inputs, the rebuilt
 // answers with identity dropped at every depth, PayPal's errors, the time limit, the
-// stream cap and the token request. Does NOT cover: PayPal's real answers (npm run
+// stream cap, the token request, and instructions planted in an answer coming back only
+// as the field they were planted in. Does NOT cover: PayPal's real answers (npm run
 // prove:m6 calls the live sandbox server), the agent's wiring (agent.test.ts), TLS or DNS.
+import { readFileSync } from "node:fs";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
 import { describe, expect, it, vi } from "vitest";
+import { withoutEmails } from "./claude";
 import {
   callPayPalTool,
   MAX_STREAM_BYTES,
@@ -410,6 +415,41 @@ describe("callPayPalTool", () => {
     const fetch: FetchFn = async () => new Response("unauthorized", { status: 401 });
     await expect(callPayPalTool("list_disputes", {}, { fetch, tokens: source })).rejects.toMatchObject({ reason: "paypal_error", status: 401 });
     expect(source.drop).toHaveBeenCalledWith(TOKEN);
+  });
+});
+
+type Planted = { readonly id: string; readonly tool: "get_order" | "show_product_details"; readonly text: string };
+const EVALS = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "..", "evals");
+const PLANTED = (JSON.parse(readFileSync(path.join(EVALS, "injected-notes.json"), "utf8")) as { paypal?: Planted[] }).paypal ?? [];
+
+describe("an instruction planted in a PayPal answer", () => {
+  it("is in the eval set for both kinds of free text the read tools keep", () => {
+    expect(new Set(PLANTED.map((entry) => entry.tool))).toEqual(new Set(["get_order", "show_product_details"]));
+  });
+
+  it.each(PLANTED.map((entry) => [entry.id, entry] as const))("%s comes back only as the field it was planted in, cut to length, with any address removed", async (_id, entry) => {
+    const kept = (max: number) => withoutEmails(entry.text).replace(/\s+/g, " ").trim().slice(0, max);
+    if (entry.tool === "get_order") {
+      const unit = ORDER.purchase_units[0];
+      const answer = { ...ORDER, purchase_units: [{ ...unit, items: [{ name: entry.text, quantity: "1" }, ...unit.items] }] };
+      const view = await call(fakeServer({ tool: () => ({ result: textResult(answer) }) }), "get_order", { id: ORDER_ID });
+      expect(view.purchase_units).toEqual([
+        {
+          amount: { currency_code: "USD", value: "12.50" },
+          items: [
+            { name: kept(127), quantity: "1" },
+            { name: "Red teapot", quantity: "1" },
+            { name: "Mug for [email removed]", quantity: "2" },
+          ],
+          captures: [{ id: "3C679366HH908993F", status: "COMPLETED" }],
+        },
+      ]);
+      expectNoPersonalData(view);
+    } else {
+      const view = await call(fakeServer({ tool: () => ({ result: textResult({ ...PRODUCT, description: entry.text }) }) }), "show_product_details", { product_id: PRODUCT.id });
+      expect(view).toEqual({ id: PRODUCT.id, name: "Red teapot", description: kept(256), type: "PHYSICAL", category: "HOUSEWARES" });
+      expectNoPersonalData(view);
+    }
   });
 });
 

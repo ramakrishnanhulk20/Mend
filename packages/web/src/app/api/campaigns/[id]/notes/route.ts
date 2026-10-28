@@ -23,7 +23,7 @@ const WRITTEN = z.strictObject({
   template: count,
   skipped: count,
   ai: z.enum(["used", "no_key"]),
-  stopped: z.enum(["limit_reached", "outbound_refused", "timed_out"]).nullable(),
+  stopped: z.enum(["limit_reached", "claude_token_cap", "outbound_refused", "timed_out"]).nullable(),
   notice: z.string().max(300).nullable(),
   aiCalls: count,
 });

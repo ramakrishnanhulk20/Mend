@@ -1,14 +1,28 @@
 // Covers the engine client in both modes: against a fake dev bridge on 127.0.0.1, and
 // against the engine's task server at a Render private network address with fetch
-// replaced. Does NOT cover: Render's private network itself or the real task server
-// (packages/engine test_task_server.py, and the live proof node scripts/deploy/render.mjs
-// prove), the real engine behind either (packages/engine tests, npm run prove:m7a), or
-// runs read from another process or after a restart (runs live in this process only).
+// replaced, plus the cap of 2 calls in flight per session, per client address for calls
+// with no session, and per task for calls naming neither. Does NOT cover: Render's
+// private network itself or the real task server (packages/engine test_task_server.py,
+// and the live proof node scripts/deploy/render.mjs prove), the real engine behind
+// either (packages/engine tests, npm run prove:m7a), or runs read from another process
+// or after a restart (runs live in this process only).
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import type { AddressInfo } from "node:net";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { ConfigError } from "./config";
-import { getRun, isRunId, RunNotFound, runAndWait, runTask, statusForEngineError, waitForRun, type TaskName } from "./engine";
+import {
+  getRun,
+  isRunId,
+  MAX_IN_FLIGHT,
+  RunNotFound,
+  runAndWait,
+  runSettled,
+  runTask,
+  statusForEngineError,
+  TOO_MANY_RUNNING,
+  waitForRun,
+  type TaskName,
+} from "./engine";
 
 const TOKEN = "bridge-token-for-engine-tests-0123456789";
 const FAKE_RENDER_KEY = "rnd_testkeyforengine";
@@ -182,6 +196,57 @@ describe("through the dev bridge", () => {
     expect(isRunId("brn-6f1c1d3e-2b9a-4f0e-9a51-3c1d2e4f5a6b")).toBe(true);
     expect(isRunId("trn-abc123")).toBe(false);
     expect(isRunId("brn-../../x")).toBe(false);
+  });
+
+  it("lets a session have 2 engine calls in flight and answers a third too_many_running at once, before any engine call", async () => {
+    expect(MAX_IN_FLIGHT).toBe(2);
+    bridge.delayMs = 400;
+    const actor = { role: "demo", session: "a".repeat(64) };
+    const running = [await runTask("view_campaign", ["c-1", actor]), await runTask("results", ["c-1", actor])];
+    const started = Date.now();
+    const third = await runAndWait("view_campaign", ["c-2", actor], 5_000);
+    expect(Date.now() - started).toBeLessThan(200);
+    expect(third).toMatchObject({ state: "finished", status: "succeeded", result: { ok: false, error: TOO_MANY_RUNNING, ref: expect.any(String) } });
+    expect(statusForEngineError(TOO_MANY_RUNNING)).toBe(429);
+    // Started without waiting, the refusal is a run that is already finished.
+    const asyncThird = await runTask("view_campaign", ["c-3", actor]);
+    expect(await getRun(asyncThird)).toMatchObject({ status: "succeeded", result: { ok: false, error: TOO_MANY_RUNNING } });
+    expect(await runSettled(asyncThird)).toMatchObject({ status: "succeeded", result: { error: TOO_MANY_RUNNING } });
+    // Another session is counted apart.
+    expect(await runAndWait("view_campaign", ["c-1", { role: "demo", session: "b".repeat(64) }], 5_000)).toMatchObject({ status: "succeeded" });
+    for (const runId of running) expect((await runSettled(runId)).status).toBe("succeeded");
+    expect(bridge.seen.map((call) => call.path).sort()).toEqual(["/tasks/results", "/tasks/view_campaign", "/tasks/view_campaign"]);
+    expect(logLines.join("")).toContain('"outcome":"refused_in_flight","task":"view_campaign","holder":"session"');
+    // Once a call finishes its place is free again.
+    expect(await runAndWait("view_campaign", ["c-2", actor], 5_000)).toMatchObject({ result: { ok: true } });
+  });
+
+  it("frees a place when a call fails, and never counts a repeat of an idempotency key", async () => {
+    bridge.delayMs = 300;
+    bridge.answer = { status: 500, body: "{}" };
+    const actor = { role: "owner", session: "c".repeat(64) };
+    const failing = [await runTask("submit_campaign", ["c-1", actor], { idempotencyKey: "in-flight-1" }), await runTask("submit_campaign", ["c-2", actor])];
+    expect(await runTask("submit_campaign", ["c-1", actor], { idempotencyKey: "in-flight-1" })).toBe(failing[0]);
+    for (const runId of failing) expect((await runSettled(runId)).status).toBe("failed");
+    bridge.answer = { status: 200, body: JSON.stringify({ ok: true, campaign_id: "x" }) };
+    bridge.delayMs = 0;
+    expect(await runAndWait("submit_campaign", ["c-3", actor], 5_000)).toMatchObject({ result: { ok: true } });
+  });
+
+  it("counts a call with no session against the client address it names, and one naming neither against its task", async () => {
+    bridge.delayMs = 400;
+    const first = [await runTask("consent_text", [], { address: "198.51.100.7" }), await runTask("consent_text", [], { address: "198.51.100.7" })];
+    expect(await runAndWait("consent_text", [], 5_000, { address: "198.51.100.7" })).toMatchObject({ result: { error: TOO_MANY_RUNNING } });
+    const elsewhere = await runTask("consent_text", [], { address: "198.51.100.8" });
+    const unnamed = [await runTask("purge", []), await runTask("purge", [])];
+    expect(await runAndWait("purge", [], 5_000)).toMatchObject({ result: { error: TOO_MANY_RUNNING } });
+    const otherTask = await runTask("reconcile", []);
+    for (const runId of [...first, elsewhere, ...unnamed, otherTask]) expect((await runSettled(runId)).status).toBe("succeeded");
+    expect(bridge.seen).toHaveLength(6);
+  });
+
+  it("does not know a run it never issued when asked to wait for it to settle", async () => {
+    await expect(runSettled("brn-6f1c1d3e-2b9a-4f0e-9a51-3c1d2e4f5a6b")).rejects.toThrow(RunNotFound);
   });
 });
 

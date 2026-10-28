@@ -96,6 +96,7 @@ function headersFor(body: string, overrides: Partial<SignedHeaders> = {}, webhoo
 }
 
 const BODY = '{"id":"WH-1","event_type":"PAYMENT.PAYOUTS-ITEM.SUCCEEDED"}';
+const BYTES = Buffer.from(BODY, "utf8");
 
 beforeEach(() => {
   net.served = new Map();
@@ -168,25 +169,33 @@ describe("the certificate address", () => {
 describe("the signed text", () => {
   it("is transmission id, time and our webhook id with the CRC-32 of the raw body as an unsigned decimal", () => {
     const headers = { ...headersFor("a"), transmission_id: "T1", transmission_time: "2026-10-26T12:00:00Z" };
-    expect(signedText(headers, "a", "WH9")).toBe("T1|2026-10-26T12:00:00Z|WH9|3904355907");
-    expect(signedText(headers, "hello", "WH9")).toBe("T1|2026-10-26T12:00:00Z|WH9|907060870");
+    expect(signedText(headers, Buffer.from("a"), "WH9")).toBe("T1|2026-10-26T12:00:00Z|WH9|3904355907");
+    expect(signedText(headers, Buffer.from("hello"), "WH9")).toBe("T1|2026-10-26T12:00:00Z|WH9|907060870");
+  });
+
+  it("takes the CRC-32 over the bytes exactly as given, a byte-order mark or a byte that is not UTF-8 included", () => {
+    const headers = { ...headersFor("a"), transmission_id: "T1", transmission_time: "2026-10-26T12:00:00Z" };
+    const marked = Buffer.from([0xef, 0xbb, 0xbf, 0x61]);
+    expect(signedText(headers, marked, "WH9")).toBe(`T1|2026-10-26T12:00:00Z|WH9|${crc32(marked)}`);
+    expect(signedText(headers, marked, "WH9")).not.toBe(signedText(headers, Buffer.from("a"), "WH9"));
+    expect(signedText(headers, Buffer.from([0xff]), "WH9")).toBe(`T1|2026-10-26T12:00:00Z|WH9|${crc32(Buffer.from([0xff]))}`);
   });
 });
 
 describe("check", () => {
   it("passes a genuine delivery with one certificate download, redirects refused and a timeout set", async () => {
     serve(CERT_URL, chain.leaf);
-    expect(await checker().check(headersFor(BODY), BODY, WEBHOOK_ID, SENDER)).toEqual({ ok: true });
+    expect(await checker().check(headersFor(BODY), BYTES, WEBHOOK_ID, SENDER)).toEqual({ ok: true });
     expect(net.requests.map((request) => request.url)).toEqual([CERT_URL]);
     expect(net.requests[0].init.redirect).toBe("error");
     expect(net.requests[0].init.signal).toBeInstanceOf(AbortSignal);
   });
 
   it.each([
-    ["an altered body", (headers: SignedHeaders) => ({ headers, body: `${BODY} ` })],
-    ["another transmission time", (headers: SignedHeaders) => ({ headers: { ...headers, transmission_time: "2026-10-26T12:00:01Z" }, body: BODY })],
-    ["another transmission id", (headers: SignedHeaders) => ({ headers: { ...headers, transmission_id: "another-id" }, body: BODY })],
-    ["a signature that is not base64 of anything signed", (headers: SignedHeaders) => ({ headers: { ...headers, transmission_sig: "AAAA" }, body: BODY })],
+    ["an altered body", (headers: SignedHeaders) => ({ headers, body: Buffer.from(`${BODY} `, "utf8") })],
+    ["another transmission time", (headers: SignedHeaders) => ({ headers: { ...headers, transmission_time: "2026-10-26T12:00:01Z" }, body: BYTES })],
+    ["another transmission id", (headers: SignedHeaders) => ({ headers: { ...headers, transmission_id: "another-id" }, body: BYTES })],
+    ["a signature that is not base64 of anything signed", (headers: SignedHeaders) => ({ headers: { ...headers, transmission_sig: "AAAA" }, body: BYTES })],
   ])("refuses %s as a bad signature", async (_label, change) => {
     serve(CERT_URL, chain.leaf);
     const { headers, body } = change(headersFor(BODY));
@@ -195,13 +204,13 @@ describe("check", () => {
 
   it("refuses a delivery signed over any webhook id but ours", async () => {
     serve(CERT_URL, chain.leaf);
-    expect(await checker().check(headersFor(BODY, {}, "ATTACKERWEBHOOK"), BODY, WEBHOOK_ID, SENDER)).toEqual({ ok: false, problem: "signature" });
+    expect(await checker().check(headersFor(BODY, {}, "ATTACKERWEBHOOK"), BYTES, WEBHOOK_ID, SENDER)).toEqual({ ok: false, problem: "signature" });
   });
 
   it("refuses another algorithm or a certificate address off PayPal's path without any download", async () => {
     serve(CERT_URL, chain.leaf);
-    expect(await checker().check(headersFor(BODY, { auth_algo: "SHA1withRSA" }), BODY, WEBHOOK_ID, SENDER)).toEqual({ ok: false, problem: "auth_algo" });
-    expect(await checker().check(headersFor(BODY, { cert_url: "https://evil.example/cert.pem" }), BODY, WEBHOOK_ID, SENDER)).toEqual({ ok: false, problem: "cert_url" });
+    expect(await checker().check(headersFor(BODY, { auth_algo: "SHA1withRSA" }), BYTES, WEBHOOK_ID, SENDER)).toEqual({ ok: false, problem: "auth_algo" });
+    expect(await checker().check(headersFor(BODY, { cert_url: "https://evil.example/cert.pem" }), BYTES, WEBHOOK_ID, SENDER)).toEqual({ ok: false, problem: "cert_url" });
     expect(net.requests).toEqual([]);
   });
 
@@ -209,9 +218,9 @@ describe("check", () => {
     const { kept, certificates } = memory([CERT_URL]);
     serve(CERT_URL, chain.leaf);
     const signatures = checker({ certificates });
-    expect(await signatures.check(headersFor(BODY), BODY, WEBHOOK_ID, SENDER)).toEqual({ ok: true });
+    expect(await signatures.check(headersFor(BODY), BYTES, WEBHOOK_ID, SENDER)).toEqual({ ok: true });
     for (const cert_url of [`${CERT_URL}?n=1`, `${CERT_URL}#n`]) {
-      expect(await signatures.check(headersFor(BODY, { cert_url }), BODY, WEBHOOK_ID, SENDER)).toEqual({ ok: false, problem: "cert_url" });
+      expect(await signatures.check(headersFor(BODY, { cert_url }), BYTES, WEBHOOK_ID, SENDER)).toEqual({ ok: false, problem: "cert_url" });
     }
     expect(net.requests.map((request) => request.url)).toEqual([CERT_URL]);
     expect(kept.recalls).toBe(1);
@@ -221,7 +230,7 @@ describe("check", () => {
 describe("the chain", () => {
   async function verdictFor(served: Issued[], options: SignatureOptions = {}) {
     serve(CERT_URL, ...served);
-    return checker(options).check(headersFor(BODY), BODY, WEBHOOK_ID, SENDER);
+    return checker(options).check(headersFor(BODY), BYTES, WEBHOOK_ID, SENDER);
   }
 
   it("passes when the served PEM carries the intermediate itself, each certificate signed by the next", async () => {
@@ -274,7 +283,7 @@ describe("the chain", () => {
 
   it("refuses a served body that is not only PEM certificates", async () => {
     net.served.set(CERT_URL, () => new Response(`${chain.leaf.pem}\nsomething else\n`));
-    expect(await checker().check(headersFor(BODY), BODY, WEBHOOK_ID, SENDER)).toEqual({ ok: false, problem: "cert_chain" });
+    expect(await checker().check(headersFor(BODY), BYTES, WEBHOOK_ID, SENDER)).toEqual({ ok: false, problem: "cert_chain" });
   });
 
   it("adds at most two issuers to the served PEM", async () => {
@@ -298,28 +307,28 @@ describe("filling an issuer from DigiCert's CA Issuers address", () => {
     serve(CERT_URL, leaf);
     serve(`${CERT_URL}-again`, leaf);
     serve(`${CERT_URL}-later`, leaf);
-    expect(await signatures.check(headersFor(BODY), BODY, WEBHOOK_ID, SENDER)).toEqual({ ok: true });
+    expect(await signatures.check(headersFor(BODY), BYTES, WEBHOOK_ID, SENDER)).toEqual({ ok: true });
     // Another sender: the first delivery spent SENDER's share of 2 on the leaf and its issuer.
-    expect(await signatures.check(headersFor(BODY, { cert_url: `${CERT_URL}-again` }), BODY, WEBHOOK_ID, sender(1))).toEqual({ ok: true });
+    expect(await signatures.check(headersFor(BODY, { cert_url: `${CERT_URL}-again` }), BYTES, WEBHOOK_ID, sender(1))).toEqual({ ok: true });
     expect(net.requests.filter((request) => request.url === ISSUER_URL)).toHaveLength(1);
     expect(net.requests.find((request) => request.url === ISSUER_URL)?.init.redirect).toBe("error");
     now += 24 * 60 * 60 * 1000;
-    expect(await signatures.check(headersFor(BODY, { cert_url: `${CERT_URL}-later` }), BODY, WEBHOOK_ID, SENDER)).toEqual({ ok: true });
+    expect(await signatures.check(headersFor(BODY, { cert_url: `${CERT_URL}-later` }), BYTES, WEBHOOK_ID, SENDER)).toEqual({ ok: true });
     expect(net.requests.filter((request) => request.url === ISSUER_URL)).toHaveLength(2);
   });
 
   it("takes it as PEM too", async () => {
     net.served.set(ISSUER_URL, () => new Response(chain.intermediate.pem));
     serve(CERT_URL, chain.leafWithIssuerUrl(ISSUER_URL));
-    expect(await checker({ intermediates: [] }).check(headersFor(BODY), BODY, WEBHOOK_ID, SENDER)).toEqual({ ok: true });
+    expect(await checker({ intermediates: [] }).check(headersFor(BODY), BYTES, WEBHOOK_ID, SENDER)).toEqual({ ok: true });
   });
 
   it("refuses an issuer over 16 KB, or one DigiCert's host does not serve", async () => {
     net.served.set(ISSUER_URL, () => new Response(new Uint8Array(Buffer.concat([chain.intermediate.der, Buffer.alloc(MAX_ISSUER_BYTES)]))));
     serve(CERT_URL, chain.leafWithIssuerUrl(ISSUER_URL));
-    expect(await checker({ intermediates: [] }).check(headersFor(BODY), BODY, WEBHOOK_ID, SENDER)).toEqual({ ok: false, problem: "cert_chain" });
+    expect(await checker({ intermediates: [] }).check(headersFor(BODY), BYTES, WEBHOOK_ID, SENDER)).toEqual({ ok: false, problem: "cert_chain" });
     net.served.delete(ISSUER_URL);
-    expect(await checker({ intermediates: [] }).check(headersFor(BODY), BODY, WEBHOOK_ID, SENDER)).toEqual({ ok: false, problem: "cert_chain" });
+    expect(await checker({ intermediates: [] }).check(headersFor(BODY), BYTES, WEBHOOK_ID, SENDER)).toEqual({ ok: false, problem: "cert_chain" });
   });
 
   it("keeps a downloaded issuer only once it has checked that the issuer signs the certificate below it", async () => {
@@ -328,15 +337,15 @@ describe("filling an issuer from DigiCert's CA Issuers address", () => {
     serve(`${CERT_URL}-again`, leaf);
     const signatures = checker({ intermediates: [] });
     net.served.set(ISSUER_URL, () => new Response(new Uint8Array(chain.stranger.der)));
-    expect(await signatures.check(headersFor(BODY), BODY, WEBHOOK_ID, SENDER)).toEqual({ ok: false, problem: "cert_chain" });
+    expect(await signatures.check(headersFor(BODY), BYTES, WEBHOOK_ID, SENDER)).toEqual({ ok: false, problem: "cert_chain" });
     net.served.set(ISSUER_URL, () => new Response(new Uint8Array(chain.intermediate.der)));
-    expect(await signatures.check(headersFor(BODY, { cert_url: `${CERT_URL}-again` }), BODY, WEBHOOK_ID, sender(1))).toEqual({ ok: true });
+    expect(await signatures.check(headersFor(BODY, { cert_url: `${CERT_URL}-again` }), BYTES, WEBHOOK_ID, sender(1))).toEqual({ ok: true });
     expect(net.requests.filter((request) => request.url === ISSUER_URL)).toHaveLength(2);
   });
 
   it("does not download what the bundle already holds", async () => {
     serve(CERT_URL, chain.leafWithIssuerUrl(ISSUER_URL));
-    expect(await checker().check(headersFor(BODY), BODY, WEBHOOK_ID, SENDER)).toEqual({ ok: true });
+    expect(await checker().check(headersFor(BODY), BYTES, WEBHOOK_ID, SENDER)).toEqual({ ok: true });
     expect(net.requests.map((request) => request.url)).toEqual([CERT_URL]);
   });
 });
@@ -348,7 +357,7 @@ describe("downloading the certificate", () => {
     ["a redirect, which fetch refuses", () => Promise.reject(new TypeError("fetch failed: redirect mode is set to error"))],
   ])("refuses %s", async (_label, answer) => {
     net.served.set(CERT_URL, answer);
-    expect(await checker().check(headersFor(BODY), BODY, WEBHOOK_ID, SENDER)).toEqual({ ok: false, problem: "cert_fetch" });
+    expect(await checker().check(headersFor(BODY), BYTES, WEBHOOK_ID, SENDER)).toEqual({ ok: false, problem: "cert_fetch" });
   });
 
   it("stops reading a body with no length once it passes 64 KB", async () => {
@@ -362,7 +371,7 @@ describe("downloading the certificate", () => {
       }, { highWaterMark: 0 });
       return new Response(stream);
     });
-    expect(await checker().check(headersFor(BODY), BODY, WEBHOOK_ID, SENDER)).toEqual({ ok: false, problem: "cert_fetch" });
+    expect(await checker().check(headersFor(BODY), BYTES, WEBHOOK_ID, SENDER)).toEqual({ ok: false, problem: "cert_fetch" });
     expect(given).toBeLessThanOrEqual(MAX_CERT_BYTES + 16 * 1024);
   });
 
@@ -371,7 +380,7 @@ describe("downloading the certificate", () => {
       new Promise<Response>((_resolve, reject) => init.signal?.addEventListener("abort", () => reject(init.signal?.reason))),
     );
     vi.stubGlobal("fetch", slow);
-    expect(await checker({ fetchTimeoutMs: 50 }).check(headersFor(BODY), BODY, WEBHOOK_ID, SENDER)).toEqual({ ok: false, problem: "cert_fetch" });
+    expect(await checker({ fetchTimeoutMs: 50 }).check(headersFor(BODY), BYTES, WEBHOOK_ID, SENDER)).toEqual({ ok: false, problem: "cert_fetch" });
     expect(slow).toHaveBeenCalledTimes(1);
   });
 });
@@ -380,9 +389,9 @@ describe("the caches", () => {
   it("download a certificate once for many deliveries, even at the same moment", async () => {
     const signatures = checker();
     serve(CERT_URL, chain.leaf);
-    const verdicts = await Promise.all(Array.from({ length: 5 }, () => signatures.check(headersFor(BODY), BODY, WEBHOOK_ID, SENDER)));
+    const verdicts = await Promise.all(Array.from({ length: 5 }, () => signatures.check(headersFor(BODY), BYTES, WEBHOOK_ID, SENDER)));
     expect(verdicts.every((verdict) => verdict.ok)).toBe(true);
-    expect(await signatures.check(headersFor(BODY), BODY, WEBHOOK_ID, SENDER)).toEqual({ ok: true });
+    expect(await signatures.check(headersFor(BODY), BYTES, WEBHOOK_ID, SENDER)).toEqual({ ok: true });
     expect(net.requests).toHaveLength(1);
   });
 
@@ -392,14 +401,14 @@ describe("the caches", () => {
     const urls = Array.from({ length: 21 }, (_unused, index) => `${CERT_URL}-${index}`);
     for (const [index, url] of urls.entries()) {
       serve(url, chain.leaf);
-      expect(await signatures.check(headersFor(BODY, { cert_url: url }), BODY, WEBHOOK_ID, sender(index))).toEqual({ ok: true });
+      expect(await signatures.check(headersFor(BODY, { cert_url: url }), BYTES, WEBHOOK_ID, sender(index))).toEqual({ ok: true });
       // Spaced so the downloads stay inside the 10 a minute budget.
       now += 7_000;
     }
     expect(net.requests).toHaveLength(21);
-    await signatures.check(headersFor(BODY, { cert_url: urls[20] }), BODY, WEBHOOK_ID, SENDER);
+    await signatures.check(headersFor(BODY, { cert_url: urls[20] }), BYTES, WEBHOOK_ID, SENDER);
     expect(net.requests).toHaveLength(21);
-    await signatures.check(headersFor(BODY, { cert_url: urls[0] }), BODY, WEBHOOK_ID, SENDER);
+    await signatures.check(headersFor(BODY, { cert_url: urls[0] }), BYTES, WEBHOOK_ID, SENDER);
     expect(net.requests).toHaveLength(22);
   });
 
@@ -407,11 +416,11 @@ describe("the caches", () => {
     let now = Date.UTC(2026, 9, 26);
     const signatures = checker({ now: () => now });
     net.served.set(CERT_URL, () => new Response("down", { status: 503 }));
-    for (let n = 0; n < 3; n += 1) expect(await signatures.check(headersFor(BODY), BODY, WEBHOOK_ID, SENDER)).toEqual({ ok: false, problem: "cert_fetch" });
+    for (let n = 0; n < 3; n += 1) expect(await signatures.check(headersFor(BODY), BYTES, WEBHOOK_ID, SENDER)).toEqual({ ok: false, problem: "cert_fetch" });
     expect(net.requests).toHaveLength(1);
     now += 10 * 60 * 1000;
     serve(CERT_URL, chain.leaf);
-    expect(await signatures.check(headersFor(BODY), BODY, WEBHOOK_ID, SENDER)).toEqual({ ok: true });
+    expect(await signatures.check(headersFor(BODY), BYTES, WEBHOOK_ID, SENDER)).toEqual({ ok: true });
     expect(net.requests).toHaveLength(2);
   });
 
@@ -421,12 +430,12 @@ describe("the caches", () => {
     const threeDays = issue({ commonName: chain.leaf.commonName, keys: chain.leafKeys, issuer: chain.intermediate, ca: false, notAfter: new Date(start + 3 * 24 * 60 * 60 * 1000) });
     const signatures = checker({ now: () => now });
     serve(CERT_URL, threeDays);
-    expect(await signatures.check(headersFor(BODY), BODY, WEBHOOK_ID, SENDER)).toEqual({ ok: true });
+    expect(await signatures.check(headersFor(BODY), BYTES, WEBHOOK_ID, SENDER)).toEqual({ ok: true });
     now += 25 * 60 * 60 * 1000;
-    expect(await signatures.check(headersFor(BODY), BODY, WEBHOOK_ID, SENDER)).toEqual({ ok: true });
+    expect(await signatures.check(headersFor(BODY), BYTES, WEBHOOK_ID, SENDER)).toEqual({ ok: true });
     expect(net.requests).toHaveLength(1);
     now = start + 3 * 24 * 60 * 60 * 1000 + 1_000;
-    expect(await signatures.check(headersFor(BODY), BODY, WEBHOOK_ID, SENDER)).toEqual({ ok: false, problem: "cert_chain" });
+    expect(await signatures.check(headersFor(BODY), BYTES, WEBHOOK_ID, SENDER)).toEqual({ ok: false, problem: "cert_chain" });
   });
 });
 
@@ -437,15 +446,15 @@ describe("the download budget", () => {
     const urls = Array.from({ length: 11 }, (_unused, index) => `${CERT_URL}-budget-${index}`);
     for (const url of urls) serve(url, chain.leaf);
     for (const [index, url] of urls.slice(0, 10).entries()) {
-      expect(await signatures.check(headersFor(BODY, { cert_url: url }), BODY, WEBHOOK_ID, sender(index))).toEqual({ ok: true });
+      expect(await signatures.check(headersFor(BODY, { cert_url: url }), BYTES, WEBHOOK_ID, sender(index))).toEqual({ ok: true });
     }
-    expect(await signatures.check(headersFor(BODY, { cert_url: urls[10] }), BODY, WEBHOOK_ID, sender(10))).toEqual({ ok: false, problem: "certificate_budget" });
+    expect(await signatures.check(headersFor(BODY, { cert_url: urls[10] }), BYTES, WEBHOOK_ID, sender(10))).toEqual({ ok: false, problem: "certificate_budget" });
     expect(net.requests.map((request) => request.url)).toEqual(urls.slice(0, 10));
-    expect(await signatures.check(headersFor(BODY, { cert_url: urls[3] }), BODY, WEBHOOK_ID, sender(10))).toEqual({ ok: true });
+    expect(await signatures.check(headersFor(BODY, { cert_url: urls[3] }), BYTES, WEBHOOK_ID, sender(10))).toEqual({ ok: true });
     expect(net.requests).toHaveLength(10);
     // The refusal was not remembered as a failed address: a minute on, it downloads and passes.
     now += 60_000;
-    expect(await signatures.check(headersFor(BODY, { cert_url: urls[10] }), BODY, WEBHOOK_ID, sender(10))).toEqual({ ok: true });
+    expect(await signatures.check(headersFor(BODY, { cert_url: urls[10] }), BYTES, WEBHOOK_ID, sender(10))).toEqual({ ok: true });
     expect(net.requests).toHaveLength(11);
   });
 
@@ -455,13 +464,13 @@ describe("the download budget", () => {
     const urls = Array.from({ length: 4 }, (_unused, index) => `${CERT_URL}-share-${index}`);
     for (const url of urls) serve(url, chain.leaf);
     for (const url of urls.slice(0, 2)) {
-      expect(await signatures.check(headersFor(BODY, { cert_url: url }), BODY, WEBHOOK_ID, "203.0.113.9")).toEqual({ ok: true });
+      expect(await signatures.check(headersFor(BODY, { cert_url: url }), BYTES, WEBHOOK_ID, "203.0.113.9")).toEqual({ ok: true });
     }
-    expect(await signatures.check(headersFor(BODY, { cert_url: urls[2] }), BODY, WEBHOOK_ID, "203.0.113.9")).toEqual({ ok: false, problem: "certificate_budget" });
+    expect(await signatures.check(headersFor(BODY, { cert_url: urls[2] }), BYTES, WEBHOOK_ID, "203.0.113.9")).toEqual({ ok: false, problem: "certificate_budget" });
     expect(net.requests.map((request) => request.url)).toEqual(urls.slice(0, 2));
-    expect(await signatures.check(headersFor(BODY, { cert_url: urls[3] }), BODY, WEBHOOK_ID, SENDER)).toEqual({ ok: true });
+    expect(await signatures.check(headersFor(BODY, { cert_url: urls[3] }), BYTES, WEBHOOK_ID, SENDER)).toEqual({ ok: true });
     now += 60_000;
-    expect(await signatures.check(headersFor(BODY, { cert_url: urls[2] }), BODY, WEBHOOK_ID, "203.0.113.9")).toEqual({ ok: true });
+    expect(await signatures.check(headersFor(BODY, { cert_url: urls[2] }), BYTES, WEBHOOK_ID, "203.0.113.9")).toEqual({ ok: true });
     expect(net.requests).toHaveLength(4);
   });
 
@@ -470,8 +479,8 @@ describe("the download budget", () => {
     net.served.set(ISSUER_URL, () => new Response(new Uint8Array(chain.intermediate.der)));
     serve(CERT_URL, chain.leafWithIssuerUrl(ISSUER_URL));
     serve(`${CERT_URL}-next`, chain.leaf);
-    expect(await signatures.check(headersFor(BODY), BODY, WEBHOOK_ID, "203.0.113.9")).toEqual({ ok: true });
-    expect(await signatures.check(headersFor(BODY, { cert_url: `${CERT_URL}-next` }), BODY, WEBHOOK_ID, "203.0.113.9")).toEqual({ ok: false, problem: "certificate_budget" });
+    expect(await signatures.check(headersFor(BODY), BYTES, WEBHOOK_ID, "203.0.113.9")).toEqual({ ok: true });
+    expect(await signatures.check(headersFor(BODY, { cert_url: `${CERT_URL}-next` }), BYTES, WEBHOOK_ID, "203.0.113.9")).toEqual({ ok: false, problem: "certificate_budget" });
     expect(net.requests.map((request) => request.url)).toEqual([CERT_URL, ISSUER_URL]);
   });
 
@@ -483,7 +492,7 @@ describe("the download budget", () => {
     const signatures = checker({ now: () => now });
     serve(CERT_URL, chain.leaf);
     const first = firstSignature === "genuine" ? headersFor(BODY) : { ...headersFor(BODY), transmission_sig: Buffer.alloc(256, 1).toString("base64") };
-    expect((await signatures.check(first, BODY, WEBHOOK_ID, SENDER)).ok).toBe(firstSignature === "genuine");
+    expect((await signatures.check(first, BYTES, WEBHOOK_ID, SENDER)).ok).toBe(firstSignature === "genuine");
     for (let index = 0; index < 20; index += 1) {
       now += 7_000;
       serve(`${CERT_URL}-newer-${index}`, chain.leaf);
@@ -491,11 +500,11 @@ describe("the download budget", () => {
     }
     now += 60_000;
     for (let index = 0; index < 10; index += 1) {
-      expect(await signatures.check(headersFor(BODY, { cert_url: `${CERT_URL}-forged-${index}` }), BODY, WEBHOOK_ID, sender(100 + index))).toEqual({ ok: false, problem: "cert_fetch" });
+      expect(await signatures.check(headersFor(BODY, { cert_url: `${CERT_URL}-forged-${index}` }), BYTES, WEBHOOK_ID, sender(100 + index))).toEqual({ ok: false, problem: "cert_fetch" });
     }
-    expect(await signatures.check(headersFor(BODY, { cert_url: `${CERT_URL}-forged-10` }), BODY, WEBHOOK_ID, sender(110))).toEqual({ ok: false, problem: "certificate_budget" });
+    expect(await signatures.check(headersFor(BODY, { cert_url: `${CERT_URL}-forged-10` }), BYTES, WEBHOOK_ID, sender(110))).toEqual({ ok: false, problem: "certificate_budget" });
     const before = net.requests.length;
-    const verdict = await signatures.check(headersFor(BODY), BODY, WEBHOOK_ID, SENDER);
+    const verdict = await signatures.check(headersFor(BODY), BYTES, WEBHOOK_ID, SENDER);
     return { verdict, fetched: net.requests.slice(before).map((request) => request.url) };
   }
 
@@ -511,19 +520,19 @@ describe("the download budget", () => {
     const { kept, certificates } = memory();
     net.served.set(ISSUER_URL, () => new Response(new Uint8Array(chain.intermediate.der)));
     serve(CERT_URL, chain.leafWithIssuerUrl(ISSUER_URL));
-    expect(await checker({ intermediates: [], certificates }).check(headersFor(BODY), BODY, WEBHOOK_ID, SENDER)).toEqual({ ok: true });
+    expect(await checker({ intermediates: [], certificates }).check(headersFor(BODY), BYTES, WEBHOOK_ID, SENDER)).toEqual({ ok: true });
     expect(kept.urls).toEqual([CERT_URL]);
     // The restart: a fresh checker, nothing in memory, the same record.
     const restarted = checker({ intermediates: [], certificates });
     for (let index = 0; index < 2; index += 1) {
-      expect(await restarted.check(headersFor(BODY, { cert_url: `${CERT_URL}-gone-${index}` }), BODY, WEBHOOK_ID, SENDER)).toEqual({ ok: false, problem: "cert_fetch" });
+      expect(await restarted.check(headersFor(BODY, { cert_url: `${CERT_URL}-gone-${index}` }), BYTES, WEBHOOK_ID, SENDER)).toEqual({ ok: false, problem: "cert_fetch" });
     }
     for (let index = 0; index < 8; index += 1) {
-      expect(await restarted.check(headersFor(BODY, { cert_url: `${CERT_URL}-other-${index}` }), BODY, WEBHOOK_ID, sender(index))).toEqual({ ok: false, problem: "cert_fetch" });
+      expect(await restarted.check(headersFor(BODY, { cert_url: `${CERT_URL}-other-${index}` }), BYTES, WEBHOOK_ID, sender(index))).toEqual({ ok: false, problem: "cert_fetch" });
     }
-    expect(await restarted.check(headersFor(BODY, { cert_url: `${CERT_URL}-other-8` }), BODY, WEBHOOK_ID, sender(8))).toEqual({ ok: false, problem: "certificate_budget" });
+    expect(await restarted.check(headersFor(BODY, { cert_url: `${CERT_URL}-other-8` }), BYTES, WEBHOOK_ID, sender(8))).toEqual({ ok: false, problem: "certificate_budget" });
     const before = net.requests.length;
-    expect(await restarted.check(headersFor(BODY), BODY, WEBHOOK_ID, SENDER)).toEqual({ ok: true });
+    expect(await restarted.check(headersFor(BODY), BYTES, WEBHOOK_ID, SENDER)).toEqual({ ok: true });
     expect(net.requests.slice(before).map((request) => request.url)).toEqual([CERT_URL, ISSUER_URL]);
     expect(kept.recalls).toBe(2);
   });
@@ -532,22 +541,22 @@ describe("the download budget", () => {
     const { certificates } = memory(["https://API.Sandbox.PayPal.com:443/v1/notifications/certs/CERT-test-0001", `${CERT_URL}-x?n=1`]);
     const signatures = checker({ certificates });
     for (let index = 0; index < 10; index += 1) {
-      expect(await signatures.check(headersFor(BODY, { cert_url: `${CERT_URL}-other-${index}` }), BODY, WEBHOOK_ID, sender(index))).toEqual({ ok: false, problem: "cert_fetch" });
+      expect(await signatures.check(headersFor(BODY, { cert_url: `${CERT_URL}-other-${index}` }), BYTES, WEBHOOK_ID, sender(index))).toEqual({ ok: false, problem: "cert_fetch" });
     }
     serve(CERT_URL, chain.leaf);
-    expect(await signatures.check(headersFor(BODY), BODY, WEBHOOK_ID, SENDER)).toEqual({ ok: true });
+    expect(await signatures.check(headersFor(BODY), BYTES, WEBHOOK_ID, SENDER)).toEqual({ ok: true });
     serve(`${CERT_URL}-x`, chain.leaf);
-    expect(await signatures.check(headersFor(BODY, { cert_url: `${CERT_URL}-x` }), BODY, WEBHOOK_ID, sender(20))).toEqual({ ok: false, problem: "certificate_budget" });
+    expect(await signatures.check(headersFor(BODY, { cert_url: `${CERT_URL}-x` }), BYTES, WEBHOOK_ID, sender(20))).toEqual({ ok: false, problem: "certificate_budget" });
   });
 
   it("counts a failed address's download, but not the answers its cache gives afterwards", async () => {
     const signatures = checker({ now: () => Date.UTC(2026, 9, 26) });
     net.served.set(CERT_URL, () => new Response("down", { status: 503 }));
-    for (let n = 0; n < 20; n += 1) expect(await signatures.check(headersFor(BODY), BODY, WEBHOOK_ID, SENDER)).toEqual({ ok: false, problem: "cert_fetch" });
+    for (let n = 0; n < 20; n += 1) expect(await signatures.check(headersFor(BODY), BYTES, WEBHOOK_ID, SENDER)).toEqual({ ok: false, problem: "cert_fetch" });
     const urls = Array.from({ length: 10 }, (_unused, index) => `${CERT_URL}-after-${index}`);
     for (const url of urls) serve(url, chain.leaf);
-    for (const [index, url] of urls.slice(0, 9).entries()) expect((await signatures.check(headersFor(BODY, { cert_url: url }), BODY, WEBHOOK_ID, sender(index))).ok).toBe(true);
-    expect(await signatures.check(headersFor(BODY, { cert_url: urls[9] }), BODY, WEBHOOK_ID, sender(9))).toEqual({ ok: false, problem: "certificate_budget" });
+    for (const [index, url] of urls.slice(0, 9).entries()) expect((await signatures.check(headersFor(BODY, { cert_url: url }), BYTES, WEBHOOK_ID, sender(index))).ok).toBe(true);
+    expect(await signatures.check(headersFor(BODY, { cert_url: urls[9] }), BYTES, WEBHOOK_ID, sender(9))).toEqual({ ok: false, problem: "certificate_budget" });
     expect(net.requests).toHaveLength(10);
   });
 
@@ -556,11 +565,11 @@ describe("the download budget", () => {
     // Nine downloads of a leaf this checker cannot chain (no bundle, no CA Issuers address).
     const urls = Array.from({ length: 9 }, (_unused, index) => `${CERT_URL}-plain-${index}`);
     for (const url of urls) serve(url, chain.leaf);
-    for (const [index, url] of urls.entries()) expect(await signatures.check(headersFor(BODY, { cert_url: url }), BODY, WEBHOOK_ID, sender(index))).toEqual({ ok: false, problem: "cert_chain" });
+    for (const [index, url] of urls.entries()) expect(await signatures.check(headersFor(BODY, { cert_url: url }), BYTES, WEBHOOK_ID, sender(index))).toEqual({ ok: false, problem: "cert_chain" });
     // The tenth fetches the leaf; its issuer would be the eleventh, so it is refused unfetched.
     net.served.set(ISSUER_URL, () => new Response(new Uint8Array(chain.intermediate.der)));
     serve(CERT_URL, chain.leafWithIssuerUrl(ISSUER_URL));
-    expect(await signatures.check(headersFor(BODY), BODY, WEBHOOK_ID, SENDER)).toEqual({ ok: false, problem: "certificate_budget" });
+    expect(await signatures.check(headersFor(BODY), BYTES, WEBHOOK_ID, SENDER)).toEqual({ ok: false, problem: "certificate_budget" });
     expect(net.requests.map((request) => request.url)).toEqual([...urls, CERT_URL]);
   });
 });
@@ -582,7 +591,7 @@ describe("PayPal's real sandbox certificate", () => {
   it("reaches the signature check, and fails only there, for a delivery we cannot sign", async () => {
     served();
     const headers = { ...headersFor(BODY), cert_url: LIVE_CERT_URL };
-    expect(await realChecker(INSIDE_LIVE_LEAF).check(headers, BODY, WEBHOOK_ID, SENDER)).toEqual({ ok: false, problem: "signature" });
+    expect(await realChecker(INSIDE_LIVE_LEAF).check(headers, BYTES, WEBHOOK_ID, SENDER)).toEqual({ ok: false, problem: "signature" });
   });
 
   it("is refused after its end date, and refused when Node's roots are not the anchors", async () => {

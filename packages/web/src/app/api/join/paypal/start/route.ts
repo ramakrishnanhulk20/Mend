@@ -1,10 +1,11 @@
 import { randomUUID, timingSafeEqual } from "node:crypto";
+import { joinLimits } from "@/server/address-limits";
 import { csrfBinding, csrfSecret, csrfTokenFor, csrfTokenForRequest, originProblem } from "@/server/csrf";
-import { EngineUnavailable, runAndWait } from "@/server/engine";
+import { EngineUnavailable, runAndWait, TOO_MANY_RUNNING } from "@/server/engine";
 import { writeLog } from "@/server/log";
 import { connectUrl, issueTicket, SANDBOX_WEB_HOST, type JoinIntent } from "@/server/paypal-login";
 import { failed, refuse } from "@/server/permissions";
-import { clientAddress, LIMITS, takeHit } from "@/server/ratelimit";
+import { clientAddress, recordMemoryRefusal } from "@/server/ratelimit";
 import { successBody } from "@/server/runs";
 
 export const runtime = "nodejs";
@@ -68,13 +69,16 @@ function confirmationPage(intent: JoinIntent, shopName: string, text: string, ha
 type Shown = { readonly shopName: string; readonly text: string; readonly hash: string };
 
 /** The consent words the engine shows now, or the refusal to send when it cannot say. */
-async function currentConsent(route: string, ref: string): Promise<{ readonly shown: Shown } | { readonly refusal: Response }> {
-  const waited = await runAndWait("consent_text", [], WAIT_MS);
+async function currentConsent(request: Request, route: string, ref: string): Promise<{ readonly shown: Shown } | { readonly refusal: Response }> {
+  const waited = await runAndWait("consent_text", [], WAIT_MS, { address: clientAddress(request.headers) });
   if (waited.state === "pending") {
     return { refusal: refuse(route, ref, 503, "engine_unavailable", { reason: "consent_still_running", run_id: waited.runId }) };
   }
   if (waited.status === "failed" || waited.result === undefined) {
     return { refusal: refuse(route, ref, 503, "engine_unavailable", { reason: "run_failed", run_id: waited.runId }) };
+  }
+  if (!waited.result.ok && waited.result.error === TOO_MANY_RUNNING) {
+    return { refusal: refuse(route, waited.result.ref, 429, TOO_MANY_RUNNING, { run_id: waited.runId }) };
   }
   if (!waited.result.ok) return { refusal: refuse(route, waited.result.ref, 500, "internal", { engine_error: waited.result.error, run_id: waited.runId }) };
   const body = successBody("consent_text", waited.result);
@@ -84,11 +88,13 @@ async function currentConsent(route: string, ref: string): Promise<{ readonly sh
   return { shown: { shopName: body.shopName, text: body.text, hash: body.hash } };
 }
 
-/** The 429 refusal once this client address is past joinStart, which GET and POST share; otherwise null. */
+/** The 429 refusal once this client address is past the start count in memory, which GET and POST share; otherwise null. */
 async function overLimit(request: Request, route: string, ref: string): Promise<Response | null> {
-  const hit = await takeHit(LIMITS.joinStart, clientAddress(request.headers));
+  const address = clientAddress(request.headers);
+  const hit = joinLimits.start.take(address);
   if (hit.allowed) return null;
-  return refuse(route, ref, 429, "rate_limited", { bucket: LIMITS.joinStart.bucket }, { "retry-after": String(hit.retryAfterSeconds) });
+  await recordMemoryRefusal(hit, address);
+  return refuse(route, ref, 429, "rate_limited", { bucket: hit.limit.bucket }, { "retry-after": String(hit.retryAfterSeconds) });
 }
 
 /**
@@ -96,8 +102,9 @@ async function overLimit(request: Request, route: string, ref: string): Promise<
  * visitor's own click on it is the only way into PayPal's sign-in (C28): the POST it
  * sends needs this origin and this browser's CSRF token, and the page cannot be framed.
  * Any other query answers 400. Sets the anonymous CSRF cookie when the browser has
- * nothing to bind a token to. 429 past 20 a minute per client address, counted with
- * POST; 503 when the engine has not answered within 15 seconds.
+ * nothing to bind a token to. 429 past 20 a minute per client address or 600 from
+ * everyone, counted in memory with POST; 429 too_many_running while two engine calls
+ * already run for this address; 503 when the engine has not answered within 15 seconds.
  */
 export async function GET(request: Request): Promise<Response> {
   const ref = randomUUID();
@@ -111,7 +118,7 @@ export async function GET(request: Request): Promise<Response> {
     if (names.length !== 1 || names[0] !== "intent" || (intent !== "join" && intent !== "leave")) {
       return refuse(GET_ROUTE, ref, 400, "bad_request", { reason: "bad_query" });
     }
-    const consent = await currentConsent(GET_ROUTE, ref);
+    const consent = await currentConsent(request, GET_ROUTE, ref);
     if ("refusal" in consent) return consent.refusal;
     const { token, cookies } = csrfTokenForRequest(request);
     const headers = new Headers(PAGE_HEADERS);
@@ -174,14 +181,15 @@ function csrfMatches(request: Request, presented: string): boolean {
 
 /**
  * The visitor's click on the confirmation page: sends the browser to PayPal's sandbox
- * sign-in. In this order: 429 past joinStart; 403 not_allowed unless Origin is exactly
- * this app's origin; 400 bad_request unless the body is a form of at most 4 KB holding
+ * sign-in. In this order: 429 past the start count; 403 not_allowed unless Origin is
+ * exactly this app's origin; 400 bad_request unless the body is a form of at most 4 KB holding
  * exactly intent and csrf, plus consent for a join, each once; 403 not_allowed unless
  * csrf is this browser's token, whether its binding is a session or the anonymous id;
  * for a join, 400 unless consent is 64 lowercase hex and 409 consent_changed unless it
  * is the hash of the words the engine shows now (C28). Then 303 to
  * https://www.sandbox.paypal.com/connect with the signed join cookie (paypal-login.ts).
- * 503 when the engine has not answered within 15 seconds.
+ * 429 too_many_running while two engine calls already run for this address; 503 when
+ * the engine has not answered within 15 seconds.
  */
 export async function POST(request: Request): Promise<Response> {
   const ref = randomUUID();
@@ -204,7 +212,7 @@ export async function POST(request: Request): Promise<Response> {
     if (intent === "join") {
       const presented = form.fields.get("consent") ?? "";
       if (!CONSENT_HASH.test(presented)) return refuse(POST_ROUTE, ref, 400, "bad_request", { reason: "bad_consent" });
-      const current = await currentConsent(POST_ROUTE, ref);
+      const current = await currentConsent(request, POST_ROUTE, ref);
       if ("refusal" in current) return current.refusal;
       if (current.shown.hash !== presented) return refuse(POST_ROUTE, ref, 409, "consent_changed");
       consent = presented;

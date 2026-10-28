@@ -3,7 +3,8 @@
  * (C9), so a forged delivery spends none of the PayPal rate limits Payouts needs.
  *
  * PayPal signs transmission_id|transmission_time|webhook_id|crc32, where crc32 is the
- * CRC-32 of the raw body as an unsigned decimal, with SHA256withRSA, and names the
+ * CRC-32 of the raw body as an unsigned decimal, taken here over the request's own bytes
+ * and never over a decoded copy, with SHA256withRSA, and names the
  * signing certificate in PAYPAL-CERT-URL. That address is used only when the href of one
  * WHATWG parse is exactly https://api.sandbox.paypal.com/v1/notifications/certs/CERT-
  * and 1 to 100 letters, digits or hyphens, with no port, user, query or fragment; anything
@@ -195,9 +196,9 @@ export function signatureHeaderProblem(headers: SignedHeaders): "auth_algo" | "c
   return certificateUrl(headers.cert_url) === null ? "cert_url" : null;
 }
 
-/** The exact text PayPal signs for a delivery. */
-export function signedText(headers: SignedHeaders, rawBody: string, webhookId: string): string {
-  return `${headers.transmission_id}|${headers.transmission_time}|${webhookId}|${crc32(Buffer.from(rawBody, "utf8"))}`;
+/** The exact text PayPal signs for a delivery, with the CRC-32 taken over the body's bytes exactly as received. */
+export function signedText(headers: SignedHeaders, rawBody: Uint8Array, webhookId: string): string {
+  return `${headers.transmission_id}|${headers.transmission_time}|${webhookId}|${crc32(rawBody)}`;
 }
 
 // The body, or null for any error status, redirect, timeout, network failure, or a body
@@ -338,14 +339,15 @@ export class SignatureChecker {
   }
 
   /**
-   * Whether headers carry PayPal's signature over this exact body for webhookId. address
-   * is the sender's client address (ratelimit.ts clientAddress), whose share of the
-   * download budget any download this delivery causes draws on. Never throws and never
-   * calls PayPal's API; the only requests are the certificate download and, when the
-   * bundle lacks an issuer, one to DigiCert's host. A delivery that verifies records its
-   * certificate address in the table, and is still verified if that write fails.
+   * Whether headers carry PayPal's signature over these exact body bytes, as received,
+   * for webhookId. address is the sender's client address (ratelimit.ts clientAddress),
+   * whose share of the download budget any download this delivery causes draws on. Never
+   * throws and never calls PayPal's API; the only requests are the certificate download
+   * and, when the bundle lacks an issuer, one to DigiCert's host. A delivery that
+   * verifies records its certificate address in the table, and is still verified if that
+   * write fails.
    */
-  async check(headers: SignedHeaders, rawBody: string, webhookId: string, address: string): Promise<SignatureVerdict> {
+  async check(headers: SignedHeaders, rawBody: Uint8Array, webhookId: string, address: string): Promise<SignatureVerdict> {
     const early = signatureHeaderProblem(headers);
     const url = certificateUrl(headers.cert_url);
     if (early !== null || url === null) return { ok: false, problem: early ?? "cert_url" };

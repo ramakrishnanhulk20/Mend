@@ -4,8 +4,11 @@
 // them, pulling back unclaimed rewards with the payout states in results, sign-in,
 // demo sessions and sign-out on the audit record in the same transaction as the session
 // write, each client address's share of demo sessions, demo approvals, demo submits and
-// simulates, and the owner's simulates drawing on no pool demo visitors share.
-// Sessions live in a throwaway Postgres schema; the engine is a fake dev bridge on 127.0.0.1.
+// simulates, the owner's simulates drawing on no pool demo visitors share, approve and
+// simulate checking their input before any shared pool and giving its hit back on
+// not_found, a session's campaign views (60 an hour, 2 at a time), and the auditors'
+// junk-approval repro. Sessions live in a throwaway Postgres schema; the engine is a
+// fake dev bridge on 127.0.0.1.
 // Does NOT cover: the real engine or PayPal (npm run prove:m7b drives the M7b routes
 // against both; which campaigns a cancel may touch is the engine's own tests), Next.js
 // routing itself, or Render's run API.
@@ -80,6 +83,20 @@ const PAYOUTS = {
   unclaimed_return_by: "2026-11-23T05:00:00+00:00",
 };
 const ANSWERS: Record<string, unknown> = {
+  view_campaign: {
+    ok: true,
+    campaign_id: CAMPAIGN,
+    status: "draft",
+    goal_text: "Win back quiet regulars",
+    as_of: "2026-10-16",
+    budget_minor: 1000,
+    per_recipient_minor: 100,
+    holdout_share: "0.2",
+    total_minor: 900,
+    rows: [],
+    review_hash: HASH,
+    review_problem: null,
+  },
   approve_campaign: { ok: true, campaign_id: CAMPAIGN, snapshot_hash: HASH, approved_at: "2026-10-24T05:00:00.123456+00:00" },
   submit_campaign: { ok: true, campaign_id: CAMPAIGN, status: "submitted", sent: true, payout_batch_id: "BATCH1" },
   simulate_return: { ok: true, campaign_id: CAMPAIGN, ref: "R2", paypal_order_id: "5O190127TN364715T", paypal_status: "COMPLETED" },
@@ -103,7 +120,9 @@ const ANSWERS: Record<string, unknown> = {
     ok: true,
     as_of: "2026-10-16",
     shop_customers: 5852,
-    members: 41,
+    members_joined: 1,
+    members_seeded: 40,
+    members_seeded_label: "demo stand-ins",
     quiet_regulars: 1357,
     quiet_regulars_paid_12m_minor: 123456,
     currency: "USD",
@@ -122,7 +141,13 @@ const ANSWERS: Record<string, unknown> = {
 };
 
 type Seen = { readonly task: string; readonly args: unknown[] };
-const bridge = { delayMs: 0, overrides: {} as Record<string, unknown>, seen: [] as Seen[] };
+const bridge = {
+  delayMs: 0,
+  overrides: {} as Record<string, unknown>,
+  // An answer chosen from the call itself, ahead of overrides; undefined falls through.
+  answerFor: null as ((task: string, args: unknown[]) => unknown) | null,
+  seen: [] as Seen[],
+};
 let server: Server;
 let dev: DevDatabase;
 let admin: pg.Client;
@@ -137,10 +162,11 @@ beforeAll(async () => {
     });
     request.on("end", () => {
       const task = (request.url ?? "").replace("/tasks/", "");
-      bridge.seen.push({ task, args: (JSON.parse(text) as { args: unknown[] }).args });
+      const args = (JSON.parse(text) as { args: unknown[] }).args;
+      bridge.seen.push({ task, args });
       setTimeout(() => {
         response.writeHead(200, { "content-type": "application/json" });
-        response.end(JSON.stringify(bridge.overrides[task] ?? ANSWERS[task]));
+        response.end(JSON.stringify(bridge.answerFor?.(task, args) ?? bridge.overrides[task] ?? ANSWERS[task]));
       }, bridge.delayMs);
     });
   });
@@ -181,6 +207,7 @@ afterAll(async () => {
 beforeEach(() => {
   bridge.delayMs = 0;
   bridge.overrides = {};
+  bridge.answerFor = null;
   bridge.seen = [];
   vi.spyOn(process.stdout, "write").mockImplementation((() => true) as typeof process.stdout.write);
   return () => vi.restoreAllMocks();
@@ -688,5 +715,109 @@ describe("each client address's share", () => {
     expect(await auditSince(before)).toEqual([
       { actor: "web", action: "rate_limit_hit", detail: { bucket: "simulate_address", per: "address", address_tag: addressTag("198.51.100.42") } },
     ]);
+  });
+});
+
+describe("the shared demo pools", () => {
+  const UNKNOWN = "11111111-2222-4333-8444-555555555555";
+  const POOLS = ["demo_approvals_all", "demo_approvals_address", "simulates_all", "simulate_address"];
+
+  async function rows(bucket: string, subject?: string): Promise<number> {
+    const { rows: found } = await admin.query<{ n: number }>(
+      "select count(*)::int as n from rate_limit_hits where bucket = $1 and ($2::text is null or subject = $2)",
+      [bucket, subject ?? null],
+    );
+    return found[0].n;
+  }
+
+  beforeEach(async () => {
+    await admin.query("delete from rate_limit_hits where bucket = any($1)", [POOLS]);
+  });
+
+  it("are charged by approve and simulate only after the campaign id and the body check out", async () => {
+    const approve = await import("./campaigns/[id]/approve/route");
+    const simulate = await import("./campaigns/[id]/simulate/route");
+    const demo = await createSession("demo");
+    const send = (route: typeof approve, id: string, body: unknown) => route.POST(request("POST", "/x", { session: demo, address: "198.51.100.50", body }), params({ id }));
+    expect((await send(approve, "not-a-uuid", { presentedHash: HASH })).status).toBe(404);
+    expect((await send(approve, CAMPAIGN, { presentedHash: "x" })).status).toBe(400);
+    expect((await send(simulate, "not-a-uuid", { ref: "R2" })).status).toBe(404);
+    expect((await send(simulate, CAMPAIGN, { ref: "C1042" })).status).toBe(400);
+    expect(await Promise.all(POOLS.map((bucket) => rows(bucket)))).toEqual([0, 0, 0, 0]);
+    expect(bridge.seen).toEqual([]);
+  });
+
+  // Each engine round trip waits one 500 ms poll, so one junk approval per address reaches the engine.
+  it("let an 11th address approve after 10 addresses sent 10 junk approvals each (the auditors' repro)", { timeout: 40_000 }, async () => {
+    const { POST } = await import("./campaigns/[id]/approve/route");
+    bridge.answerFor = (task, args) => (task === "approve_campaign" && args[0] !== CAMPAIGN ? { ok: false, error: "not_found", ref: ENGINE_REF } : undefined);
+    const approve = (session: IssuedSession, address: string, id: string, body: unknown) => POST(request("POST", "/x", { session, address, body }), params({ id }));
+    for (let visitor = 0; visitor < 10; visitor += 1) {
+      const session = await createSession("demo");
+      const address = `198.51.100.${120 + visitor}`;
+      for (let n = 0; n < 10; n += 1) {
+        const [id, body, status]: [string, unknown, number] =
+          n < 5 ? ["not-a-uuid", { presentedHash: HASH }, 404] : n < 9 ? [CAMPAIGN, { presentedHash: "x" }, 400] : [UNKNOWN, { presentedHash: HASH }, 404];
+        expect((await approve(session, address, id, body)).status, `${address} junk ${n}`).toBe(status);
+      }
+    }
+    expect(await rows("demo_approvals_all")).toBe(0);
+    const valid = await approve(await createSession("demo"), "198.51.100.130", CAMPAIGN, { presentedHash: HASH });
+    expect(valid.status).toBe(200);
+    expect(await rows("demo_approvals_all")).toBe(1);
+  });
+
+  it("get their hit back when the engine answers not_found, also when that answer comes after a 202", async () => {
+    const approve = await import("./campaigns/[id]/approve/route");
+    const simulate = await import("./campaigns/[id]/simulate/route");
+    bridge.overrides.approve_campaign = { ok: false, error: "not_found", ref: ENGINE_REF };
+    bridge.overrides.simulate_return = { ok: false, error: "not_found", ref: ENGINE_REF };
+    const demo = await createSession("demo");
+    const options = { session: demo, address: "198.51.100.51" };
+    const missed = await approve.POST(request("POST", "/x", { ...options, body: { presentedHash: HASH } }), params({ id: UNKNOWN }));
+    expect(missed.status).toBe(404);
+    expect(await rows("demo_approvals_all", demo.sessionId)).toBe(0);
+
+    bridge.delayMs = 300;
+    const started = await approve.POST(request("POST", "/x", { ...options, prefer: "respond-async", body: { presentedHash: HASH } }), params({ id: UNKNOWN }));
+    expect(started.status).toBe(202);
+    expect(await rows("demo_approvals_all", demo.sessionId)).toBe(1);
+    await vi.waitFor(async () => expect(await rows("demo_approvals_all", demo.sessionId)).toBe(0), { timeout: 3_000 });
+    bridge.delayMs = 0;
+
+    const bought = await simulate.POST(request("POST", "/x", { ...options, body: { ref: "R2" } }), params({ id: UNKNOWN }));
+    expect(bought.status).toBe(404);
+    expect(await rows("simulates_all", demo.sessionId)).toBe(0);
+    // Each address's own share stays spent, so one address cannot ask the engine about unknown ids without end.
+    expect([await rows("demo_approvals_address", "198.51.100.51"), await rows("simulate_address", "198.51.100.51")]).toEqual([2, 1]);
+  });
+});
+
+describe("a session's campaign views", () => {
+  it("are held to 60 an hour, refused before the engine is asked", async () => {
+    const { GET } = await import("./campaigns/[id]/route");
+    const demo = await createSession("demo");
+    await admin.query("insert into rate_limit_hits (bucket, subject) select 'view_campaign', $1 from generate_series(1, 60)", [demo.sessionId]);
+    const refused = await GET(request("GET", "/x", { session: demo }), params({ id: CAMPAIGN }));
+    expect(refused.status).toBe(429);
+    expect(await json(refused)).toMatchObject({ error: "rate_limited" });
+    expect(refused.headers.get("retry-after")).toMatch(/^\d+$/);
+    expect(bridge.seen).toEqual([]);
+    expect((await GET(request("GET", "/x", { session: await createSession("demo") }), params({ id: CAMPAIGN }))).status).toBe(200);
+  });
+
+  it("run 2 at a time: a third answers 429 with a fixed message at once, and the engine is not asked a third time", async () => {
+    const { GET } = await import("./campaigns/[id]/route");
+    const demo = await createSession("demo");
+    bridge.delayMs = 500;
+    const view = (session: IssuedSession) => GET(request("GET", "/x", { session }), params({ id: CAMPAIGN }));
+    const running = [view(demo), view(demo)];
+    await vi.waitFor(() => expect(bridge.seen).toHaveLength(2));
+    const third = await view(demo);
+    expect(third.status).toBe(429);
+    expect(await json(third)).toEqual({ error: "too_many_running", message: "Too many requests. Try again later.", ref: expect.any(String) });
+    const other = view(await createSession("demo"));
+    expect((await Promise.all([...running, other])).map((response) => response.status)).toEqual([200, 200, 200]);
+    expect(bridge.seen.filter((call) => call.task === "view_campaign")).toHaveLength(3);
   });
 });

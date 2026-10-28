@@ -2,40 +2,46 @@
  * The PayPal webhook receiver: a delivery is stored only after its signature checks out
  * as PayPal's for our webhook id (C9).
  *
- * The signature is checked in this app (webhook-signature.ts) over the body exactly as
- * received and our webhook id, from config, never from the request; PayPal's verify API
- * is never called. The text that was verified is the text that is parsed and stored.
+ * The signature is checked in this app (webhook-signature.ts) over the body's bytes
+ * exactly as received and our webhook id, from config, never from the request; PayPal's
+ * verify API is never called. The body must be strict UTF-8 (a byte-order mark is kept,
+ * not dropped), so the text parsed and stored encodes back to exactly the bytes verified.
  * Nothing here acts on what an event says: a stored event is only a prompt for the
  * engine to re-read the resource from PayPal (C10). Once one is stored, the engine is
  * asked to process events at once rather than at the next scheduled run; that request
  * is never waited on and never changes the answer PayPal gets. A transmission id that
- * is already stored is answered 200 without checking the signature again and without a
- * write. Callers get a generic answer with a correlation id; the reason stays in the
- * server log, with the sender's address tag (ratelimit.ts addressTag). The first
- * rejection for each reason from each address in a minute is also written to the audit
- * log (C23), best-effort, decided in memory, so a flood leaves one row per reason and
- * address rather than one per request.
+ * is already stored, or that the engine has already processed (event_outcomes keeps it
+ * after the 47-hour purge deletes the stored row, inside the 72 hours a delivery is
+ * accepted), is answered 200 without a write. Callers get a generic answer with a
+ * correlation id; the reason stays in the server log, with the sender's address tag
+ * (ratelimit.ts addressTag). The first rejection for each reason from each address in a
+ * minute is also written to the audit log (C23), best-effort, decided in memory, at most
+ * 20 per reason a minute across every address, so a flood leaves a bounded number of rows.
  *
- * Anyone can post to the webhook, so what a flood can spend is capped (C20): requests
- * are counted in memory per client address and across everyone (address-limits.ts)
- * before a byte of the body is read or any database query runs, and the body is read
- * only up to the size cap. A forged delivery spends no PayPal API call. One that passes
- * the header, body, time and certificate address checks still costs one database read,
- * the stored-id lookup, which the in-memory counts bound, and the certificate downloads
+ * Anyone can post to the webhook, so what a flood can spend is capped (C20), and PayPal's
+ * own deliveries never wait behind it: the counts in memory per client address and
+ * across everyone (address-limits.ts) are charged only for deliveries that are rejected,
+ * and a delivery whose signature verifies is never refused for a count. A sender past a
+ * count still has its delivery checked, but in the order that spends nothing shared:
+ * the header checks before its body is read, then the signature, from the cached
+ * certificate, before any database query; a rejection is then answered 429. Under the
+ * counts, a delivery that passes the header and body checks costs one database read,
+ * the stored-id lookup, before its signature is checked. The body is read only up to the
+ * size cap. A forged delivery spends no PayPal API call, and the certificate downloads
  * it causes come out of its sender's own share (webhook-signature.ts), never out of
- * PayPal's known certificate. Does not cover a flood spread
- * over many addresses under the shared count: that delays real deliveries (PayPal
- * retries anything not answered 2xx, and the jobs cron re-reads PayPal).
+ * PayPal's known certificate. Does not cover a flood spread over many addresses under
+ * the shared count, which costs each request its stored-id read, or a flood of forged
+ * deliveries with well-formed headers past the counts, each of which still has its body
+ * read and its signature checked.
  */
 import { randomUUID } from "node:crypto";
 import { z } from "zod";
 import { webhookLimits, webhookRejections } from "./address-limits";
-import { appendAudit } from "./audit";
 import { loadConfig } from "./config";
 import { database } from "./db";
 import { runTask } from "./engine";
 import { writeLog } from "./log";
-import { addressTag, clientAddress, GLOBAL, recordLimitHit } from "./ratelimit";
+import { addressTag, appendCappedAudit, clientAddress, recordMemoryRefusal } from "./ratelimit";
 import { parseStrictJson, StrictJsonError } from "./strict-json";
 import { deliverySignatures, signatureHeaderProblem } from "./webhook-signature";
 
@@ -73,8 +79,22 @@ type WebhookEvent = { readonly id: string; readonly eventType: string; readonly 
 /** What to answer: the status, the generic body, and for a 429 how many seconds until a retry can pass. */
 export type DeliveryResult = { readonly status: number; readonly body: string; readonly retryAfterSeconds?: number };
 
-function bodyBytes(rawBody: string): number {
-  return Buffer.byteLength(rawBody, "utf8");
+// fatal refuses every byte sequence that is not UTF-8 rather than replacing it, and
+// ignoreBOM keeps a leading byte-order mark in the text, so the text always encodes back
+// to exactly the bytes it came from.
+const STRICT_UTF8 = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true });
+
+function strictText(bytes: Uint8Array): string | null {
+  try {
+    return STRICT_UTF8.decode(bytes);
+  } catch {
+    return null;
+  }
+}
+
+// A caller's text is taken as its UTF-8 bytes; the route always passes the request's own bytes.
+function asBytes(raw: Uint8Array | string): Buffer {
+  return typeof raw === "string" ? Buffer.from(raw, "utf8") : Buffer.from(raw.buffer, raw.byteOffset, raw.byteLength);
 }
 
 const DELIVERY_HEADER_KEYS = Object.keys(DELIVERY_HEADERS) as (keyof DeliveryHeaders)[];
@@ -170,24 +190,34 @@ function timeProblem(transmissionTime: string, now: number): string | null {
  * Whether this delivery is a genuine event for our webhook id, checked in the app.
  *
  * Returns "rejected" without any download when a PAYPAL-* header is missing or
- * malformed, the body is over 262,144 bytes, or the body is not a single JSON event
- * object with no repeated keys. Otherwise returns "verified" only when the signature
- * checks out (webhook-signature.ts); a certificate that cannot be fetched or does not
- * check out is "rejected" too. Never calls PayPal's API. Throws ConfigError when
- * PAYPAL_WEBHOOK_ID is unusable.
+ * malformed, the body is over 262,144 bytes, is not strict UTF-8, or is not a single
+ * JSON event object with no repeated keys. Otherwise returns "verified" only when the
+ * signature over the body's bytes checks out (webhook-signature.ts); a certificate that
+ * cannot be fetched or does not check out is "rejected" too. A string body is taken as
+ * its UTF-8 bytes. Never calls PayPal's API. Throws ConfigError when PAYPAL_WEBHOOK_ID is
+ * unusable.
  */
-export async function verifyDelivery(rawBody: string, headers: Headers): Promise<"verified" | "rejected"> {
+export async function verifyDelivery(rawBody: Uint8Array | string, headers: Headers): Promise<"verified" | "rejected"> {
+  const bytes = asBytes(rawBody);
   const delivery = readDeliveryHeaders(headers);
-  if (delivery === null || bodyBytes(rawBody) > MAX_BODY_BYTES || "problem" in readEvent(rawBody)) {
+  const text = strictText(bytes);
+  if (delivery === null || bytes.byteLength > MAX_BODY_BYTES || text === null || "problem" in readEvent(text)) {
     return "rejected";
   }
-  const verdict = await deliverySignatures().check(delivery, rawBody, loadConfig().webhookId, clientAddress(headers));
+  const verdict = await deliverySignatures().check(delivery, bytes, loadConfig().webhookId, clientAddress(headers));
   return verdict.ok ? "verified" : "rejected";
 }
 
-async function alreadyStored(transmissionId: string): Promise<boolean> {
-  const { rows } = await database().query("select 1 from paypal_events where transmission_id = $1", [transmissionId]);
-  return rows.length > 0;
+// Seen before: still stored, or already processed by the engine. event_outcomes keeps
+// the id after the purge deletes the stored row at 47 hours, while a delivery is
+// accepted for 72, so a replay in between is still known.
+async function alreadySeen(transmissionId: string): Promise<boolean> {
+  const { rows } = await database().query<{ seen: boolean }>(
+    `select exists (select 1 from paypal_events where transmission_id = $1)
+         or exists (select 1 from event_outcomes where transmission_id = $1) as seen`,
+    [transmissionId],
+  );
+  return rows[0].seen;
 }
 
 async function storeEvent(transmissionId: string, event: WebhookEvent, rawBody: string): Promise<"stored" | "duplicate"> {
@@ -223,18 +253,18 @@ function senderOf(headers: Headers): Sender {
   }
 }
 
-// Best-effort: once per reason per address a minute, decided in memory, and a failure
-// leaves one log line.
+// Best-effort: once per reason per address a minute and at most 20 per reason a minute
+// across every address, decided in memory, and a failure leaves one log line.
 async function recordRejection(sender: Sender, reason: string, status: number): Promise<void> {
   if (!webhookRejections.first(`${reason}\n${sender.address}`)) return;
   if (sender.tag === null) {
     writeLog({ kind: "audit", outcome: "not_written", action: "webhook_rejected", reason: "no_tag" });
     return;
   }
-  await appendAudit("webhook_rejected", { reason, status, address_tag: sender.tag });
+  await appendCappedAudit("webhook_rejected", reason, { reason, status, address_tag: sender.tag });
 }
 
-// Rate-limit refusals are recorded by refuseOverLimit, once per limit and subject a window.
+// Rate-limit refusals are recorded by receiveDelivery, once per limit and subject a window.
 async function answer(status: number, ref: string, sender: Sender, log: Readonly<Record<string, unknown>>, retryAfterSeconds?: number): Promise<DeliveryResult> {
   writeLog({ kind: "webhook", ref, status, address_tag: sender.tag, ...log });
   if (log.outcome === "refused" && log.reason !== "rate_limited" && typeof log.reason === "string") await recordRejection(sender, log.reason, status);
@@ -243,17 +273,116 @@ async function answer(status: number, ref: string, sender: Sender, log: Readonly
 }
 
 /**
- * Ask the engine to run process_events now, without waiting. Never throws: a refusal to
+ * Ask the engine to run process_events now, without waiting, counted against the
+ * sender's address for the engine client's in-flight cap. Never throws: a refusal to
  * start (missing engine settings) is logged under the delivery's ref, and a run that
- * fails is logged by the engine client. The mend-jobs cron processes anything this
- * misses within 5 minutes.
+ * fails or is refused is logged by the engine client. The mend-jobs cron processes
+ * anything this misses within 5 minutes.
  */
-function askEngineToProcess(ref: string): void {
+function askEngineToProcess(ref: string, sender: Sender): void {
   Promise.resolve()
-    .then(() => runTask("process_events", []))
+    .then(() => runTask("process_events", [], { address: sender.address }))
     .catch((error: unknown) => {
       writeLog({ kind: "webhook", ref, outcome: "engine_not_asked", reason: error instanceof Error ? error.message : "unknown" });
     });
+}
+
+/** What a delivery gets, decided but not yet logged or answered: the status and the log line's fields. */
+type Verdict = { readonly status: number; readonly log: Readonly<Record<string, unknown>> };
+
+function refused(status: 400 | 413, reason: string, facts: Readonly<Record<string, unknown>> = {}): Verdict {
+  return { status, log: { outcome: "refused", reason, ...facts } };
+}
+
+function unavailable(error: unknown, facts: Readonly<Record<string, unknown>>): Verdict {
+  const code = (error as { code?: unknown } | null)?.code;
+  return { status: 503, log: { outcome: "unavailable", reason: "db_error", code: typeof code === "string" ? code : null, ...facts } };
+}
+
+// A rejection is the sender's fault and is charged to its counts; a 503 is ours and is not.
+function isRejection(verdict: Verdict): boolean {
+  return verdict.status === 400 || verdict.status === 413;
+}
+
+function declaredOversize(headers: Headers): Verdict | null {
+  const declared = headers.get("content-length");
+  if (declared === null || !/^\d+$/.test(declared) || Number(declared) <= MAX_BODY_BYTES) return null;
+  return refused(413, "declared_oversize");
+}
+
+// Every check the PAYPAL-* headers can fail on their own, none of which needs the body
+// or a query: their shapes, the transmission time window, the algorithm and the
+// certificate address.
+function headerVerdict(headers: Headers): { readonly delivery: DeliveryHeaders } | { readonly verdict: Verdict } {
+  const delivery = readDeliveryHeaders(headers);
+  if (delivery === null) return { verdict: refused(400, "missing_header") };
+  const seen = { transmission_id: delivery.transmission_id };
+  const late = timeProblem(delivery.transmission_time, Date.now());
+  if (late !== null) return { verdict: refused(400, late, seen) };
+  const unusable = signatureHeaderProblem(delivery);
+  if (unusable !== null) return { verdict: refused(400, "verify_failure", { check: unusable, ...seen }) };
+  return { delivery };
+}
+
+function headerProblem(headers: Headers): Verdict | null {
+  const checked = headerVerdict(headers);
+  return "verdict" in checked ? checked.verdict : null;
+}
+
+// 200 duplicate for an id seen before, 503 when the lookup fails, otherwise null.
+async function replayVerdict(transmissionId: string): Promise<Verdict | null> {
+  const seen = { transmission_id: transmissionId };
+  try {
+    return (await alreadySeen(transmissionId)) ? { status: 200, log: { outcome: "duplicate", reason: "transmission_stored", ...seen } } : null;
+  } catch (error) {
+    return unavailable(error, seen);
+  }
+}
+
+/**
+ * The verdict on one delivery's bytes. signatureFirst, for a sender past its counts,
+ * checks the signature before the stored-id lookup, so a forged delivery from it runs no
+ * query; otherwise the lookup comes first and a replay is answered without a signature
+ * check.
+ */
+async function decide(bytes: Buffer, headers: Headers, sender: Sender, signatureFirst: boolean): Promise<Verdict> {
+  if (bytes.byteLength > MAX_BODY_BYTES) return refused(413, "oversize");
+  const checked = headerVerdict(headers);
+  if ("verdict" in checked) return checked.verdict;
+  const { delivery } = checked;
+  const seen = { transmission_id: delivery.transmission_id };
+  const text = strictText(bytes);
+  if (text === null) return refused(400, "not_utf8", seen);
+  const reading = readEvent(text);
+  if ("problem" in reading) return refused(400, reading.problem, seen);
+
+  if (!signatureFirst) {
+    const replay = await replayVerdict(delivery.transmission_id);
+    if (replay !== null) return replay;
+  }
+  const signature = await deliverySignatures().check(delivery, bytes, loadConfig().webhookId, sender.address);
+  if (!signature.ok) {
+    return refused(400, signature.problem === "certificate_budget" ? "certificate_budget" : "verify_failure", { check: signature.problem, ...seen });
+  }
+  if (signatureFirst) {
+    const replay = await replayVerdict(delivery.transmission_id);
+    if (replay !== null) return replay;
+  }
+
+  const event = reading.event;
+  const facts = { ...seen, event_id: event.id, event_type: event.eventType, delivery };
+  try {
+    return { status: 200, log: { outcome: await storeEvent(delivery.transmission_id, event, text), ...facts } };
+  } catch (error) {
+    return unavailable(error, facts);
+  }
+}
+
+// Log and answer a verdict, and once a delivery is stored ask the engine to process it.
+async function finish(verdict: Verdict, ref: string, sender: Sender): Promise<DeliveryResult> {
+  const result = await answer(verdict.status, ref, sender, verdict.log);
+  if (verdict.log.outcome === "stored") askEngineToProcess(ref, sender);
+  return result;
 }
 
 /**
@@ -261,33 +390,17 @@ function askEngineToProcess(ref: string): void {
  * route can refuse it before reading the body. Returns null when no such header is set.
  */
 export async function refuseDeclaredLength(headers: Headers): Promise<DeliveryResult | null> {
-  const declared = headers.get("content-length");
-  if (declared === null || !/^\d+$/.test(declared) || Number(declared) <= MAX_BODY_BYTES) return null;
-  return answer(413, randomUUID(), senderOf(headers), { outcome: "refused", reason: "declared_oversize" });
+  const verdict = declaredOversize(headers);
+  return verdict === null ? null : answer(verdict.status, randomUUID(), senderOf(headers), verdict.log);
 }
 
 /**
- * The 429 answer, with the wait until a retry can pass, once this client address has
- * sent 120 requests in the last minute or everyone together 600; otherwise null. The
- * counts live in memory, so deciding runs no query. Only the first refusal per limit
- * and subject in a minute writes an audit row, so a flood refused here costs at most
- * one row a minute per flooding address plus one for the shared count.
- */
-async function refuseOverLimit(sender: Sender): Promise<DeliveryResult | null> {
-  const hit = webhookLimits.take(sender.address);
-  if (hit.allowed) return null;
-  if (hit.firstRefusal) await recordLimitHit(hit.limit, hit.limit.per === "address" ? sender.address : GLOBAL);
-  return answer(429, randomUUID(), sender, { outcome: "refused", reason: "rate_limited", bucket: hit.limit.bucket }, hit.retryAfterSeconds);
-}
-
-/**
- * The body as text, or null once it passes the cap. Reading stops at the first chunk
+ * The body's bytes, or null once they pass the cap. Reading stops at the first chunk
  * past the cap, so a body with no Content-Length, or a false one, costs at most the cap
- * plus one chunk. Decoded the way request.text() decodes, so the text verified is the
- * text it would have been before.
+ * plus one chunk. Nothing is decoded here: the bytes read are the bytes verified.
  */
-async function readCappedBody(request: Request): Promise<string | null> {
-  if (request.body === null) return "";
+async function readCappedBody(request: Request): Promise<Buffer | null> {
+  if (request.body === null) return Buffer.alloc(0);
   const reader = request.body.getReader();
   const chunks: Uint8Array[] = [];
   let size = 0;
@@ -301,111 +414,87 @@ async function readCappedBody(request: Request): Promise<string | null> {
     }
     chunks.push(value);
   }
-  return new TextDecoder().decode(Buffer.concat(chunks));
+  return Buffer.concat(chunks);
+}
+
+async function readAndDecide(request: Request, sender: Sender, signatureFirst: boolean): Promise<Verdict> {
+  let bytes: Buffer | null;
+  try {
+    bytes = await readCappedBody(request);
+  } catch {
+    return refused(400, "body_unreadable");
+  }
+  if (bytes === null) return refused(413, "oversize_stream");
+  return decide(bytes, request.headers, sender, signatureFirst);
 }
 
 /**
- * Handle one webhook request and say what to answer. Before any of the body is read or
- * any query runs: 429 with a wait once this client address has sent 120 requests in the
- * last minute or everyone together 600, counted in memory, then 413 for a declared
- * Content-Length over the cap. The body
- * is then read as a stream: 413 the moment it passes 262,144 bytes, length declared or
- * not, with nothing more read, and 400 if the sender breaks off. The text read goes
- * through handleDelivery.
+ * Handle one webhook request and say what to answer. First 413 for a declared
+ * Content-Length over the cap. Then, for a client address with 120 rejected requests in
+ * the last minute, or once everyone together has 600, counted in memory: the header
+ * checks before any of the body is read, then the signature before any query. The body
+ * is read as a stream: 413 the moment it passes 262,144 bytes, length declared or not,
+ * with nothing more read, and 400 if the sender breaks off. Its bytes then go through
+ * the checks handleDelivery lists. Every rejection (a 400 or 413) is counted against the
+ * sender's address and everyone, and is answered 429, with the wait until a retry can
+ * pass, once a count is full; the first such refusal per limit and subject in a minute
+ * writes an audit row. A delivery whose signature verifies is never counted and never
+ * refused for a count.
  */
 export async function receiveDelivery(request: Request): Promise<DeliveryResult> {
+  const ref = randomUUID();
   const sender = senderOf(request.headers);
-  const refused = (await refuseOverLimit(sender)) ?? (await refuseDeclaredLength(request.headers));
-  if (refused !== null) return refused;
-  let rawBody: string | null;
+  const flooded = webhookLimits.full(sender.address) !== null;
+  let verdict: Verdict;
   try {
-    rawBody = await readCappedBody(request);
+    const early = declaredOversize(request.headers) ?? (flooded ? headerProblem(request.headers) : null);
+    verdict = early ?? (await readAndDecide(request, sender, flooded));
   } catch {
-    return answer(400, randomUUID(), sender, { outcome: "refused", reason: "body_unreadable" });
+    verdict = { status: 503, log: { outcome: "unavailable", reason: "internal_error" } };
   }
-  if (rawBody === null) return answer(413, randomUUID(), sender, { outcome: "refused", reason: "oversize_stream" });
-  return handleDelivery(rawBody, request.headers);
+  if (isRejection(verdict)) {
+    const hit = webhookLimits.take(sender.address);
+    if (!hit.allowed) {
+      await recordMemoryRefusal(hit, sender.address);
+      return answer(429, ref, sender, { outcome: "refused", reason: "rate_limited", bucket: hit.limit.bucket, rejected: verdict.log.reason }, hit.retryAfterSeconds);
+    }
+  }
+  return finish(verdict, ref, sender);
 }
 
 /**
- * Handle one webhook delivery and say what to answer PayPal.
+ * Handle one webhook delivery and say what to answer PayPal. A string body is taken as
+ * its UTF-8 bytes.
  *
  * In this order: a body over 262,144 bytes gets 413; a missing or malformed PAYPAL-*
- * header gets 400; text that is not one JSON event object, has a repeated key at any
- * depth, or nests deeper than 64 gets 400; a transmission time more than 5 minutes
- * ahead or more than 3 days old gets 400; an algorithm other than SHA256withRSA or a
- * certificate address that is not exactly
- * https://api.sandbox.paypal.com/v1/notifications/certs/CERT-<id> gets 400
- * (verify_failure) before any query; a transmission id already stored gets 200 with no
- * signature check and no write; a signature that does not check out, including a
- * certificate that cannot be fetched or does not chain to a trusted root, gets 400
- * (verify_failure, with the failing check in the log) and nothing is stored; so does a
- * certificate address not yet known good once this client address has caused 2
- * certificate downloads this minute or the app 10 (certificate_budget). A verified
- * delivery records its certificate address (webhook-signature.ts), is inserted once,
- * keyed on transmission id (event id is unique too), and the engine is then asked to
- * process events without waiting; a replay gets
- * 200, stores nothing new and asks nothing. A database failure or a missing webhook id
- * setting gets 503 with nothing stored, so PayPal retries.
+ * header gets 400; a transmission time more than 5 minutes ahead or more than 3 days old
+ * gets 400; an algorithm other than SHA256withRSA or a certificate address that is not
+ * exactly https://api.sandbox.paypal.com/v1/notifications/certs/CERT-<id> gets 400
+ * (verify_failure) before any query; a body that is not strict UTF-8 gets 400
+ * (not_utf8); text that is not one JSON event object, has a repeated key at any depth,
+ * or nests deeper than 64 gets 400; a transmission id already stored, or already
+ * processed by the engine, gets 200 with no signature check and no write; a signature
+ * over the body's bytes that does not check out, including a certificate that cannot be
+ * fetched or does not chain to a trusted root, gets 400 (verify_failure, with the
+ * failing check in the log) and nothing is stored; so does a certificate address not
+ * yet known good once this client address has caused 2 certificate downloads this
+ * minute or the app 10 (certificate_budget). A verified delivery records its
+ * certificate address (webhook-signature.ts), is inserted once, keyed on transmission id
+ * (event id is unique too), and the engine is then asked to process events without
+ * waiting; a replay gets 200, stores nothing new and asks nothing. A database failure or
+ * a missing webhook id setting gets 503 with nothing stored, so PayPal retries.
  *
  * The stored-id check trusts the header without verifying the body, so a forged body
- * under a stored id also gets 200; it is neither stored nor acted on, so nothing is lost.
+ * under a seen id also gets 200; it is neither stored nor acted on, so nothing is lost.
  */
-export async function handleDelivery(rawBody: string, headers: Headers): Promise<DeliveryResult> {
+export async function handleDelivery(rawBody: Uint8Array | string, headers: Headers): Promise<DeliveryResult> {
   const ref = randomUUID();
   const sender = senderOf(headers);
+  let verdict: Verdict;
   try {
-    if (bodyBytes(rawBody) > MAX_BODY_BYTES) {
-      return await answer(413, ref, sender, { outcome: "refused", reason: "oversize" });
-    }
-    const delivery = readDeliveryHeaders(headers);
-    if (delivery === null) {
-      return await answer(400, ref, sender, { outcome: "refused", reason: "missing_header" });
-    }
-    const seen = { transmission_id: delivery.transmission_id };
-    const reading = readEvent(rawBody);
-    if ("problem" in reading) {
-      return await answer(400, ref, sender, { outcome: "refused", reason: reading.problem, ...seen });
-    }
-    const late = timeProblem(delivery.transmission_time, Date.now());
-    if (late !== null) {
-      return await answer(400, ref, sender, { outcome: "refused", reason: late, ...seen });
-    }
-    const unusable = signatureHeaderProblem(delivery);
-    if (unusable !== null) {
-      return await answer(400, ref, sender, { outcome: "refused", reason: "verify_failure", check: unusable, ...seen });
-    }
-
-    let stored: boolean;
-    try {
-      stored = await alreadyStored(delivery.transmission_id);
-    } catch (error) {
-      const code = (error as { code?: unknown }).code;
-      return await answer(503, ref, sender, { outcome: "unavailable", reason: "db_error", code: typeof code === "string" ? code : null, ...seen });
-    }
-    if (stored) {
-      return await answer(200, ref, sender, { outcome: "duplicate", reason: "transmission_stored", ...seen });
-    }
-
-    const verdict = await deliverySignatures().check(delivery, rawBody, loadConfig().webhookId, sender.address);
-    if (!verdict.ok) {
-      const reason = verdict.problem === "certificate_budget" ? "certificate_budget" : "verify_failure";
-      return await answer(400, ref, sender, { outcome: "refused", reason, check: verdict.problem, ...seen });
-    }
-
-    const event = reading.event;
-    const facts = { ...seen, event_id: event.id, event_type: event.eventType, delivery };
-    let outcome: "stored" | "duplicate";
-    try {
-      outcome = await storeEvent(delivery.transmission_id, event, rawBody);
-    } catch (error) {
-      const code = (error as { code?: unknown }).code;
-      return await answer(503, ref, sender, { outcome: "unavailable", reason: "db_error", code: typeof code === "string" ? code : null, ...facts });
-    }
-    const result = await answer(200, ref, sender, { outcome, ...facts });
-    if (outcome === "stored") askEngineToProcess(ref);
-    return result;
+    verdict = await decide(asBytes(rawBody), headers, sender, false);
   } catch {
-    return answer(503, ref, sender, { outcome: "unavailable", reason: "internal_error" });
+    verdict = { status: 503, log: { outcome: "unavailable", reason: "internal_error" } };
   }
+  return finish(verdict, ref, sender);
 }

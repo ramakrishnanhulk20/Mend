@@ -1,9 +1,12 @@
 // Covers which address a request is counted against, its short tag, the counting itself
-// against a real Postgres schema, including concurrent requests, and the one audit row
-// each window's first refusal leaves. Does NOT cover: Render's proxy really appending
-// the client address (unverified until deployed; the tag in the webhook log line is how
-// to check it), the limits wired into each route (console-routes.test.ts, npm run
-// prove:m7a), or attackers spread across many addresses (a named non-goal).
+// against a real Postgres schema, including concurrent requests, each shared demo pool's
+// last 20% kept for sessions that have not drawn, a hit given back, each bucket swept
+// at its own window, the one audit row each window's first refusal leaves and the cap of
+// 20 such rows per bucket a minute, and, from the real constants, how long 50 addresses
+// can hold a shared pool closed. Does NOT cover: Render's proxy really appending the
+// client address (unverified until deployed; the tag in the webhook log line is how to
+// check it), the limits wired into each route (console-routes.test.ts, npm run
+// prove:m7a), or attackers who keep a pool closed by drawing again every window.
 import { spawn } from "node:child_process";
 import { createHmac } from "node:crypto";
 import { once } from "node:events";
@@ -12,8 +15,22 @@ import path from "node:path";
 import pg from "pg";
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { ENGINE_DIR, SCHEMA_PATH, type DevDatabase } from "../../scripts/dev-database";
+import { auditRows, JOIN_LIMITS, WEBHOOK_LIMITS } from "./address-limits";
 import { closeDatabase } from "./db";
-import { addressTag, clientAddress, GLOBAL, LIMITS, sessionTag, takeHit, UNKNOWN_ADDRESS, type Limit } from "./ratelimit";
+import {
+  addressTag,
+  clientAddress,
+  GLOBAL,
+  LIMITS,
+  recordLimitHit,
+  returnHit,
+  sessionTag,
+  takeHit,
+  UNKNOWN_ADDRESS,
+  writeSuppressedAudit,
+  type Limit,
+} from "./ratelimit";
+import { SESSION_ABSOLUTE_MS } from "./sessions";
 import { CERTIFICATE_LIMITS } from "./webhook-signature";
 
 // dev_url applies the schema to the shared public schema, and two of those running at
@@ -64,6 +81,11 @@ async function hits(bucket: string, subject: string): Promise<number> {
   return rows[0].n;
 }
 
+async function poolHits(bucket: string): Promise<number> {
+  const { rows } = await admin.query<{ n: number }>("select count(*)::int as n from rate_limit_hits where bucket = $1", [bucket]);
+  return rows[0].n;
+}
+
 async function lastAuditId(): Promise<number> {
   const { rows } = await admin.query<{ id: number }>("select coalesce(max(id), 0)::int as id from audit_log");
   return rows[0].id;
@@ -109,6 +131,7 @@ afterAll(async () => {
 
 beforeEach(async () => {
   await admin.query("delete from rate_limit_hits");
+  auditRows.clear();
 });
 
 describe("clientAddress", () => {
@@ -191,31 +214,43 @@ describe("takeHit", () => {
   });
 
   it("counts a global limit across every session: the 101st demo approval in an hour is refused for anyone", async () => {
-    for (let n = 0; n < 100; n += 1) await takeHit(LIMITS.demoApprovals, GLOBAL);
-    expect((await takeHit(LIMITS.demoApprovals, GLOBAL)).allowed).toBe(false);
+    for (let n = 0; n < 100; n += 1) expect((await takeHit(LIMITS.demoApprovals, GLOBAL, { session: `visitor-${n}` })).allowed).toBe(true);
+    expect((await takeHit(LIMITS.demoApprovals, GLOBAL, { session: "visitor-new" })).allowed).toBe(false);
     expect((await takeHit(LIMITS.approve, "a-session")).allowed).toBe(true);
+    expect(await poolHits("demo_approvals_all")).toBe(100);
   });
 
-  it("lets 20 join starts and 20 join returns through per address in a minute, each counted apart", async () => {
-    for (let n = 0; n < 20; n += 1) expect((await takeHit(LIMITS.joinStart, "198.51.100.7")).allowed).toBe(true);
-    const refused = await takeHit(LIMITS.joinStart, "198.51.100.7");
-    expect(!refused.allowed && refused.retryAfterSeconds <= 60).toBe(true);
-    expect((await takeHit(LIMITS.joinCallback, "198.51.100.7")).allowed).toBe(true);
-    expect((await takeHit(LIMITS.joinStart, "198.51.100.8")).allowed).toBe(true);
-    await admin.query("update rate_limit_hits set at = at - interval '61 seconds'");
-    expect((await takeHit(LIMITS.joinStart, "198.51.100.7")).allowed).toBe(true);
-    expect(LIMITS.joinCallback).toEqual({ bucket: "join_callback", max: 20, windowMs: 60_000, per: "address" });
+  it("keeps each shared demo pool's last 20% for sessions that have not drawn on it in the window", async () => {
+    const pool = LIMITS.demoApprovals;
+    const open = pool.max - pool.keptForNewSessions;
+    await admin.query("insert into rate_limit_hits (bucket, subject) select $1, 'drawn-' || (n % 8) from generate_series(1, $2) as n", [pool.bucket, open - 2]);
+    // Below the line a session may draw again.
+    for (let n = 0; n < 2; n += 1) expect((await takeHit(pool, GLOBAL, { session: "drawn-1" })).allowed).toBe(true);
+    expect((await takeHit(pool, GLOBAL, { session: "drawn-1" })).allowed).toBe(false);
+    // A caller that names no session cannot show it has not drawn, so it gets none of the reserve.
+    expect((await takeHit(pool, GLOBAL)).allowed).toBe(false);
+    expect((await takeHit(pool, GLOBAL, { session: "fresh-0" })).allowed).toBe(true);
+    expect((await takeHit(pool, GLOBAL, { session: "fresh-0" })).allowed).toBe(false);
+    for (let n = 1; n < pool.keptForNewSessions; n += 1) expect((await takeHit(pool, GLOBAL, { session: `fresh-${n}` })).allowed).toBe(true);
+    const full = await takeHit(pool, GLOBAL, { session: "fresh-last" });
+    expect(!full.allowed && full.retryAfterSeconds > 0 && full.retryAfterSeconds <= 3600).toBe(true);
+    expect(await poolHits(pool.bucket)).toBe(pool.max);
+    // One window on, every draw has aged out and a session that drew before may draw again.
+    await admin.query("update rate_limit_hits set at = at - make_interval(secs => $1)", [pool.windowMs / 1000 + 1]);
+    expect((await takeHit(pool, GLOBAL, { session: "drawn-1" })).allowed).toBe(true);
   });
 
-  it("lets 60 consent reads through per address in a minute and refuses the 61st", async () => {
-    await admin.query(
-      "insert into rate_limit_hits (bucket, subject, at) select 'join_consent', '198.51.100.7', now() - interval '30 seconds' from generate_series(1, 59)",
-    );
-    expect((await takeHit(LIMITS.joinConsent, "198.51.100.7")).allowed).toBe(true);
-    const refused = await takeHit(LIMITS.joinConsent, "198.51.100.7");
-    expect(!refused.allowed && refused.retryAfterSeconds <= 60).toBe(true);
-    expect((await takeHit(LIMITS.joinConsent, "198.51.100.8")).allowed).toBe(true);
-    expect(await hits("join_consent", "198.51.100.7")).toBe(60);
+  it("gives a hit back: the pool draw a session made leaves the count, as if it was never taken", async () => {
+    const pool = LIMITS.simulates;
+    expect((await takeHit(pool, GLOBAL, { session: "s-1" })).allowed).toBe(true);
+    expect((await takeHit(pool, GLOBAL, { session: "s-2" })).allowed).toBe(true);
+    await returnHit(pool, GLOBAL, { session: "s-1" });
+    expect([await hits(pool.bucket, "s-1"), await hits(pool.bucket, "s-2")]).toEqual([0, 1]);
+    await returnHit(pool, GLOBAL, { session: "s-1" });
+    expect(await poolHits(pool.bucket)).toBe(1);
+    expect((await takeHit(LIMITS.draft, "a-session")).allowed).toBe(true);
+    await returnHit(LIMITS.draft, "a-session");
+    expect(await hits("draft", "a-session")).toBe(0);
   });
 
   it("lets a session pull back unclaimed rewards 10 times an hour, counted apart from its submits", async () => {
@@ -234,38 +269,74 @@ describe("takeHit", () => {
     expect(LIMITS.simulateAddress).toEqual({ bucket: "simulate_address", max: 10, windowMs: HOUR_MS, per: "address" });
   });
 
-  it("leaves every shared pool room that no one address's share can fill", () => {
+  it("lets 50 addresses hold no shared pool closed for longer than its window, at most an hour, and lets no one address close one alone", () => {
+    const ATTACKERS = 50;
+    expect(LIMITS.claudeDemoAll).toEqual({ bucket: "claude_demo_all", max: 50, windowMs: HOUR_MS, per: "all", keptForNewSessions: 10 });
+    expect([LIMITS.claudeDemoSession.max, LIMITS.claudeDemoAddress.max]).toEqual([40, 80]);
     expect(LIMITS.demoSubmitsAddress).toEqual({ bucket: "demo_submits_address", max: 4, windowMs: DAY_MS, per: "address" });
     // 1000 is the engine's DEMO_CAMPAIGN_CAP_MINOR and 5000 its DEMO_DAILY_CAP_MINOR (tasks.py),
     // a pool the engine counts over the same rolling 24 hours.
     expect(LIMITS.demoSubmitsAddress.max * 1000).toBeLessThan(5000);
-    const pairs: readonly (readonly [Limit, Limit])[] = [
+
+    // A session lives at most a day, so an address holds at most demoSessionDay.max live sessions.
+    expect(SESSION_ABSOLUTE_MS).toBeLessThanOrEqual(LIMITS.demoSessionDay.windowMs);
+    const liveSessions = LIMITS.demoSessionDay.max;
+    const demoPools: readonly (readonly [Limit, Limit & { readonly keptForNewSessions: number }])[] = [
       [LIMITS.claudeDemoAddress, LIMITS.claudeDemoAll],
       [LIMITS.demoApprovalsAddress, LIMITS.demoApprovals],
       [LIMITS.simulateAddress, LIMITS.simulates],
     ];
-    for (const [share, pool] of pairs) {
-      expect([share.per, pool.per], share.bucket).toEqual(["address", "all"]);
-      expect(share.windowMs, share.bucket).toBe(pool.windowMs);
-      expect(share.max, share.bucket).toBeLessThan(pool.max);
+    for (const [share, pool] of demoPools) {
+      expect([share.per, pool.per], pool.bucket).toEqual(["address", "all"]);
+      expect(pool.keptForNewSessions, pool.bucket).toBe(pool.max / 5);
+      // One address's draws in one window of the pool: its share over that window, and past
+      // the pool's open part only one draw per live session that had not drawn yet.
+      const shareInWindow = share.max * Math.ceil(pool.windowMs / share.windowMs);
+      const oneAddress = Math.min(shareInWindow, pool.max - pool.keptForNewSessions + liveSessions - 1);
+      expect(oneAddress, pool.bucket).toBeLessThan(pool.max);
+      // Fifty addresses together can fill it, but each draw counts only inside the pool's
+      // window, so the longest it stays closed after their last draw is that window.
+      const fiftyAddresses = Math.min(ATTACKERS * shareInWindow, pool.max - pool.keptForNewSessions + ATTACKERS * liveSessions);
+      expect(fiftyAddresses, pool.bucket).toBeGreaterThanOrEqual(pool.max);
+      expect(pool.windowMs, pool.bucket).toBeLessThanOrEqual(HOUR_MS);
     }
     // Every pool shared by visitors is in the list above; claude_owner is the owner's alone.
     const pools = Object.values(LIMITS).filter((limit) => limit.per === "all").map((limit) => limit.bucket);
-    expect(pools.sort()).toEqual([...pairs.map(([, pool]) => pool.bucket), LIMITS.claudeOwner.bucket].sort());
-    // Certificate downloads are counted in memory (webhook-signature.ts), outside LIMITS.
-    const { address: share, all: pool } = CERTIFICATE_LIMITS;
-    expect([share.per, pool.per]).toEqual(["address", "all"]);
-    expect(share.windowMs).toBe(pool.windowMs);
-    expect([share.max, pool.max]).toEqual([2, 10]);
-    expect(share.max).toBeLessThan(pool.max);
+    expect(pools.sort()).toEqual([...demoPools.map(([, pool]) => pool.bucket), LIMITS.claudeOwner.bucket].sort());
+
+    // The pools traffic nobody authenticated draws on are counted in memory, outside LIMITS.
+    expect([CERTIFICATE_LIMITS.address.max, CERTIFICATE_LIMITS.all.max]).toEqual([2, 10]);
+    for (const { address: share, all: pool } of [WEBHOOK_LIMITS, CERTIFICATE_LIMITS, JOIN_LIMITS.start, JOIN_LIMITS.callback, JOIN_LIMITS.consent]) {
+      expect([share.per, pool.per], pool.bucket).toEqual(["address", "all"]);
+      expect(share.windowMs, pool.bucket).toBe(pool.windowMs);
+      expect(share.max, pool.bucket).toBeLessThan(pool.max);
+      expect(pool.windowMs, pool.bucket).toBeLessThanOrEqual(HOUR_MS);
+    }
   });
 
-  it("sweeps out rows older than every window", async () => {
-    await admin.query("insert into rate_limit_hits (bucket, subject, at) values ('draft', 'old', now() - interval '25 hours')");
-    // The sweep lock is database-wide and other test files run at the same time, so a
-    // call that finds it taken skips the sweep, as it should; a later call sweeps.
-    for (let call = 0; call < 20 && (await hits("draft", "old")) > 0; call += 1) await takeHit(LIMITS.draft, `a-session-${call}`);
-    expect(await hits("draft", "old")).toBe(0);
+  // The sweep lock is database-wide and other test files run at the same time, so a call
+  // that finds it taken skips the sweep, as it should; a later call sweeps.
+  async function sweepUntil(done: () => Promise<boolean>): Promise<void> {
+    for (let call = 0; call < 20 && !(await done()); call += 1) await takeHit(LIMITS.draft, `a-session-${call}`);
+  }
+
+  it("sweeps each bucket's rows, and its first-refusal marker, once older than that bucket's own window", async () => {
+    await admin.query(
+      `insert into rate_limit_hits (bucket, subject, at) values
+         ('sign_in', '198.51.100.7', now() - interval '16 minutes'),
+         ('first:refused:sign_in', '198.51.100.7', now() - interval '16 minutes'),
+         ('sign_in', '198.51.100.8', now() - interval '14 minutes'),
+         ('draft', 'old', now() - interval '16 minutes'),
+         ('draft', 'older', now() - interval '61 minutes'),
+         ('legacy_bucket', 'x', now() - interval '25 hours'),
+         ('legacy_bucket', 'y', now() - interval '23 hours')`,
+    );
+    await sweepUntil(async () => (await hits("sign_in", "198.51.100.7")) === 0);
+    expect(await hits("sign_in", "198.51.100.7")).toBe(0);
+    expect(await hits("first:refused:sign_in", "198.51.100.7")).toBe(0);
+    expect(await hits("sign_in", "198.51.100.8")).toBe(1);
+    expect([await hits("draft", "old"), await hits("draft", "older")]).toEqual([1, 0]);
+    expect([await hits("legacy_bucket", "x"), await hits("legacy_bucket", "y")]).toEqual([0, 1]);
   });
 });
 
@@ -297,6 +368,31 @@ describe("limit hits on the audit record", () => {
       { actor: "web", action: "rate_limit_hit", detail: { bucket: "demo_approvals_all", per: "all" } },
     ]);
     expect(JSON.stringify(rows)).not.toContain(sessionId);
+  });
+
+  it("writes at most 20 limit-hit rows per bucket a minute across the process, then one audit_rows_suppressed row holding the count", async () => {
+    const before = await lastAuditId();
+    const start = Date.now();
+    vi.useFakeTimers({ toFake: ["Date"] });
+    try {
+      vi.setSystemTime(start);
+      for (let n = 0; n < 23; n += 1) await recordLimitHit(LIMITS.signIn, `198.51.100.${100 + n}`);
+      await recordLimitHit(LIMITS.draft, "d".repeat(64));
+      vi.setSystemTime(start + 61_000);
+      await writeSuppressedAudit();
+      await writeSuppressedAudit();
+      await recordLimitHit(LIMITS.signIn, "198.51.100.200");
+    } finally {
+      vi.useRealTimers();
+    }
+    const rows = await auditSince(before);
+    const signIns = rows.filter((row) => row.action === "rate_limit_hit" && (row.detail as { bucket: string }).bucket === "sign_in");
+    expect(signIns).toHaveLength(21);
+    expect(rows.filter((row) => row.action === "rate_limit_hit" && (row.detail as { bucket: string }).bucket === "draft")).toHaveLength(1);
+    expect(rows.filter((row) => row.action === "audit_rows_suppressed")).toEqual([
+      { actor: "web", action: "audit_rows_suppressed", detail: { action: "rate_limit_hit", reason: "sign_in", suppressed: 3 } },
+    ]);
+    expect(rows.at(-1)).toEqual({ actor: "web", action: "rate_limit_hit", detail: { bucket: "sign_in", per: "address", address_tag: addressTag("198.51.100.200") } });
   });
 
   it("refuses the same way when the audit row cannot be written, and logs one line saying so", async () => {

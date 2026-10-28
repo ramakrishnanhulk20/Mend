@@ -15,12 +15,18 @@
  * refuse an "@" or a UUID anywhere in them: one check on the whole output, not a list
  * of the fields that might carry one. It covers emails and member ids; it does not
  * cover a person's name, which is synthetic in the demo shop (C25).
+ *
+ * A simulate answer that passes its schema also records its PayPal order id for the
+ * session that started the run (session-orders.ts), whether it reaches that session
+ * directly or through a poll, so the assistant can show a demo visitor that order and
+ * no other (C18).
  */
 import { z } from "zod";
 import { database } from "./db";
 import { runAndWait, runTask, statusForEngineError, TASK_NAMES, type EngineAnswer, type RunOptions, type TaskName, type Waited } from "./engine";
 import { writeLog } from "./log";
 import { refuse, reply } from "./permissions";
+import { rememberSessionOrder } from "./session-orders";
 
 const SESSION_ID = /^[0-9a-f]{64}$/;
 const RUN_ID = /^(?:brn|trn)-[A-Za-z0-9-]{1,80}$/;
@@ -42,6 +48,9 @@ const displayName = z.string().min(1).max(80).regex(/^[^\p{Cc}\p{Cf}@]+$/u);
 const shopName = z.string().min(1).max(100).regex(/^\P{C}+$/u);
 const consentText = z.string().min(1).max(400).regex(/^\P{C}+$/u);
 const sha256Hex = z.string().regex(/^[0-9a-f]{64}$/);
+// The engine's name for the members a demo script joined, whom no person agreed to be (tasks.py SEEDED_LABEL).
+// Kept apart from the people who joined, and never added to them.
+const seededLabel = z.literal("demo stand-ins");
 
 function carriesNoIdentifier(body: unknown): boolean {
   const text = JSON.stringify(body);
@@ -153,21 +162,111 @@ const CUTOFF = z.strictObject({ cutoff: day, customers: count, converged: z.bool
 const DECILE_ANSWER = z.strictObject({ decile: z.number().int().min(1).max(10), customers: count, returned_share: share });
 const DECILE = z.strictObject({ decile: z.number().int().min(1).max(10), customers: count, returnedShare: share });
 
-const BACKTEST_ANSWER = z.strictObject({
-  source: z.string().min(1).max(200),
-  holdout_days: count,
-  cutoffs: z.array(CUTOFF_ANSWER).max(20),
-  converged: count,
-  model_wins: count,
-  mean_auc_gain: z.number().min(-1).max(1).nullable(),
-  decile_cutoff: day.nullable(),
-  deciles: z.array(DECILE_ANSWER).max(10),
-  passed: z.boolean(),
-  computed_at: time,
+// The model's AUC minus recency's, and the bounds of its bootstrap interval.
+const difference = z.number().min(-1).max(1);
+const groupLabel = z.string().regex(/^[a-z ]{1,40}$/);
+
+// One backtest group (store_facts.py _group_fact): the live segment campaigns pick from,
+// or every customer. The engine writes null where a group was too small to measure: the
+// segment rule for all customers, the pooled difference and interval with no valid
+// cutoff, and each cutoff's numbers where nobody in the group came back.
+const GROUP_CUTOFF_ANSWER = z.strictObject({
+  cutoff: day,
+  customers: count,
+  returned: count,
+  auc_model: share.nullable(),
+  auc_recency: share.nullable(),
+  difference: difference.nullable(),
+  interval_low: difference.nullable(),
+  interval_high: difference.nullable(),
 });
+const GROUP_CUTOFF = z.strictObject({
+  cutoff: day,
+  customers: count,
+  returned: count,
+  aucModel: share.nullable(),
+  aucRecency: share.nullable(),
+  difference: difference.nullable(),
+  intervalLow: difference.nullable(),
+  intervalHigh: difference.nullable(),
+});
+const GROUP_ANSWER = z.strictObject({
+  group: groupLabel,
+  regular_min_days: count.nullable(),
+  silent_min_days: count.nullable(),
+  confidence: share,
+  resamples: count,
+  valid_cutoffs: count,
+  model_wins: count,
+  mean_auc_difference: difference.nullable(),
+  interval_low: difference.nullable(),
+  interval_high: difference.nullable(),
+  cutoffs: z.array(GROUP_CUTOFF_ANSWER).max(20),
+});
+const GROUP = z.strictObject({
+  group: groupLabel,
+  regularMinDays: count.nullable(),
+  silentMinDays: count.nullable(),
+  confidence: share,
+  resamples: count,
+  validCutoffs: count,
+  modelWins: count,
+  meanAucDifference: difference.nullable(),
+  intervalLow: difference.nullable(),
+  intervalHigh: difference.nullable(),
+  cutoffs: z.array(GROUP_CUTOFF).max(20),
+});
+
+function group(answer: z.output<typeof GROUP_ANSWER>): z.input<typeof GROUP> {
+  return {
+    group: answer.group,
+    regularMinDays: answer.regular_min_days,
+    silentMinDays: answer.silent_min_days,
+    confidence: answer.confidence,
+    resamples: answer.resamples,
+    validCutoffs: answer.valid_cutoffs,
+    modelWins: answer.model_wins,
+    meanAucDifference: answer.mean_auc_difference,
+    intervalLow: answer.interval_low,
+    intervalHigh: answer.interval_high,
+    cutoffs: answer.cutoffs.map((c) => ({
+      cutoff: c.cutoff,
+      customers: c.customers,
+      returned: c.returned,
+      aucModel: c.auc_model,
+      aucRecency: c.auc_recency,
+      difference: c.difference,
+      intervalLow: c.interval_low,
+      intervalHigh: c.interval_high,
+    })),
+  };
+}
+
+// Every older key keeps its all-customer meaning. headline (the live segment) and
+// all_customers were added together, so a row stored before them has neither, and a row
+// with only one of them is malformed.
+const BACKTEST_ANSWER = z
+  .strictObject({
+    source: z.string().min(1).max(200),
+    holdout_days: count,
+    cutoffs: z.array(CUTOFF_ANSWER).max(20),
+    converged: count,
+    model_wins: count,
+    mean_auc_gain: z.number().min(-1).max(1).nullable(),
+    decile_cutoff: day.nullable(),
+    deciles: z.array(DECILE_ANSWER).max(10),
+    passed: z.boolean(),
+    computed_at: time,
+    headline: GROUP_ANSWER.optional(),
+    all_customers: GROUP_ANSWER.optional(),
+  })
+  .refine((answer) => (answer.headline === undefined) === (answer.all_customers === undefined), "headline and all_customers come together");
+// The live-segment headline comes before the all-customer result, and both are null for a row stored before them.
 const BACKTEST = z.strictObject({
   source: z.string().min(1).max(200),
   holdoutDays: count,
+  headline: GROUP.nullable(),
+  allCustomers: GROUP.nullable(),
   cutoffs: z.array(CUTOFF).max(20),
   converged: count,
   modelWins: count,
@@ -325,7 +424,9 @@ const SPECS: Readonly<Record<TaskName, Spec>> = {
       ok: z.literal(true),
       as_of: day.nullable(),
       shop_customers: count,
-      members: count,
+      members_joined: count,
+      members_seeded: count,
+      members_seeded_label: seededLabel,
       quiet_regulars: count,
       quiet_regulars_paid_12m_minor: cents,
       currency: z.literal("USD"),
@@ -335,7 +436,9 @@ const SPECS: Readonly<Record<TaskName, Spec>> = {
     (a) => ({
       asOf: a.as_of,
       shopCustomers: a.shop_customers,
-      members: a.members,
+      membersJoined: a.members_joined,
+      membersSeeded: a.members_seeded,
+      membersSeededLabel: a.members_seeded_label,
       quietRegulars: a.quiet_regulars,
       quietRegularsPaid12mMinor: a.quiet_regulars_paid_12m_minor,
       currency: a.currency,
@@ -356,6 +459,8 @@ const SPECS: Readonly<Record<TaskName, Spec>> = {
           : {
               source: a.backtest.source,
               holdoutDays: a.backtest.holdout_days,
+              headline: a.backtest.headline === undefined ? null : group(a.backtest.headline),
+              allCustomers: a.backtest.all_customers === undefined ? null : group(a.backtest.all_customers),
               cutoffs: a.backtest.cutoffs.map((c) => ({ cutoff: c.cutoff, customers: c.customers, converged: c.converged, aucModel: c.auc_model, aucRecency: c.auc_recency })),
               converged: a.backtest.converged,
               modelWins: a.backtest.model_wins,
@@ -370,7 +475,9 @@ const SPECS: Readonly<Record<TaskName, Spec>> = {
       .strictObject({
         asOf: day.nullable(),
         shopCustomers: count,
-        members: count,
+        membersJoined: count,
+        membersSeeded: count,
+        membersSeededLabel: seededLabel,
         quietRegulars: count,
         quietRegularsPaid12mMinor: cents,
         currency: z.literal("USD"),
@@ -514,11 +621,36 @@ export async function recordRun(runId: string, sessionId: string, task: TaskName
   }
 }
 
+// Who started each simulate run a poll has asked about. The poll route reads a run's
+// owner here (ownedRunTask) before it builds the answer (finishedResponse), and recordRun
+// gives a run id exactly one owner, so the session noted for a run is always the one that
+// started it. Kept for as long as a run may be polled, and for at most this many runs.
+const SIMULATE_OWNER_MS = 60 * 60 * 1000;
+const MAX_SIMULATE_OWNERS = 1000;
+const simulateOwners = new Map<string, { readonly sessionId: string; readonly at: number }>();
+
+function noteSimulateOwner(runId: string, sessionId: string): void {
+  const now = Date.now();
+  simulateOwners.delete(runId);
+  simulateOwners.set(runId, { sessionId, at: now });
+  for (const [id, owner] of simulateOwners) {
+    if (simulateOwners.size <= MAX_SIMULATE_OWNERS && now - owner.at < SIMULATE_OWNER_MS) break;
+    simulateOwners.delete(id);
+  }
+}
+
+function simulateOwner(runId: string): string | null {
+  const owner = simulateOwners.get(runId);
+  return owner !== undefined && Date.now() - owner.at < SIMULATE_OWNER_MS ? owner.sessionId : null;
+}
+
 /** The task of run runId if the session with id hash sessionId started it, otherwise null. */
 export async function ownedRunTask(runId: string, sessionId: string): Promise<TaskName | null> {
   if (!RUN_ID.test(runId) || !SESSION_ID.test(sessionId)) return null;
   const { rows } = await database().query<{ task: string }>("select task from run_owners where run_id = $1 and session_id_hash = $2", [runId, sessionId]);
-  return TASK_NAMES.find((name) => name === rows[0]?.task) ?? null;
+  const task = TASK_NAMES.find((name) => name === rows[0]?.task) ?? null;
+  if (task === "simulate_return") noteSimulateOwner(runId, sessionId);
+  return task;
 }
 
 /** True when the caller asked not to wait for the work (Prefer: respond-async, RFC 7240). */
@@ -544,7 +676,10 @@ export async function pendingResponse(route: string, ref: string, task: TaskName
  * The response for a finished run of task, exactly as the route that started it gives
  * it: the engine's refusal with its code, status and ref; 500 for a failed run or an
  * answer that does not fit the task's schema; otherwise the task's success status and
- * its checked body.
+ * its checked body. sessionId is the session the answer goes to, when the caller knows
+ * it; a poll leaves it out and the owner ownedRunTask noted is used. A checked simulate
+ * answer records its order id for that session; with no known session, nothing is
+ * recorded.
  */
 export function finishedResponse(
   route: string,
@@ -552,6 +687,7 @@ export function finishedResponse(
   task: TaskName,
   runId: string,
   run: { readonly status: "succeeded" | "failed"; readonly result?: EngineAnswer },
+  sessionId: string | null = null,
 ): Response {
   if (run.status === "failed" || run.result === undefined) return refuse(route, ref, 500, "internal", { reason: "run_failed", run_id: runId });
   if (!run.result.ok) {
@@ -561,6 +697,10 @@ export function finishedResponse(
   const { status: okStatus, check } = SPECS[task];
   const body = check(run.result);
   if (body === null) return refuse(route, ref, 500, "internal", { reason: "malformed_answer", task, run_id: runId });
+  if (task === "simulate_return" && typeof body.paypalOrderId === "string") {
+    const buyer = sessionId ?? simulateOwner(runId);
+    if (buyer !== null) rememberSessionOrder(buyer, body.paypalOrderId);
+  }
   writeLog({ kind: "api", route, ref, status: okStatus, outcome: "answered", task, run_id: runId });
   return reply(okStatus, body);
 }
@@ -568,7 +708,7 @@ export function finishedResponse(
 /** finishedResponse for a run that finished in time, or a recorded 202 for one still going. */
 export async function waitedResponse(route: string, ref: string, task: TaskName, waited: Waited, sessionId: string): Promise<Response> {
   if (waited.state === "pending") return pendingResponse(route, ref, task, waited.runId, sessionId);
-  return finishedResponse(route, ref, task, waited.runId, waited);
+  return finishedResponse(route, ref, task, waited.runId, waited, sessionId);
 }
 
 /**

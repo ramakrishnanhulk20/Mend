@@ -12,6 +12,16 @@
  * Everything the engine answers is checked against the shape the engine promises
  * before any route uses it (C12): {"ok": true, ...} or {"ok": false, "error": <code>,
  * "ref": <uuid>}. Anything else counts as a failed run.
+ *
+ * At most 2 calls are in flight at once for one holder (C20), so no visitor can tie up
+ * the engine's workers: the session named by the call's actor argument, the same
+ * {role, session} object the engine checks; for a call with no session, the client
+ * address the caller passes; for a call naming neither (the owner's admin jobs, which
+ * pass no actor, and the public summary), the task itself. A third call is not sent:
+ * its run is finished at once with the refusal too_many_running, which routes answer as
+ * 429 like any engine refusal. A call stays in flight until the engine answers or the
+ * 120-second timeout ends it, also after a route has answered 202. Does not cover many
+ * sessions or addresses at once; the per-address limits on opening sessions bound those.
  */
 import { randomUUID } from "node:crypto";
 import { isIP } from "node:net";
@@ -51,6 +61,12 @@ const MAX_ANSWER_BYTES = 1_000_000;
 const MAX_RUNS = 500;
 const IDEMPOTENCY_WINDOW_MS = 24 * 60 * 60 * 1000;
 const MIN_TOKEN_CHARS = 32;
+const MAX_ADDRESS_CHARS = 64;
+
+/** Engine calls one session, client address or task may have in flight at once. */
+export const MAX_IN_FLIGHT = 2;
+/** The refusal a run carries when its holder already had MAX_IN_FLIGHT calls in flight. */
+export const TOO_MANY_RUNNING = "too_many_running";
 
 // One shape for both modes; runs.ts records ids of this shape against their session.
 const RUN_ID = /^brn-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
@@ -66,7 +82,12 @@ const answerSchema = z.union([
 
 export type EngineAnswer = z.infer<typeof answerSchema>;
 export type Run = { readonly status: RunStatus; readonly result?: EngineAnswer };
-export type RunOptions = { readonly idempotencyKey?: string };
+/**
+ * idempotencyKey: a repeat within 24 hours returns the first run. address: the client
+ * address (ratelimit.ts clientAddress) a call with no session in its arguments counts
+ * against for MAX_IN_FLIGHT.
+ */
+export type RunOptions = { readonly idempotencyKey?: string; readonly address?: string };
 
 /** The engine could not be asked: a run could not be started or read. */
 export class EngineUnavailable extends Error {
@@ -89,6 +110,9 @@ function checkedArguments(name: string, options: RunOptions): void {
   if (options.idempotencyKey !== undefined && !IDEMPOTENCY_KEY.test(options.idempotencyKey)) {
     throw new Error("idempotency key must be 1 to 255 letters, digits or _.:-");
   }
+  if (options.address !== undefined && (options.address.length > MAX_ADDRESS_CHARS || !PRINTABLE_NO_SPACE.test(options.address))) {
+    throw new Error("a client address must be 1 to 64 printable characters");
+  }
 }
 
 function sleep(ms: number): Promise<void> {
@@ -103,16 +127,40 @@ function readAnswer(value: unknown): EngineAnswer | null {
 /** Where task calls go in this mode, and the token and header they carry. */
 type Target = { readonly mode: "bridge" | "service"; readonly url: URL; readonly token: string; readonly header: string };
 
-type LocalRun = { readonly startedAt: number; readonly key: string | null; run: Run };
-type RunStore = { readonly runs: Map<string, LocalRun>; readonly keys: Map<string, string> };
+type LocalRun = { readonly startedAt: number; readonly key: string | null; run: Run; readonly settled: Promise<Run> };
+type RunStore = { readonly runs: Map<string, LocalRun>; readonly keys: Map<string, string>; inFlight?: Map<string, number> };
 
 // Kept on globalThis because Next.js may load this module once per route bundle: a run
-// started by one route must be readable from GET /api/runs/[runId] in the same process.
+// started by one route must be readable from GET /api/runs/[runId] in the same process,
+// and the in-flight counts must be one count per holder for the whole process.
 const STORE_KEY = Symbol.for("mend.engine.runs");
 const holder = globalThis as typeof globalThis & { [STORE_KEY]?: RunStore };
 const store: RunStore = (holder[STORE_KEY] ??= { runs: new Map(), keys: new Map() });
 const localRuns = store.runs;
 const localKeys = store.keys;
+const inFlight: Map<string, number> = (store.inFlight ??= new Map());
+
+type Holder = { readonly kind: "session" | "address" | "task"; readonly key: string };
+
+// The actor every signed-in route builds from its principal, and the engine checks.
+const ACTOR_KEYS = "role,session";
+
+/** Who a call counts against for MAX_IN_FLIGHT; see the file comment. */
+function holderOf(name: TaskName, args: readonly unknown[], options: RunOptions): Holder {
+  for (const arg of args) {
+    if (typeof arg !== "object" || arg === null || Array.isArray(arg) || Object.keys(arg).sort().join(",") !== ACTOR_KEYS) continue;
+    const session: unknown = (arg as { session?: unknown }).session;
+    if (typeof session === "string") return { kind: "session", key: `session\n${session}` };
+  }
+  if (options.address !== undefined) return { kind: "address", key: `address\n${options.address}` };
+  return { kind: "task", key: `task\n${name}` };
+}
+
+function release(key: string): void {
+  const left = (inFlight.get(key) ?? 1) - 1;
+  if (left > 0) inFlight.set(key, left);
+  else inFlight.delete(key);
+}
 
 function bareOrigin(url: URL): boolean {
   return url.username === "" && url.password === "" && url.pathname === "/" && url.search === "" && url.hash === "";
@@ -195,6 +243,16 @@ function remember(runId: string, entry: LocalRun): void {
   }
 }
 
+// A run finished before any call: holder already has MAX_IN_FLIGHT calls in flight. It
+// carries no idempotency key, so a retry with the same key is free to start a real call.
+function refusedRun(name: TaskName, holderKind: Holder["kind"]): string {
+  const runId = `brn-${randomUUID()}`;
+  const run: Run = { status: "succeeded", result: { ok: false, error: TOO_MANY_RUNNING, ref: randomUUID() } };
+  remember(runId, { startedAt: Date.now(), key: null, run, settled: Promise.resolve(run) });
+  writeLog({ kind: "engine", outcome: "refused_in_flight", task: name, holder: holderKind, run_id: runId, ref: run.result?.ref });
+  return runId;
+}
+
 function startRun(target: Target, name: TaskName, args: readonly unknown[], options: RunOptions): string {
   const key = options.idempotencyKey ?? null;
   if (key !== null) {
@@ -202,25 +260,38 @@ function startRun(target: Target, name: TaskName, args: readonly unknown[], opti
     const entry = earlier === undefined ? undefined : localRuns.get(earlier);
     if (earlier !== undefined && entry !== undefined && Date.now() - entry.startedAt < IDEMPOTENCY_WINDOW_MS) return earlier;
   }
+  const owner = holderOf(name, args, options);
+  const running = inFlight.get(owner.key) ?? 0;
+  if (running >= MAX_IN_FLIGHT) return refusedRun(name, owner.kind);
+  inFlight.set(owner.key, running + 1);
   const runId = `brn-${randomUUID()}`;
-  const entry: LocalRun = { startedAt: Date.now(), key, run: { status: "running" } };
+  let settle: (run: Run) => void = () => undefined;
+  const settled = new Promise<Run>((resolve) => {
+    settle = resolve;
+  });
+  const entry: LocalRun = { startedAt: Date.now(), key, run: { status: "running" }, settled };
   remember(runId, entry);
-  callEngine(target, name, args).then(
-    (answer) => {
-      entry.run = { status: "succeeded", result: answer };
-    },
-    (error: unknown) => {
-      entry.run = { status: "failed" };
-      writeLog({
-        kind: "engine",
-        outcome: "engine_call_failed",
-        mode: target.mode,
-        task: name,
-        run_id: runId,
-        reason: error instanceof Error ? error.message : "unknown",
-      });
-    },
-  );
+  callEngine(target, name, args)
+    .then(
+      (answer) => {
+        entry.run = { status: "succeeded", result: answer };
+      },
+      (error: unknown) => {
+        entry.run = { status: "failed" };
+        writeLog({
+          kind: "engine",
+          outcome: "engine_call_failed",
+          mode: target.mode,
+          task: name,
+          run_id: runId,
+          reason: error instanceof Error ? error.message : "unknown",
+        });
+      },
+    )
+    .finally(() => {
+      release(owner.key);
+      settle(entry.run);
+    });
   return runId;
 }
 
@@ -228,9 +299,12 @@ function startRun(target: Target, name: TaskName, args: readonly unknown[], opti
  * Start task name with positional args and return the run id at once, without waiting
  * for the run: the engine's task server (MEND_ENGINE_URL) in production, the dev bridge
  * (MEND_BRIDGE_URL) with MEND_DEV on. A repeat with the same idempotencyKey within 24
- * hours returns the first run's id instead of starting another. Throws ConfigError,
- * before anything is sent, when that mode's address or token is missing or wrong. A
- * call that then fails makes the run "failed".
+ * hours returns the first run's id instead of starting another. When the call's holder
+ * already has MAX_IN_FLIGHT calls in flight, nothing is sent and the run is finished at
+ * once with the refusal too_many_running. Throws ConfigError, before anything is sent,
+ * when that mode's address or token is missing or wrong, and Error for an unknown task,
+ * a malformed idempotency key or client address. A call that then fails makes the run
+ * "failed".
  */
 export async function runTask(name: TaskName, args: readonly unknown[], options: RunOptions = {}): Promise<string> {
   checkedArguments(name, options);
@@ -253,35 +327,48 @@ export async function getRun(runId: string): Promise<Run> {
   return entry.run;
 }
 
+/**
+ * The run once it is no longer running, at once for one already finished, so a route
+ * can act on the answer after it has replied 202. Throws RunNotFound as getRun does.
+ */
+export async function runSettled(runId: string): Promise<Run> {
+  const entry = RUN_ID.test(runId) ? localRuns.get(runId) : undefined;
+  if (entry === undefined) throw new RunNotFound();
+  return entry.settled;
+}
+
 export type Waited =
   | { readonly state: "finished"; readonly runId: string; readonly status: "succeeded" | "failed"; readonly result?: EngineAnswer }
   | { readonly state: "pending"; readonly httpStatus: 202; readonly runId: string };
 
 /**
- * Start a run and poll it every 500 ms for up to timeoutMs, for use inside a route.
- * Returns the finished run, or, once the time is up, httpStatus 202 with the run id
- * so the route can answer at once and the run carries on. A failed read while polling
- * is treated as still running. Throws as runTask does when the run cannot be started.
+ * Start a run, read it at once and then every 500 ms for up to timeoutMs, for use
+ * inside a route. Returns the finished run, a refused one at once, or, once the time is
+ * up, httpStatus 202 with the run id so the route can answer at once and the run carries
+ * on. A failed read while polling is treated as still running. Throws as runTask does
+ * when the run cannot be started.
  */
 export async function runAndWait(name: TaskName, args: readonly unknown[], timeoutMs: number, options: RunOptions = {}): Promise<Waited> {
   return waitForRun(await runTask(name, args, options), timeoutMs);
 }
 
 /**
- * Poll a run already started every 500 ms for up to timeoutMs, as runAndWait does. A
- * timeoutMs of 0 reads the run once. Throws RunNotFound for an id never issued.
+ * Read a run already started at once and then every 500 ms for up to timeoutMs, as
+ * runAndWait does. A timeoutMs of 0 reads the run once. Throws RunNotFound for an id
+ * never issued.
  */
 export async function waitForRun(runId: string, timeoutMs: number): Promise<Waited> {
   const deadline = Date.now() + timeoutMs;
   for (;;) {
-    await sleep(Math.min(POLL_MS, Math.max(deadline - Date.now(), 0)));
     try {
       const run = await getRun(runId);
       if (run.status !== "running") return { state: "finished", runId, status: run.status, result: run.result };
     } catch (error) {
       if (!(error instanceof EngineUnavailable)) throw error;
     }
-    if (Date.now() >= deadline) return { state: "pending", httpStatus: 202, runId };
+    const left = deadline - Date.now();
+    if (left <= 0) return { state: "pending", httpStatus: 202, runId };
+    await sleep(Math.min(POLL_MS, left));
   }
 }
 
@@ -297,7 +384,7 @@ export function statusForEngineError(code: string): number {
   if (code === "not_found") return 404;
   if (code === "invalid_input" || code === "invalid_actor") return 400;
   if (code === "forbidden") return 403;
-  if (code === "limit_reached" || code === "over_demo_daily_cap" || code === "over_daily_cap") return 429;
+  if (code === "limit_reached" || code === "over_demo_daily_cap" || code === "over_daily_cap" || code === TOO_MANY_RUNNING) return 429;
   // busy: another demo send held the spend lock for 10 s; balance_unavailable: PayPal could not report the balance.
   if (code === "paypal_unavailable" || code === "busy" || code === "balance_unavailable") return 503;
   if (code === "internal") return 500;

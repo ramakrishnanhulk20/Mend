@@ -33,6 +33,9 @@ const STEP_WAIT_MS = 20_000;
 const NOTE_CHARACTERS = /^[A-Za-z0-9 .,!?'"():;&-]+$/;
 // A word, a dot and two or more letters with no space between: "evil.example", "x.co".
 const DOMAIN_LIKE = /[A-Za-z0-9-]\.[A-Za-z]{2,}/;
+// A dot bracketed, or written out before a web ending, still makes a link ("polka dot" does not);
+// the engine's rule reads it the same way.
+const SPELLED_DOT = /\[\.\]|\(\.\)|\{\.\}|\s+dot\s+(?=(?:com|net|org|io|co|info|biz|shop|store|app|dev|xyz|me|us|uk|example)\b)/gi;
 // A rule rather than a list of separators: every character that is not a letter or a
 // digit, in any script, is taken out before digits are counted, so "(415) 555-0199",
 // "415;555;0199" and "415&555&0199" all count as 4155550199. Letters still split a run,
@@ -73,7 +76,8 @@ export function noteProblem(text: string): string | null {
   if (text.length > MAX_NOTE_CHARS) return `is longer than ${MAX_NOTE_CHARS} characters`;
   if (!NOTE_CHARACTERS.test(text)) return "uses a character other than letters, digits and plain punctuation";
   const lowered = text.toLowerCase();
-  if (lowered.includes("http") || lowered.includes("www.") || DOMAIN_LIKE.test(text)) return "looks like a link";
+  const dotted = text.replace(SPELLED_DOT, ".");
+  if (lowered.includes("http") || dotted.toLowerCase().includes("www.") || DOMAIN_LIKE.test(dotted)) return "looks like a link";
   if (hasLongDigitRun(text)) return "has a run of 7 or more digits";
   if (SANDBOX_CODE.test(text)) return "starts with a PayPal sandbox test code";
   const brand = namedBrand(lowered);

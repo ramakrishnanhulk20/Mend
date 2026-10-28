@@ -1,8 +1,10 @@
 /**
  * Rate limits counted in Postgres (C18, C20), on things the caller cannot choose: the
- * client address the platform saw, or a session id this server issued. The webhook,
- * which anyone can post to, is counted in memory instead (address-limits.ts), so that
- * traffic nobody has authenticated never reaches the database.
+ * client address the platform saw, or a session id this server issued. The webhook and
+ * the public join routes, which anyone can call, are counted in memory instead
+ * (address-limits.ts), so that traffic nobody has authenticated never writes a row here.
+ * Each bucket's rows are swept out once older than that bucket's own window, so the
+ * table holds only rows that still count.
  *
  * The client address is the right-most entry of X-Forwarded-For. On Render, the proxy
  * in front of the app appends the address it received the connection from, so
@@ -22,11 +24,13 @@
  * after a deploy which address Render hands the app.
  *
  * The first refusal in each window for a bucket and subject is written to the audit
- * log (C23), best-effort, with a short tag in place of the address or session id.
+ * log (C23), best-effort, with a short tag in place of the address or session id, and
+ * at most 20 such rows per bucket a minute across the process (appendCappedAudit).
  */
 import { createHmac } from "node:crypto";
 import { isIP } from "node:net";
 import type { PoolClient } from "pg";
+import { auditRows } from "./address-limits";
 import { appendAudit, type AuditDetail } from "./audit";
 import { csrfSecret } from "./csrf";
 import { database } from "./db";
@@ -35,7 +39,12 @@ import { writeLog } from "./log";
 /** What a limit counts on: one client address, one session this server issued, or every caller together. */
 export type Per = "address" | "session" | "all";
 
-export type Limit = { readonly bucket: string; readonly max: number; readonly windowMs: number; readonly per: Per };
+/**
+ * A count of max requests in a sliding window. keptForNewSessions, on a pool shared by
+ * every demo visitor: the last that many of max are kept for sessions that have not drawn
+ * on the pool in the current window.
+ */
+export type Limit = { readonly bucket: string; readonly max: number; readonly windowMs: number; readonly per: Per; readonly keptForNewSessions?: number };
 
 const MINUTE_MS = 60 * 1000;
 const HOUR_MS = 60 * MINUTE_MS;
@@ -44,10 +53,12 @@ const DAY_MS = 24 * HOUR_MS;
 // Per-session limits count against a session id this server issued, per-address ones
 // against clientAddress. The "all" limits count every caller together (subject GLOBAL),
 // the global caps C20 asks for on demo Claude calls, demo approvals and simulates; the
-// engine's demo pool caps demo spending on top. Each shared pool has a per-address share
-// below it, so no one address can take a whole pool (ratelimit.test.ts checks every
-// pair). Where a route takes several, the narrowest is taken first, so a caller stopped
-// there never fills a wider count.
+// engine's demo pool caps demo spending on top. Each shared demo pool keeps its last 20%
+// for sessions that have not drawn on it in the window, and has a per-address share, so
+// no one address can close a whole pool, and no pool counts over more than an hour, so a
+// pool many addresses fill opens again within the hour (ratelimit.test.ts checks both
+// from these numbers). Where a route takes several, the narrowest is taken first, so a
+// caller stopped there never fills a wider count.
 export const LIMITS = {
   signIn: { bucket: "sign_in", max: 10, windowMs: 15 * 60 * 1000, per: "address" },
   // Each demo session opens a fresh set of per-session counts, so the number one address
@@ -56,9 +67,11 @@ export const LIMITS = {
   demoSessionDay: { bucket: "demo_session_day", max: 10, windowMs: DAY_MS, per: "address" },
   draft: { bucket: "draft", max: 20, windowMs: HOUR_MS, per: "session" },
   quietRegulars: { bucket: "quiet_regulars", max: 60, windowMs: HOUR_MS, per: "session" },
+  // Each view is an engine run that rebuilds the campaign, so one session cannot keep the engine busy.
+  viewCampaign: { bucket: "view_campaign", max: 60, windowMs: HOUR_MS, per: "session" },
   approve: { bucket: "approve", max: 20, windowMs: HOUR_MS, per: "session" },
   demoApprovalsAddress: { bucket: "demo_approvals_address", max: 10, windowMs: HOUR_MS, per: "address" },
-  demoApprovals: { bucket: "demo_approvals_all", max: 100, windowMs: HOUR_MS, per: "all" },
+  demoApprovals: { bucket: "demo_approvals_all", max: 100, windowMs: HOUR_MS, per: "all", keptForNewSessions: 20 },
   submit: { bucket: "submit", max: 10, windowMs: HOUR_MS, per: "session" },
   // Demo submits per client address over a rolling day: at the engine's 1000-cent demo
   // campaign cap, 4 send at most 4000 cents, under the 5000-cent daily demo pool, so one
@@ -68,32 +81,26 @@ export const LIMITS = {
   cancelUnclaimed: { bucket: "cancel_unclaimed", max: 10, windowMs: HOUR_MS, per: "session" },
   simulate: { bucket: "simulate", max: 10, windowMs: HOUR_MS, per: "session" },
   simulateAddress: { bucket: "simulate_address", max: 10, windowMs: HOUR_MS, per: "address" },
-  simulates: { bucket: "simulates_all", max: 100, windowMs: HOUR_MS, per: "all" },
+  simulates: { bucket: "simulates_all", max: 100, windowMs: HOUR_MS, per: "all", keptForNewSessions: 20 },
   results: { bucket: "results", max: 240, windowMs: HOUR_MS, per: "session" },
   // One poll every 2 seconds for a whole hour; each poll may read Render's API.
   runPoll: { bucket: "run_poll", max: 1800, windowMs: HOUR_MS, per: "session" },
   admin: { bucket: "admin", max: 30, windowMs: HOUR_MS, per: "session" },
-  // Claude calls, each request to the model and each tool-runner round, over a rolling
-  // day (C20, 6n): per demo session, per demo client address, across every demo session,
-  // and for the owner.
+  // Claude calls, each request to the model and each tool-runner round (C20, 6n): per
+  // demo session and per demo client address over a rolling day, across every demo
+  // session over an hour, so a pool filled by many addresses opens again within the hour,
+  // and for the owner over a day.
   claudeDemoSession: { bucket: "claude_demo_session", max: 40, windowMs: DAY_MS, per: "session" },
   claudeDemoAddress: { bucket: "claude_demo_address", max: 80, windowMs: DAY_MS, per: "address" },
-  claudeDemoAll: { bucket: "claude_demo_all", max: 600, windowMs: DAY_MS, per: "all" },
+  claudeDemoAll: { bucket: "claude_demo_all", max: 50, windowMs: HOUR_MS, per: "all", keptForNewSessions: 10 },
   claudeOwner: { bucket: "claude_owner", max: 2000, windowMs: DAY_MS, per: "all" },
-  // The two public Join with PayPal steps, per client address. A person signs in once,
-  // so a few retries after a cancel stay well inside 20 a minute.
-  joinStart: { bucket: "join_start", max: 20, windowMs: MINUTE_MS, per: "address" },
-  joinCallback: { bucket: "join_callback", max: 20, windowMs: MINUTE_MS, per: "address" },
-  // The public consent words: each read is an engine run, so one address cannot keep the engine busy.
-  joinConsent: { bucket: "join_consent", max: 60, windowMs: MINUTE_MS, per: "address" },
 } as const satisfies Record<string, Limit>;
 
 /** The subject for limits that count every caller together. */
 export const GLOBAL = "all";
 
-const LONGEST_WINDOW_MS = Math.max(...Object.values(LIMITS).map((limit) => limit.windowMs));
 // Lock keys: the two-number form scopes one lock per bucket and subject; the single
-// number lets just one request at a time sweep out rows older than every window.
+// number lets just one request at a time sweep out rows that no longer count.
 const HIT_LOCK_CLASS = 773141;
 const SWEEP_LOCK = 7731400001;
 export const UNKNOWN_ADDRESS = "unknown";
@@ -101,6 +108,24 @@ const TAG_HEX_CHARS = 12;
 // Marker rows saying "already recorded in this window" live in rate_limit_hits under
 // this prefix. Limit buckets are plain lowercase names, so no marker shares their count.
 const FIRST_MARKER = "first:";
+const REFUSED_KEY = "refused:";
+
+// What the sweep keeps: each bucket's rows, and its first-refusal marker, for that
+// bucket's own window; a row under any other name, such as a bucket since removed, for
+// the longest window. Built from LIMITS, so a new limit is swept without a list to keep.
+const WINDOWS = Object.values(LIMITS).flatMap((limit: Limit) => [
+  [limit.bucket, limit.windowMs],
+  [`${FIRST_MARKER}${REFUSED_KEY}${limit.bucket}`, limit.windowMs],
+] as const);
+const SWEEP_BUCKETS = WINDOWS.map(([bucket]) => bucket);
+const SWEEP_SECONDS = WINDOWS.map(([, windowMs]) => windowMs / 1000);
+const SHORTEST_WINDOW_MS = Math.min(...WINDOWS.map(([, windowMs]) => windowMs));
+const LONGEST_WINDOW_MS = Math.max(...WINDOWS.map(([, windowMs]) => windowMs));
+// The first condition lets the at index skip every row still inside the shortest window.
+const SWEEP_SQL = `delete from rate_limit_hits h
+  where h.at < now() - make_interval(secs => $3)
+    and h.at < now() - make_interval(secs => coalesce(
+          (select w.secs from unnest($1::text[], $2::float8[]) as w(bucket, secs) where w.bucket = h.bucket), $4))`;
 
 function ipv6Block(address: string): string {
   const [head, tail = ""] = address.split("::");
@@ -184,31 +209,99 @@ async function claimFirst(client: PoolClient, key: string, subject: string, wind
   return true;
 }
 
-async function countHit(limit: Limit, subject: string): Promise<{ readonly result: HitResult; readonly firstRefusal: boolean }> {
-  return underLock(limit.bucket, subject, async (client) => {
-    const sweep = await client.query<{ got: boolean }>("select pg_try_advisory_xact_lock($1) as got", [SWEEP_LOCK]);
-    if (sweep.rows[0].got) {
-      await client.query("delete from rate_limit_hits where at < now() - make_interval(secs => $1)", [LONGEST_WINDOW_MS / 1000]);
-    }
-    const { rows } = await client.query<{ n: number; wait: number | null }>(
-      `select count(*)::int as n,
-              ceil(extract(epoch from min(at) + make_interval(secs => $3) - now()))::int as wait
-         from rate_limit_hits where bucket = $1 and subject = $2 and at > now() - make_interval(secs => $3)`,
-      [limit.bucket, subject, limit.windowMs / 1000],
+// One request at a time across every process deletes the rows that no longer count; a
+// request that finds the sweep taken skips it.
+async function sweep(client: PoolClient): Promise<void> {
+  const { rows } = await client.query<{ got: boolean }>("select pg_try_advisory_xact_lock($1) as got", [SWEEP_LOCK]);
+  if (!rows[0].got) return;
+  await client.query(SWEEP_SQL, [SWEEP_BUCKETS, SWEEP_SECONDS, SHORTEST_WINDOW_MS / 1000, LONGEST_WINDOW_MS / 1000]);
+}
+
+/** For a pool every caller shares: the session drawing on it, which decides whether the pool's kept part is open to it. */
+export type Draw = { readonly session?: string };
+
+// The rows a limit counts. A pool's rows carry the session that drew each one (or
+// GLOBAL when the caller named none), so a pool counts every subject and still knows
+// who drew; any other limit counts its own subject's rows.
+const COUNTED = "bucket = $1 and ($2 or subject = $3) and at > now() - make_interval(secs => $4)";
+
+async function countHit(limit: Limit, subject: string, session: string | null): Promise<{ readonly result: HitResult; readonly firstRefusal: boolean }> {
+  const pooled = limit.per === "all";
+  const lockSubject = pooled ? GLOBAL : subject;
+  const counted = [limit.bucket, pooled, subject, limit.windowMs / 1000];
+  return underLock(limit.bucket, lockSubject, async (client) => {
+    await sweep(client);
+    const { rows } = await client.query<{ n: number; drawn: boolean }>(
+      `select count(*)::int as n, coalesce(bool_or(subject = $5), false) as drawn from rate_limit_hits where ${COUNTED}`,
+      [...counted, session ?? GLOBAL],
     );
-    if (rows[0].n >= limit.max) {
-      const firstRefusal = await claimFirst(client, `refused:${limit.bucket}`, subject, limit.windowMs);
-      return { result: { allowed: false, retryAfterSeconds: Math.max(rows[0].wait ?? 1, 1) }, firstRefusal };
+    const { n, drawn } = rows[0];
+    const kept = limit.keptForNewSessions ?? 0;
+    // A caller naming no session cannot show it has not drawn, so the kept part is closed to it.
+    const closedAt = kept > 0 && (session === null || drawn) ? limit.max - kept : limit.max;
+    if (n >= closedAt) {
+      // The refusal lifts once enough of the oldest counted rows age out to bring n below closedAt.
+      const { rows: waits } = await client.query<{ wait: number | null }>(
+        `select ceil(extract(epoch from at + make_interval(secs => $4) - now()))::int as wait
+           from rate_limit_hits where ${COUNTED} order by at offset $5 limit 1`,
+        [...counted, n - closedAt],
+      );
+      const firstRefusal = await claimFirst(client, `${REFUSED_KEY}${limit.bucket}`, lockSubject, limit.windowMs);
+      return { result: { allowed: false, retryAfterSeconds: Math.max(waits[0]?.wait ?? 1, 1) }, firstRefusal };
     }
-    await client.query("insert into rate_limit_hits (bucket, subject) values ($1, $2)", [limit.bucket, subject]);
+    await client.query("insert into rate_limit_hits (bucket, subject) values ($1, $2)", [limit.bucket, pooled ? (session ?? GLOBAL) : subject]);
     return { result: { allowed: true }, firstRefusal: false };
   });
 }
 
+// Fires once the earliest minute holding rows back has ended, so its summary row is
+// written even when no further row is asked for. unref: it never keeps the process up.
+let suppressedTimer: ReturnType<typeof setTimeout> | null = null;
+
+function scheduleSuppressedAudit(): void {
+  if (suppressedTimer !== null) return;
+  const wait = auditRows.nextDueInMs();
+  if (wait === null) return;
+  suppressedTimer = setTimeout(() => {
+    suppressedTimer = null;
+    void writeSuppressedAudit().then(scheduleSuppressedAudit);
+  }, wait + 1000);
+  suppressedTimer.unref();
+}
+
+/**
+ * One audit_rows_suppressed row, detail {action, reason, suppressed}, for each action and
+ * reason whose minute has ended with rows held back by appendCappedAudit, each minute
+ * written once. Never throws: a row that cannot be written leaves one log line.
+ */
+export async function writeSuppressedAudit(): Promise<void> {
+  for (const { key, held } of auditRows.due()) {
+    const [action, reason] = key.split("\n");
+    await appendAudit("audit_rows_suppressed", { action, reason, suppressed: held });
+  }
+}
+
+/**
+ * Append one audit row for action with detail, unless 20 rows for this action and reason
+ * were already written this minute across the process (C23, C20): past that the row is
+ * held back and counted, and one audit_rows_suppressed row holds the count once the
+ * minute ends. reason is a code the caller chose, such as a bucket name or a rejection
+ * reason. Best-effort, like appendAudit without a client: never throws.
+ */
+export async function appendCappedAudit(action: string, reason: string, detail: AuditDetail): Promise<void> {
+  await writeSuppressedAudit();
+  if (auditRows.take(`${action}\n${reason}`)) {
+    await appendAudit(action, detail);
+    return;
+  }
+  scheduleSuppressedAudit();
+}
+
 /**
  * The audit row for a refusal by limit for subject: the bucket, and the address or
- * session tag for a per-address or per-session limit. Best-effort: a tag that cannot be
- * made or a row that cannot be written leaves one log line and never changes the refusal.
+ * session tag for a per-address or per-session limit, at most 20 per bucket a minute
+ * (appendCappedAudit). Best-effort: a tag that cannot be made or a row that cannot be
+ * written leaves one log line and never changes the refusal.
  */
 export async function recordLimitHit(limit: Limit, subject: string): Promise<void> {
   let detail: AuditDetail;
@@ -220,19 +313,50 @@ export async function recordLimitHit(limit: Limit, subject: string): Promise<voi
     writeLog({ kind: "audit", outcome: "not_written", action: "rate_limit_hit", reason: "no_tag", bucket: limit.bucket });
     return;
   }
-  await appendAudit("rate_limit_hit", detail);
+  await appendCappedAudit("rate_limit_hit", limit.bucket, detail);
+}
+
+/**
+ * Record a refusal by one of the in-memory counts (address-limits.ts) the way takeHit
+ * records its own: only the first by that limit for that subject in a window, with the
+ * address tag for a per-address limit. Writes nothing to rate_limit_hits.
+ */
+export async function recordMemoryRefusal(hit: { readonly limit: Limit; readonly firstRefusal: boolean }, address: string): Promise<void> {
+  if (hit.firstRefusal) await recordLimitHit(hit.limit, hit.limit.per === "address" ? address : GLOBAL);
 }
 
 /**
  * Count one request against limit for subject. Allowed while fewer than limit.max
  * requests were let through in the last limit.windowMs; a refused request is not
- * counted, so the refusal lifts once the oldest counted request ages out, and
- * retryAfterSeconds says when. The first refusal in each window for this bucket and
- * subject is written to the audit log after the count's own connection is released;
- * that write never changes the answer.
+ * counted, so the refusal lifts once enough counted requests age out, and
+ * retryAfterSeconds says when. For a pool every caller shares (per "all", subject
+ * GLOBAL), draw.session names the session drawing: once the pool holds max minus
+ * keptForNewSessions, only a session with no draw on it in the window may take one of
+ * the kept part, and a call naming no session may not. The first refusal in each window
+ * for this bucket and subject is written to the audit log after the count's own
+ * connection is released; that write never changes the answer.
  */
-export async function takeHit(limit: Limit, subject: string): Promise<HitResult> {
-  const counted = await countHit(limit, subject);
+export async function takeHit(limit: Limit, subject: string, draw: Draw = {}): Promise<HitResult> {
+  const counted = await countHit(limit, subject, draw.session ?? null);
   if (counted.firstRefusal) await recordLimitHit(limit, subject);
   return counted.result;
+}
+
+/**
+ * Give back one request counted against limit for subject in its window, the most
+ * recent, as if it had never been counted; for a pool, the latest draw by
+ * draw.session. For a request whose work turned out to cost nothing, such as an engine
+ * answer of not_found. Does nothing when there is none to give back.
+ */
+export async function returnHit(limit: Limit, subject: string, draw: Draw = {}): Promise<void> {
+  const pooled = limit.per === "all";
+  await underLock(limit.bucket, pooled ? GLOBAL : subject, async (client) => {
+    await client.query(
+      `delete from rate_limit_hits where ctid = (
+         select ctid from rate_limit_hits
+          where bucket = $1 and subject = $2 and at > now() - make_interval(secs => $3)
+          order by at desc limit 1)`,
+      [limit.bucket, pooled ? (draw.session ?? GLOBAL) : subject, limit.windowMs / 1000],
+    );
+  });
 }

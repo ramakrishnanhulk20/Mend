@@ -40,6 +40,15 @@ vi.mock("./engine", async (importOriginal) => {
     }),
   };
 });
+// Claude's token budgets read and add to claude_usage; here no usage is ever stored.
+vi.mock("./db", () => ({
+  database: () => ({
+    query: async (sql: string) => {
+      if (sql.includes("claude_usage")) return { rows: [] };
+      throw new Error("the goal tests have no database");
+    },
+  }),
+}));
 vi.mock("./permissions", async (importOriginal) => {
   const actual = await importOriginal<typeof import("./permissions")>();
   return {

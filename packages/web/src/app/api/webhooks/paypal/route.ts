@@ -3,9 +3,10 @@ import { receiveDelivery } from "@/server/webhooks";
 export const runtime = "nodejs";
 
 /**
- * PayPal webhook deliveries. The rate limits are counted in memory before the body is
- * read or any query runs, and the body is read as raw bytes up to the size cap, so the
- * exact bytes PayPal signed are the bytes verified and stored (webhooks.ts receiveDelivery).
+ * PayPal webhook deliveries. Only rejected deliveries are counted, in memory, so PayPal's
+ * own never wait behind an attacker; a sender past its count gets header and signature
+ * checks before any query. The body is read as raw bytes up to the size cap, so the exact
+ * bytes PayPal signed are the bytes verified and stored (webhooks.ts receiveDelivery).
  */
 export async function POST(request: Request): Promise<Response> {
   const result = await receiveDelivery(request);

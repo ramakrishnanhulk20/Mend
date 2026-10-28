@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
-import { EngineUnavailable, runAndWait, type Waited } from "@/server/engine";
+import { joinLimits } from "@/server/address-limits";
+import { EngineUnavailable, runAndWait, TOO_MANY_RUNNING, type Waited } from "@/server/engine";
 import { writeLog } from "@/server/log";
 import {
   clearedTicketCookie,
@@ -13,7 +14,7 @@ import {
   type JoinIntent,
 } from "@/server/paypal-login";
 import { reply } from "@/server/permissions";
-import { clientAddress, LIMITS, takeHit } from "@/server/ratelimit";
+import { clientAddress, recordMemoryRefusal } from "@/server/ratelimit";
 import { successBody } from "@/server/runs";
 
 export const runtime = "nodejs";
@@ -80,6 +81,7 @@ function engineAnswer(task: JoinIntent, waited: Waited, ref: string, facts: Fact
   const result = waited.result;
   if (!result.ok) {
     if (ENGINE_REFUSALS.has(result.error)) return refusal(409, result.error, result.ref, "refused", { ...run, error: result.error });
+    if (result.error === TOO_MANY_RUNNING) return refusal(429, TOO_MANY_RUNNING, result.ref, "too_many_running", run);
     return refusal(500, "internal", result.ref, "failed", { ...run, engine_error: result.error });
   }
   const body = successBody(task, result);
@@ -90,23 +92,27 @@ function engineAnswer(task: JoinIntent, waited: Waited, ref: string, facts: Fact
 /**
  * PayPal's return from sign-in, a top-level GET from paypal.com. Every answer clears
  * the join cookie and carries Referrer-Policy no-referrer and Cache-Control no-store.
- * In this order: 429 past 20 a minute per client address; 400
- * bad_state, with nothing sent to PayPal, when the join cookie is missing, not signed by
- * this server, expired, or its state differs from ?state (compared in constant time);
+ * In this order: 429 past 20 a minute per client address or 600 from everyone, counted
+ * in memory; 400 bad_state, with nothing sent to PayPal, when the join cookie is
+ * missing, not signed by this server, expired, or its state differs from ?state
+ * (compared in constant time);
  * 200 {outcome: "cancelled"} when PayPal sent ?error; 400 bad_request without exactly
  * one usable ?code. Otherwise the code is swapped for the customer's token, which lives
  * only in this function, userinfo is read with it, and the engine's join (with the
  * consent hash the cookie carried) or leave is handed exactly email, email_verified and
  * payer_id. Answers 200 {outcome: "joined", linked} or {outcome: "left"}; 409 with the
- * engine's refusal code; 502 paypal_unavailable when PayPal fails; 503 when the engine
- * has not answered within 20 seconds; 500 for anything else.
+ * engine's refusal code; 429 too_many_running while two engine calls already run for
+ * this address; 502 paypal_unavailable when PayPal fails; 503 when the engine has not
+ * answered within 20 seconds; 500 for anything else.
  */
 export async function GET(request: Request): Promise<Response> {
   const ref = randomUUID();
   try {
-    const hit = await takeHit(LIMITS.joinCallback, clientAddress(request.headers));
+    const address = clientAddress(request.headers);
+    const hit = joinLimits.callback.take(address);
     if (!hit.allowed) {
-      return refusal(429, "rate_limited", ref, "rate_limited", { bucket: LIMITS.joinCallback.bucket }, { "retry-after": String(hit.retryAfterSeconds) });
+      await recordMemoryRefusal(hit, address);
+      return refusal(429, "rate_limited", ref, "rate_limited", { bucket: hit.limit.bucket }, { "retry-after": String(hit.retryAfterSeconds) });
     }
     const params = new URL(request.url).searchParams;
     const reading = readTicket(request);
@@ -142,7 +148,7 @@ export async function GET(request: Request): Promise<Response> {
 
     const seen = { ...facts, userinfo_path: signedIn.source, userinfo_fields: signedIn.fields, payer_id_kept: signedIn.identity.payer_id !== null };
     const args = ticket.intent === "join" ? [signedIn.identity, ticket.consent] : [signedIn.identity];
-    return engineAnswer(ticket.intent, await runAndWait(ticket.intent, args, WAIT_MS), ref, seen);
+    return engineAnswer(ticket.intent, await runAndWait(ticket.intent, args, WAIT_MS, { address }), ref, seen);
   } catch (error) {
     const unavailable = error instanceof EngineUnavailable;
     return refusal(unavailable ? 503 : 500, unavailable ? "engine_unavailable" : "internal", ref, "failed", { exception: error instanceof Error ? error.name : "unknown" });

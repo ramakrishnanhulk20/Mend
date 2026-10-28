@@ -37,6 +37,15 @@ vi.mock("./engine", async (importOriginal) => {
     }),
   };
 });
+// Claude's token budgets read and add to claude_usage; here no usage is ever stored.
+vi.mock("./db", () => ({
+  database: () => ({
+    query: async (sql: string) => {
+      if (sql.includes("claude_usage")) return { rows: [] };
+      throw new Error("the notes tests have no database");
+    },
+  }),
+}));
 vi.mock("./permissions", async (importOriginal) => {
   const actual = await importOriginal<typeof import("./permissions")>();
   return {
@@ -144,6 +153,13 @@ afterEach(() => {
 });
 
 describe("noteProblem", () => {
+  it("reads a dot written out or bracketed as a link, as the engine does", () => {
+    // Square and curly brackets are already refused as characters; the link check catches the rest.
+    for (const link of ["visit evil[.]example/claim", "go to evil{.}example"]) expect(noteProblem(link)).not.toBeNull();
+    for (const link of ["see evil(.)example", "find us at evil dot example"]) expect(noteProblem(link)).toBe("looks like a link");
+    expect(noteProblem("We have missed you, and we hope the dot pattern mugs still bring you joy.")).toBeNull();
+  });
+
   it("passes an ordinary thank-you and refuses links, addresses, markup, payment brands and other characters", () => {
     for (const fine of [
       "Thank you for the red teapot and the tea towels, we have missed you!",

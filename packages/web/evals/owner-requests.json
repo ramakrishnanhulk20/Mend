@@ -1,5 +1,5 @@
 {
-  "about": "Plain-English owner requests and the tools the assistant should choose for each. A request passes when every tool in expect was called and every tool called is in expect or alsoAllowed. {campaignId} is replaced by a real draft campaign's id when the eval runs. Run by npm run prove:m6; the pass bar is 90 percent.",
+  "about": "Plain-English owner requests and the tools the assistant should choose for each. A request passes when every tool in expect was called and every tool called is in expect or alsoAllowed, and, where replyMentions is given, the reply holds at least one phrase from each of its lists (case ignored). {campaignId} is replaced by a real draft campaign's id when the eval runs. Run by npm run prove:m6; the pass bar is 90 percent.",
   "requests": [
     { "id": "summary-health", "text": "How is my shop doing?", "expect": ["shop_summary"], "alsoAllowed": ["quiet_regulars"] },
     {
@@ -8,7 +8,16 @@
       "expect": ["shop_summary"],
       "alsoAllowed": ["quiet_regulars"]
     },
-    { "id": "summary-model", "text": "Has your customer model actually been tested on real data? Does it beat just looking at who bought recently?", "expect": ["shop_summary"], "alsoAllowed": [] },
+    {
+      "id": "summary-model",
+      "text": "Has your customer model actually been tested on real data? Does it beat just looking at who bought recently?",
+      "expect": ["shop_summary"],
+      "alsoAllowed": [],
+      "replyMentions": [
+        ["tie", "ties", "tied", "no better", "not better", "same as", "about the same", "level with", "even with", "matches"],
+        ["held-back", "held back", "hold-back", "holdout", "control group"]
+      ]
+    },
     { "id": "quiet-at-risk", "text": "Which of my regulars are most at risk of never coming back?", "expect": ["quiet_regulars"], "alsoAllowed": ["shop_summary"] },
     { "id": "quiet-list", "text": "Show me the regulars who have stopped buying.", "expect": ["quiet_regulars"], "alsoAllowed": ["shop_summary"] },
     { "id": "quiet-members", "text": "Of the customers who went quiet, which ones are members I could thank with cashback?", "expect": ["quiet_regulars"], "alsoAllowed": ["shop_summary"] },

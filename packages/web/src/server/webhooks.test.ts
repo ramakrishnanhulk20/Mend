@@ -2,12 +2,15 @@
 // schema (the engine's schema.sql in a throwaway schema) with deliveries really signed
 // over transmission id, time, webhook id and the body's CRC-32 by a throwaway certificate
 // chain (__fixtures__/test-chain.ts), trusted through the signature checker's injectable
-// anchors. It checks that nothing calls PayPal's API, the in-memory counts taken before
-// any query, the streamed body cap, replays answered without a signature check, the
-// reviewers' flood repros, each sender's share of the certificate downloads, PayPal's
-// certificate address remembered in the real paypal_certs table across a restart (a fresh
-// checker over the same database), and the first rejection per reason and address each
-// minute on the audit record with the address tag in the log line. Does NOT cover: PayPal's real
+// anchors. It checks that nothing calls PayPal's API, the in-memory counts charged only
+// for rejected deliveries and never refusing one that verifies, junk past the counts
+// answered without a query, the streamed body cap, strict UTF-8 and the signature over
+// the raw bytes, replays answered without a signature check (after the 47-hour purge too,
+// from the engine's event_outcomes), the reviewers' flood repros, each sender's share of
+// the certificate downloads, PayPal's certificate address remembered in the real
+// paypal_certs table across a restart (a fresh checker over the same database), and the
+// first rejection per reason and address each minute on the audit record, at most 20 per
+// reason a minute, with the address tag in the log line. Does NOT cover: PayPal's real
 // certificate (webhook-signature.test.ts checks its chain) or a real PayPal signature and
 // delivery timing (render.mjs prove "delivery" does), Render's proxy really writing the
 // client address (ratelimit.test.ts names that gap), a flood spread across many
@@ -21,10 +24,10 @@ import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vites
 import { holdDevDatabase, SCHEMA_PATH, type DevDatabase } from "../../scripts/dev-database";
 import { POST } from "../app/api/webhooks/paypal/route";
 import { testChain } from "./__fixtures__/test-chain";
-import { webhookLimits, webhookRejections } from "./address-limits";
+import { auditRows, webhookLimits, webhookRejections } from "./address-limits";
 import { closeDatabase, database } from "./db";
 import { runTask } from "./engine";
-import { addressTag } from "./ratelimit";
+import { addressTag, writeSuppressedAudit } from "./ratelimit";
 import { SignatureChecker } from "./webhook-signature";
 import { handleDelivery, MAX_BODY_BYTES, parseTransmissionTime, refuseDeclaredLength, verifyDelivery } from "./webhooks";
 
@@ -90,13 +93,12 @@ function paypalTime(ms: number): string {
 
 type DeliveryOptions = { sentAt?: number; transmissionId?: string; webhookId?: string; forged?: boolean };
 
-// Headers PayPal would send, signed with the test leaf's key over the documented text;
-// forged signs with a key no certificate vouches for.
-function signedDelivery(event: Record<string, unknown> | string, options: DeliveryOptions = {}) {
-  const body = typeof event === "string" ? event : JSON.stringify(event);
+// Headers PayPal would send, signed with the test leaf's key over the documented text
+// with the CRC-32 of crcOf; forged signs with a key no certificate vouches for.
+function signedHeaders(crcOf: Buffer, options: DeliveryOptions = {}) {
   const transmissionId = options.transmissionId ?? randomUUID();
   const time = paypalTime(options.sentAt ?? Date.now());
-  const text = `${transmissionId}|${time}|${options.webhookId ?? WEBHOOK_ID}|${crc32(Buffer.from(body, "utf8"))}`;
+  const text = `${transmissionId}|${time}|${options.webhookId ?? WEBHOOK_ID}|${crc32(crcOf)}`;
   const key = options.forged ? chain.stranger.keys.privateKey : chain.leafKeys.privateKey;
   const headers = new Headers({
     "content-type": "application/json",
@@ -106,11 +108,16 @@ function signedDelivery(event: Record<string, unknown> | string, options: Delive
     "paypal-transmission-sig": sign("sha256", Buffer.from(text, "utf8"), key).toString("base64"),
     "paypal-transmission-time": time,
   });
-  return { body, headers, transmissionId };
+  return { headers, transmissionId };
+}
+
+function signedDelivery(event: Record<string, unknown> | string, options: DeliveryOptions = {}) {
+  const body = typeof event === "string" ? event : JSON.stringify(event);
+  return { body, ...signedHeaders(Buffer.from(body, "utf8"), options) };
 }
 
 // What the route receives: the delivery's headers plus the address Render's proxy appends.
-function routeRequest(body: string | ReadableStream<Uint8Array>, headers: Headers, address: string): Request {
+function routeRequest(body: string | Uint8Array | ReadableStream<Uint8Array>, headers: Headers, address: string): Request {
   const sent = new Headers(headers);
   sent.set("x-forwarded-for", address);
   return new Request(ROUTE_URL, { method: "POST", headers: sent, body, duplex: "half" } as RequestInit & { duplex: "half" });
@@ -226,9 +233,10 @@ afterAll(async () => {
 });
 
 beforeEach(async () => {
-  await admin.query("truncate paypal_events, paypal_certs");
+  await admin.query("truncate paypal_events, paypal_certs, event_outcomes");
   webhookLimits.clear();
   webhookRejections.clear();
+  auditRows.clear();
   signing.checker = trusting();
   network.certificate = () => new Response(chain.leaf.pem);
   network.certFetches = 0;
@@ -352,6 +360,46 @@ describe("replays", () => {
     expect((await handleDelivery(firstDelivery.body, firstDelivery.headers)).status).toBe(200);
     expect((await handleDelivery(resend.body, resend.headers)).status).toBe(200);
     expect(await rowCount()).toBe(1);
+  });
+
+  it("a stored delivery deleted by the purge and replayed 50 hours later inserts nothing, because the engine's outcome remembers its id (the auditors' repro)", async () => {
+    const delivery = signedDelivery(payoutItemEvent(), { sentAt: Date.now() - 50 * 60 * 60 * 1000 });
+    expect((await handleDelivery(delivery.body, delivery.headers)).status).toBe(200);
+    await admin.query("insert into event_outcomes (transmission_id, outcome, detail) values ($1, 'status recorded', '{}')", [delivery.transmissionId]);
+    await admin.query("delete from paypal_events");
+    asked.mockClear();
+    const replay = await POST(routeRequest(delivery.body, delivery.headers, "198.51.100.8"));
+    expect(replay.status).toBe(200);
+    expect(lastLog()).toMatchObject({ outcome: "duplicate", reason: "transmission_stored", transmission_id: delivery.transmissionId });
+    expect(await rowCount()).toBe(0);
+    expect(asked).not.toHaveBeenCalled();
+  });
+});
+
+describe("the bytes that are verified", () => {
+  it("must be strict UTF-8: an invalid byte gets 400 not_utf8 before any download, even when the signature matches its lenient decoding", async () => {
+    const bytes = Buffer.concat([
+      Buffer.from(`{"id":"WH-${randomUUID()}","event_type":"PAYMENT.PAYOUTS-ITEM.SUCCEEDED","summary":"caf`, "utf8"),
+      Buffer.from([0xff]),
+      Buffer.from('"}', "utf8"),
+    ]);
+    const { headers } = signedHeaders(Buffer.from(new TextDecoder().decode(bytes), "utf8"));
+    const response = await POST(routeRequest(bytes, headers, "198.51.100.8"));
+    expect(response.status).toBe(400);
+    expect(await response.text()).toMatch(GENERIC_BODY);
+    expect(lastLog()).toMatchObject({ outcome: "refused", reason: "not_utf8" });
+    expect(network.certFetches).toBe(0);
+    expect(await rowCount()).toBe(0);
+  });
+
+  it("are the raw bytes received: a byte-order mark put in front of a signed body is refused, and the body as signed is stored", async () => {
+    const delivery = signedDelivery(payoutItemEvent());
+    const marked = Buffer.concat([Buffer.from([0xef, 0xbb, 0xbf]), Buffer.from(delivery.body, "utf8")]);
+    expect((await POST(routeRequest(marked, delivery.headers, "198.51.100.8"))).status).toBe(400);
+    expect(await rowCount()).toBe(0);
+    expect((await POST(routeRequest(delivery.body, delivery.headers, "198.51.100.8"))).status).toBe(200);
+    const { rows } = await admin.query("select raw from paypal_events");
+    expect(rows).toEqual([{ raw: delivery.body }]);
   });
 });
 
@@ -672,7 +720,7 @@ describe("asking the engine to process events", () => {
     const delivery = signedDelivery(payoutItemEvent());
     expect((await handleDelivery(delivery.body, delivery.headers)).status).toBe(200);
     await vi.waitFor(() => expect(asked).toHaveBeenCalledTimes(1));
-    expect(asked).toHaveBeenCalledWith("process_events", []);
+    expect(asked).toHaveBeenCalledWith("process_events", [], { address: "unknown" });
   });
 
   it("a replay, a refusal or a 503 asks nothing", async () => {
@@ -725,34 +773,45 @@ describe("what a flood can spend", () => {
     expect(network.certFetches).toBe(1);
   });
 
-  it("lets 120 deliveries a minute through from one address and answers the next 429 from memory, without reading it or any query", async () => {
+  it("answers junk from an address past 120 rejections a minute 429 with no query and no body read, and still stores a genuine delivery from it", async () => {
     const before = await lastAuditId();
     for (let n = 0; n < 120; n += 1) {
       expect((await POST(routeRequest("{}", JSON_ONLY, "198.51.100.7"))).status).toBe(400);
     }
-    const genuine = signedDelivery(payoutItemEvent());
-    const request = routeRequest(genuine.body, genuine.headers, "198.51.100.7");
-    const refused = await POST(request);
+    const junk = routeRequest("{}", JSON_ONLY, "198.51.100.7");
+    const refused = await POST(junk);
     expect(refused.status).toBe(429);
     expect(await refused.text()).toMatch(GENERIC_BODY);
     const wait = Number(refused.headers.get("retry-after"));
     expect(wait > 0 && wait <= 60).toBe(true);
-    expect(request.bodyUsed).toBe(false);
-    expect(lastLog()).toMatchObject({ outcome: "refused", reason: "rate_limited", bucket: "webhook_address" });
+    expect(junk.bodyUsed).toBe(false);
+    expect(lastLog()).toMatchObject({ outcome: "refused", reason: "rate_limited", bucket: "webhook_address", rejected: "missing_header" });
 
-    const later = routeRequest(genuine.body, genuine.headers, "198.51.100.7");
+    const genuine = signedDelivery(payoutItemEvent());
+    expect((await POST(routeRequest(genuine.body, genuine.headers, "198.51.100.7"))).status).toBe(200);
+    expect(await rowCount()).toBe(1);
+
+    const forged = signedDelivery(payoutItemEvent(), { forged: true });
     const calls = await databaseCalls(async () => {
-      for (let n = 0; n < 10; n += 1) expect((await POST(later.clone())).status).toBe(429);
+      for (let n = 0; n < 10; n += 1) expect((await POST(routeRequest("{}", JSON_ONLY, "198.51.100.7"))).status).toBe(429);
+      expect((await POST(routeRequest(forged.body, forged.headers, "198.51.100.7"))).status).toBe(429);
     });
     expect(calls).toBe(0);
-    expect(network.certFetches).toBe(0);
+    expect(lastLog()).toMatchObject({ outcome: "refused", reason: "rate_limited", rejected: "verify_failure" });
+    expect(network.certFetches).toBe(1);
     expect(await auditSince(before)).toEqual([
       { actor: "web", action: "webhook_rejected", detail: { reason: "missing_header", status: 400, address_tag: addressTag("198.51.100.7") } },
       { actor: "web", action: "rate_limit_hit", detail: { bucket: "webhook_address", per: "address", address_tag: addressTag("198.51.100.7") } },
     ]);
+  });
 
-    expect((await POST(routeRequest(genuine.body, genuine.headers, "198.51.100.8"))).status).toBe(200);
-    expect(await rowCount()).toBe(1);
+  it("never charges a delivery that verifies: 130 genuine deliveries from one address in a minute are all stored", async () => {
+    for (let n = 0; n < 130; n += 1) {
+      const genuine = signedDelivery(payoutItemEvent());
+      expect((await POST(routeRequest(genuine.body, genuine.headers, "198.51.100.9"))).status, `delivery ${n}`).toBe(200);
+    }
+    expect(await rowCount()).toBe(130);
+    expect(webhookLimits.full("198.51.100.9")).toBeNull();
   });
 
   it("counts and refuses with the database's rate-limit table gone, because the counts live in memory", async () => {
@@ -767,14 +826,15 @@ describe("what a flood can spend", () => {
     }
   });
 
-  it("answers 429 to every address once 600 deliveries came in within a minute", async () => {
+  it("answers junk from every address 429 once 600 rejections came in within a minute, and still stores a genuine delivery", async () => {
     for (let n = 0; n < 600; n += 1) webhookLimits.take(`10.0.${Math.floor(n / 200)}.${n % 200}`);
-    const genuine = signedDelivery(payoutItemEvent());
-    const response = await POST(routeRequest(genuine.body, genuine.headers, "203.0.113.9"));
-    expect(response.status).toBe(429);
+    const junk = await POST(routeRequest("{}", JSON_ONLY, "203.0.113.9"));
+    expect(junk.status).toBe(429);
     expect(lastLog()).toMatchObject({ outcome: "refused", reason: "rate_limited", bucket: "webhook_all" });
     expect(network.certFetches).toBe(0);
-    expect(await rowCount()).toBe(0);
+    const genuine = signedDelivery(payoutItemEvent());
+    expect((await POST(routeRequest(genuine.body, genuine.headers, "203.0.113.9"))).status).toBe(200);
+    expect(await rowCount()).toBe(1);
   });
 
   it("reads a body sent without Content-Length only up to the cap, then answers 413", async () => {
@@ -861,6 +921,25 @@ describe("rejections on the audit record", () => {
     }
     expect((await auditSince(before)).at(-1)).toEqual(row("missing_header", "198.51.100.60"));
     expect(await auditSince(before)).toHaveLength(4);
+  });
+
+  it("writes at most 20 rejection rows per reason a minute across every address, then one audit_rows_suppressed row holding the count", async () => {
+    const before = await lastAuditId();
+    const start = Date.now();
+    vi.useFakeTimers({ toFake: ["Date"] });
+    try {
+      vi.setSystemTime(start);
+      for (let n = 0; n < 25; n += 1) expect((await POST(routeRequest("{}", JSON_ONLY, `198.51.100.${150 + n}`))).status).toBe(400);
+      vi.setSystemTime(start + 61_000);
+      await writeSuppressedAudit();
+    } finally {
+      vi.useRealTimers();
+    }
+    const rows = await auditSince(before);
+    expect(rows.filter((row) => row.action === "webhook_rejected")).toHaveLength(20);
+    expect(rows.filter((row) => row.action === "audit_rows_suppressed")).toEqual([
+      { actor: "web", action: "audit_rows_suppressed", detail: { action: "webhook_rejected", reason: "missing_header", suppressed: 5 } },
+    ]);
   });
 
   it("decides in memory: with the database's rate-limit table gone, three rejections from one address leave one row", async () => {

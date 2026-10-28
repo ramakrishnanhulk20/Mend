@@ -1,11 +1,13 @@
 // Covers the in-memory counts for unauthenticated traffic on a clock the test moves: the
 // per-address and shared sliding windows, the wait a refusal carries, that a refused
 // request is counted nowhere, that one flooding address cannot fill the shared count,
-// the first refusal per window, memory that stays bounded, and once-per-window records.
-// Does NOT cover: the webhook route using them before any query (webhooks.test.ts), or
-// more than one mend-web instance, where each would keep its own counts (a named limit).
+// the first refusal per window, memory that stays bounded, a look at a count that
+// changes nothing, the three join routes' counts, once-per-window records, and the cap
+// on audit rows per reason a minute with its held-back counts. Does NOT cover: the
+// webhook and join routes using them (webhooks.test.ts, join-routes.test.ts), or more
+// than one mend-web instance, where each would keep its own counts (a named limit).
 import { describe, expect, it } from "vitest";
-import { AddressLimiter, OncePerWindow, WEBHOOK_LIMITS } from "./address-limits";
+import { AddressLimiter, AuditRowBudget, JOIN_LIMITS, joinLimits, OncePerWindow, WEBHOOK_LIMITS } from "./address-limits";
 
 function limiterAt(start = 1_000_000) {
   const clock = { now: start };
@@ -74,6 +76,75 @@ describe("AddressLimiter", () => {
     clock.now += 61_000;
     limiter.take("198.51.100.7");
     expect(limiter.trackedAddresses).toBe(1);
+  });
+
+  it("says which count is full for an address, with the wait, and counts nothing by looking", () => {
+    const { clock, limiter } = limiterAt();
+    expect(limiter.full("198.51.100.7")).toBeNull();
+    for (let n = 0; n < 120; n += 1) {
+      expect(limiter.full("198.51.100.7")).toBeNull();
+      limiter.take("198.51.100.7");
+      clock.now += 250;
+    }
+    expect(limiter.full("198.51.100.7")).toEqual({ limit: WEBHOOK_LIMITS.address, retryAfterSeconds: 30 });
+    expect(limiter.full("198.51.100.8")).toBeNull();
+    const refused = limiter.take("198.51.100.7");
+    expect(!refused.allowed && refused.firstRefusal).toBe(true);
+    for (let n = 0; n < 480; n += 1) limiter.take(`10.2.0.${n}`);
+    expect(limiter.full("198.51.100.8")).toEqual({ limit: WEBHOOK_LIMITS.all, retryAfterSeconds: 30 });
+    expect(limiter.trackedAddresses).toBe(481);
+  });
+});
+
+describe("the join routes' counts", () => {
+  it("hold each route to its own count per address in a minute, 20 starts, 20 returns and 60 consent reads, under a shared count for each", () => {
+    expect(JOIN_LIMITS).toEqual({
+      start: { address: { bucket: "join_start", max: 20, windowMs: 60_000, per: "address" }, all: { bucket: "join_start_all", max: 600, windowMs: 60_000, per: "all" } },
+      callback: { address: { bucket: "join_callback", max: 20, windowMs: 60_000, per: "address" }, all: { bucket: "join_callback_all", max: 600, windowMs: 60_000, per: "all" } },
+      consent: { address: { bucket: "join_consent", max: 60, windowMs: 60_000, per: "address" }, all: { bucket: "join_consent_all", max: 1200, windowMs: 60_000, per: "all" } },
+    });
+    for (const limiter of Object.values(joinLimits)) limiter.clear();
+    for (let n = 0; n < 20; n += 1) expect(joinLimits.start.take("198.51.100.7").allowed).toBe(true);
+    const refused = joinLimits.start.take("198.51.100.7");
+    expect(!refused.allowed && refused.limit.bucket === "join_start" && refused.retryAfterSeconds <= 60).toBe(true);
+    expect(joinLimits.callback.take("198.51.100.7").allowed).toBe(true);
+    expect(joinLimits.start.take("198.51.100.8").allowed).toBe(true);
+    for (let n = 0; n < 60; n += 1) expect(joinLimits.consent.take("198.51.100.7").allowed).toBe(true);
+    expect(joinLimits.consent.take("198.51.100.7").allowed).toBe(false);
+    for (const limiter of Object.values(joinLimits)) limiter.clear();
+  });
+});
+
+describe("AuditRowBudget", () => {
+  it("lets 20 rows per key through a minute, holds back the rest, and reports each window's count once after it ends", () => {
+    const clock = { now: 0 };
+    const budget = new AuditRowBudget(20, 60_000, () => clock.now);
+    const taken = Array.from({ length: 25 }, () => budget.take("webhook_rejected\nmissing_header"));
+    expect(taken.filter(Boolean)).toHaveLength(20);
+    expect(taken.slice(20)).toEqual([false, false, false, false, false]);
+    expect(budget.take("webhook_rejected\nsyntax")).toBe(true);
+    expect(budget.due()).toEqual([]);
+    expect(budget.nextDueInMs()).toBe(60_000);
+    clock.now = 30_000;
+    expect(budget.nextDueInMs()).toBe(30_000);
+    clock.now = 60_000;
+    expect(budget.due()).toEqual([{ key: "webhook_rejected\nmissing_header", held: 5 }]);
+    expect(budget.due()).toEqual([]);
+    expect(budget.nextDueInMs()).toBeNull();
+    expect(budget.take("webhook_rejected\nmissing_header")).toBe(true);
+  });
+
+  it("keeps a held-back count when a new window starts before anyone asked for it", () => {
+    const clock = { now: 0 };
+    const budget = new AuditRowBudget(1, 60_000, () => clock.now);
+    expect([budget.take("a"), budget.take("a"), budget.take("a")]).toEqual([true, false, false]);
+    clock.now = 61_000;
+    expect([budget.take("a"), budget.take("a")]).toEqual([true, false]);
+    clock.now = 122_000;
+    expect(budget.due()).toEqual([
+      { key: "a", held: 2 },
+      { key: "a", held: 1 },
+    ]);
   });
 });
 

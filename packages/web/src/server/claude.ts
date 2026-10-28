@@ -1,5 +1,5 @@
 /**
- * Every call Mend makes to Claude, and the rules each one is held to (6n, C15, C17, C20, C26).
+ * Every call Mend makes to Claude, and the rules each one is held to (6n, C12, C15, C17, C20, C26).
  *
  * A client is built here and nowhere else, with the model, the API host and the key
  * fixed in code: the key comes from ANTHROPIC_API_KEY on the server only, and no
@@ -7,22 +7,28 @@
  * One middleware runs on every HTTP attempt the SDK makes, tool-runner rounds and
  * retries included. In order, it refuses any host but api.anthropic.com; refuses a
  * request body holding an email address or the value of a server secret, so personal
- * data and keys never reach the model provider; takes one hit on each of the caller's
- * daily Claude caps in Postgres (a demo visitor's session, its client address and every
- * demo together; the owner's one count) and refuses once one is used up; and after the
- * answer logs its token counts and stop reason, never its content.
+ * data and keys never reach the model provider; refuses once the caller's tokens for
+ * the day reach one of its budgets in claude_usage (TOKEN_BUDGETS); takes one hit on
+ * each of the caller's daily Claude call caps in Postgres (a demo visitor's session,
+ * its client address and every demo together; the owner's one count) and refuses once
+ * one is used up; and after the answer logs its token counts and stop reason, never its
+ * content, and adds its tokens to every budget it counts on.
  *
  * Covers: a bug elsewhere putting an email or a secret into a prompt, a loop spending
- * the key's credit, a base URL changed by the environment. Does not cover personal data
- * that is not an email address (names never enter a prompt by design: notes.ts and
- * agent.ts build every prompt from listed fields), or what the model says back, which
- * every caller treats as untrusted text.
+ * the key's credit, a visitor sending a few huge prompts inside the call caps, a base
+ * URL changed by the environment. Does not cover personal data that is not an email
+ * address (names never enter a prompt by design: notes.ts and agent.ts build every
+ * prompt from listed fields), or what the model says back, which every caller treats as
+ * untrusted text. A budget is checked before a call and charged after it, so calls
+ * already in flight when a budget fills each finish: one visitor can go over by what
+ * its own concurrent calls use, which the call caps bound.
  */
 import Anthropic, { type Middleware } from "@anthropic-ai/sdk";
+import { database } from "./db";
 import { writeLog } from "./log";
-import { MIN_SECRET_CHARS, reply, type SignedIn } from "./permissions";
-import { GLOBAL, LIMITS, takeHit, type Limit } from "./ratelimit";
-import { SECRET_SETTINGS } from "./secrets";
+import { reply, type SignedIn } from "./permissions";
+import { addressTag, GLOBAL, LIMITS, sessionTag, takeHit, type Limit } from "./ratelimit";
+import { secretValues } from "./secrets";
 
 export const MODEL = "claude-haiku-5-5";
 export const CALL_TIMEOUT_MS = 60_000;
@@ -32,14 +38,21 @@ const API_KEY_SHAPE = /^[\x21-\x7e]{20,512}$/;
 const LABEL = /^R[1-9][0-9]{0,3}$/;
 const STOP_REASON = /^[a-z_]{1,32}$/;
 
-// The one email rule: redaction before a prompt is built and the refusal in the
-// middleware use this same pattern, so what one lets through the other agrees with.
-const EMAIL = /[A-Za-z0-9._%+-]+@[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+/;
+// The one email rule, ported from the engine's receiver rule (payouts.py EMAIL_SHAPE:
+// printable ASCII but space and "@", then "@", then a dot with a character on each side)
+// and used as a search, so it flags at least every address the engine would pay. The
+// lookbehind starts a match only where a run of those characters begins, which keeps
+// the search linear on a long run with no "@" in it. Redaction before a prompt is built
+// and the refusal in the middleware both use it, after the same removal of invisible
+// format characters, so what one lets through the other agrees with.
+const EMAIL = /(?<![!-?A-~])[!-?A-~]+@[!-?A-~]+\.[!-?A-~]+/;
 const EMAILS = new RegExp(EMAIL.source, "g");
+const FORMAT_CHARACTERS = /\p{Cf}/gu;
+const CONTROLS_BUT_NEWLINE_AND_TAB = /(?![\n\t])\p{Cc}/gu;
 
 export type Purpose = "goal" | "note" | "agent";
 /** Why the calls of one request stopped early. */
-export type Stop = "limit_reached" | "outbound_refused" | "timed_out";
+export type Stop = "limit_reached" | "claude_token_cap" | "outbound_refused" | "timed_out";
 /** What went wrong with a Claude call, as a fixed code a route can answer with. */
 export type Failure = Stop | "declined" | "busy" | "unavailable" | "unreadable";
 
@@ -47,6 +60,7 @@ export type Failure = Stop | "declined" | "busy" | "unavailable" | "unreadable";
 export const FAILURE_MESSAGES: Readonly<Record<Failure | "no_key", string>> = {
   no_key: "The AI assistant needs an Anthropic API key (ANTHROPIC_API_KEY on the server). Everything else in Mend works without it.",
   limit_reached: "The AI assistant's daily limit for this account is used up. Planning from the form and the rest of Mend still work.",
+  claude_token_cap: "The AI assistant has used today's token budget for this account. Planning from the form and the rest of Mend still work.",
   outbound_refused: "That request could not be sent to the AI service.",
   timed_out: "The AI service took too long, so the request was stopped.",
   declined: "The AI service declined this request.",
@@ -82,36 +96,41 @@ export function hasClaudeKey(): boolean {
   return claudeKey() !== null;
 }
 
-/** text with every email address replaced, for anything a person typed before it goes into a prompt. */
+function withoutFormatCharacters(text: string): string {
+  return text.replace(FORMAT_CHARACTERS, "");
+}
+
+/** text with invisible format characters dropped and every email address replaced, for anything a person typed before it goes into a prompt. */
 export function withoutEmails(text: string): string {
-  return text.replace(EMAILS, "[email removed]");
+  return withoutFormatCharacters(text).replace(EMAILS, "[email removed]");
 }
 
 /** Why body may not be sent to the model provider, or null when it may. */
 export function outboundProblem(body: string): "email" | "secret" | null {
-  if (EMAIL.test(body)) return "email";
-  for (const name of SECRET_SETTINGS) {
-    const value = process.env[name];
-    if (value === undefined || value.length < MIN_SECRET_CHARS) continue;
+  const visible = withoutFormatCharacters(body);
+  if (EMAIL.test(visible)) return "email";
+  for (const value of secretValues()) {
     // A value may sit in the JSON body escaped, so both spellings are looked for.
-    if (body.includes(value) || body.includes(JSON.stringify(value).slice(1, -1))) return "secret";
+    const escaped = JSON.stringify(value).slice(1, -1);
+    if ([body, visible].some((text) => text.includes(value) || text.includes(escaped))) return "secret";
   }
   return null;
 }
 
 /**
- * Model text made safe to hand back as plain text (C14): no markdown image, no HTML tag
- * and no angle bracket at all, no control character but newline and tab, no email
- * address, at most maxChars. Rendering it as escaped text stays the browser's job.
+ * Model text made safe to hand back as plain text (C14): no format character, no control
+ * character but newline and tab, no markdown image, no HTML tag and no angle bracket at
+ * all, no email address, at most maxChars. Every removal runs before the email rule, so
+ * no removed character can join the halves of an address back together. Rendering it as
+ * escaped text stays the browser's job.
  */
 export function plainText(text: string, maxChars: number): string {
-  return withoutEmails(text)
+  const stripped = withoutFormatCharacters(text)
+    .replace(CONTROLS_BUT_NEWLINE_AND_TAB, "")
     .replace(/!\[[^\]]*\]\s*(?:\([^)]*\)|\[[^\]]*\])/g, "")
     .replace(/<[^>]*>/g, "")
-    .replace(/[<>]/g, "")
-    .replace(/[\u0000-\u0008\u000b-\u001f\u007f]/g, "")
-    .trim()
-    .slice(0, maxChars);
+    .replace(/[<>]/g, "");
+  return withoutEmails(stripped).trim().slice(0, maxChars);
 }
 
 /**
@@ -155,12 +174,68 @@ export class ClaudeSession {
   }
 }
 
-// Demo calls count against the session, against its client address so one address
-// cannot spend every demo's share by opening sessions, and against every demo session
-// together; the owner's against one shared owner count. Each limit is a rolling 24
-// hours. The address is counted before the global cap, so one address stopped there
-// never fills the count every other visitor needs.
-async function spendOneCall(session: ClaudeSession): Promise<string | null> {
+/**
+ * Each UTC day's Claude tokens, input plus output, with cache reads and cache writes
+ * counted as input so every token the model processes is bounded (C12, C20): per demo
+ * session, per demo client address so one address cannot spend every demo's share by
+ * opening sessions, across all demo traffic, and for the owner. A call is refused once
+ * any budget it counts on is reached.
+ */
+export const TOKEN_BUDGETS = { demoSession: 200_000, demoAddress: 400_000, demoAll: 5_000_000, owner: 2_000_000 } as const;
+
+type TokenBudget = { readonly name: string; readonly subject: string; readonly tokens: number };
+
+const UTC_TODAY = "(now() at time zone 'utc')::date";
+
+// claude_usage holds the session and address tags (ratelimit.ts), never the session id
+// or the address itself. The prefixes keep the two kinds of tag apart.
+function tokenBudgets(session: ClaudeSession): readonly TokenBudget[] {
+  const { principal } = session;
+  if (principal.role !== "demo") return [{ name: "owner", subject: "owner", tokens: TOKEN_BUDGETS.owner }];
+  return [
+    { name: "demo_session", subject: `session:${sessionTag(principal.sessionId)}`, tokens: TOKEN_BUDGETS.demoSession },
+    { name: "demo_address", subject: `address:${addressTag(session.address)}`, tokens: TOKEN_BUDGETS.demoAddress },
+    { name: "demo_all", subject: "demo_all", tokens: TOKEN_BUDGETS.demoAll },
+  ];
+}
+
+/** The first budget whose tokens today have reached its size, or null. A stored total that cannot be read counts as reached. */
+async function reachedBudget(budgets: readonly TokenBudget[]): Promise<TokenBudget | null> {
+  const { rows } = await database().query<{ subject: string; used: string }>(
+    `select subject, (input_tokens + output_tokens)::text as used from claude_usage where day = ${UTC_TODAY} and subject = any($1::text[])`,
+    [budgets.map((budget) => budget.subject)],
+  );
+  const used = new Map(rows.map((row) => [row.subject, Number(row.used)]));
+  const spent = (subject: string): number => {
+    const total = used.get(subject) ?? 0;
+    return Number.isSafeInteger(total) ? total : Number.POSITIVE_INFINITY;
+  };
+  return budgets.find((budget) => spent(budget.subject) >= budget.tokens) ?? null;
+}
+
+/** One statement adds a call's tokens to today's row of every budget it counts on. */
+async function addTokens(budgets: readonly TokenBudget[], input: number, output: number): Promise<void> {
+  if (input === 0 && output === 0) return;
+  await database().query(
+    `insert into claude_usage (day, subject, input_tokens, output_tokens)
+     select ${UTC_TODAY}, subject, $2::bigint, $3::bigint from unnest($1::text[]) as subject
+     on conflict (day, subject) do update
+       set input_tokens = claude_usage.input_tokens + excluded.input_tokens,
+           output_tokens = claude_usage.output_tokens + excluded.output_tokens`,
+    [budgets.map((budget) => budget.subject), input, output],
+  );
+}
+
+type Refused = { readonly why: Stop; readonly reason: string };
+
+// The token budgets are read first, so a refused call takes no hit on the call caps.
+// Demo calls then count against the session, against its client address, and against
+// every demo session together; the owner's against one shared owner count. Each call
+// cap is a rolling 24 hours. The address is counted before the global cap, so one
+// address stopped there never fills the count every other visitor needs.
+async function spendOneCall(session: ClaudeSession, budgets: readonly TokenBudget[]): Promise<Refused | null> {
+  const reached = await reachedBudget(budgets);
+  if (reached !== null) return { why: "claude_token_cap", reason: `tokens_${reached.name}` };
   const { principal } = session;
   const caps: readonly (readonly [Limit, string])[] =
     principal.role === "demo"
@@ -171,8 +246,9 @@ async function spendOneCall(session: ClaudeSession): Promise<string | null> {
         ]
       : [[LIMITS.claudeOwner, GLOBAL]];
   for (const [limit, subject] of caps) {
-    const hit = await takeHit(limit, subject);
-    if (!hit.allowed) return limit.bucket;
+    // The session lets a shared pool keep its last share for visitors who have not drawn on it yet.
+    const hit = await takeHit(limit, subject, { session: principal.sessionId });
+    if (!hit.allowed) return { why: "limit_reached", reason: limit.bucket };
   }
   return null;
 }
@@ -205,8 +281,9 @@ function guard(session: ClaudeSession, purpose: Purpose, label: string | null): 
     if (typeof request.body !== "string") throw refusal("outbound_refused", "body_shape");
     const problem = outboundProblem(request.body);
     if (problem !== null) throw refusal("outbound_refused", problem);
-    const spent = await spendOneCall(session);
-    if (spent !== null) throw refusal("limit_reached", spent);
+    const budgets = tokenBudgets(session);
+    const refused = await spendOneCall(session, budgets);
+    if (refused !== null) throw refusal(refused.why, refused.reason);
     session.calls += 1;
 
     const started = Date.now();
@@ -245,6 +322,8 @@ function guard(session: ClaudeSession, purpose: Purpose, label: string | null): 
       stop_reason: stopReason,
       ...counted,
     });
+    // A failed write throws, so the request fails rather than letting tokens go uncounted.
+    await addTokens(budgets, counted.input_tokens + counted.cache_read_tokens + counted.cache_write_tokens, counted.output_tokens);
     return response;
   };
 }
@@ -298,7 +377,7 @@ export function aiRefusal(route: string, ref: string, status: number, error: Fai
 
 /** The HTTP status for a Claude failure a route cannot work around. */
 export function failureStatus(failure: Failure | "no_key"): number {
-  if (failure === "limit_reached") return 429;
+  if (failure === "limit_reached" || failure === "claude_token_cap") return 429;
   if (failure === "outbound_refused" || failure === "declined" || failure === "unreadable") return 422;
   return 503;
 }

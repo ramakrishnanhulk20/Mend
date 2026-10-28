@@ -1,20 +1,23 @@
 // Covers the three Join with PayPal routes as handlers, with fetch replaced by a fake
-// PayPal and the engine and rate limiter replaced by stubs: the confirmation page and
-// its escaping and headers, the origin and CSRF checks on the click, the exact
-// redirect and cookie, the consent check, every way a return is refused before PayPal
-// is called, cancel, join, leave, the engine's refusals, PayPal failures, what reaches
-// the logs, and the cookie being cleared on every answer. Does NOT cover: PayPal's
-// real sandbox (the first live sign-in records its userinfo field names), how a real
-// browser applies the page's CSP and SameSite rules, the engine's join and leave tasks
-// (packages/engine tests), rate limit counting (ratelimit.test.ts), or Next.js routing.
+// PayPal, the engine replaced by a stub and the database's rate limiter by a recorder
+// that must stay empty: the confirmation page and its escaping and headers, the origin
+// and CSRF checks on the click, the exact redirect and cookie, the consent check, every
+// way a return is refused before PayPal is called, cancel, join, leave, the engine's
+// refusals (too many calls running for one address among them), PayPal failures, the
+// per-address counts kept in process memory, what reaches the logs, and the cookie being
+// cleared on every answer. Does NOT cover: PayPal's real sandbox (the first live sign-in
+// records its userinfo field names), how a real browser applies the page's CSP and
+// SameSite rules, the engine's join and leave tasks (packages/engine tests), the
+// in-memory counting itself (address-limits.test.ts), or Next.js routing.
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
+import { joinLimits } from "../../../server/address-limits";
 
 const fake = vi.hoisted(() => ({
   run: "brn-1c9e8f00-1111-4222-8333-944445555666",
   answers: {} as Record<string, unknown>,
   engineCalls: [] as Array<{ task: string; args: readonly unknown[] }>,
+  engineOptions: [] as unknown[],
   pending: false,
-  limited: false,
   hits: [] as Array<{ bucket: string; subject: string }>,
 }));
 
@@ -28,23 +31,34 @@ vi.mock("@/server/engine", async () => {
   const real = await import("../../../server/engine");
   return {
     ...real,
-    runAndWait: vi.fn(async (task: string, args: readonly unknown[]) => {
+    runAndWait: vi.fn(async (task: string, args: readonly unknown[], _waitMs: number, options: unknown) => {
       fake.engineCalls.push({ task, args });
+      fake.engineOptions.push(options);
       if (fake.pending) return { state: "pending", httpStatus: 202, runId: fake.run };
       return { state: "finished", runId: fake.run, status: "succeeded", result: fake.answers[task] };
     }),
   };
 });
+vi.mock("@/server/address-limits", async () => await import("../../../server/address-limits"));
+// The join routes count in memory; any use of the database's limiter shows up here.
 vi.mock("@/server/ratelimit", async () => {
   const real = await import("../../../server/ratelimit");
   return {
     ...real,
+    recordMemoryRefusal: vi.fn(async () => undefined),
     takeHit: vi.fn(async (limit: { bucket: string }, subject: string) => {
       fake.hits.push({ bucket: limit.bucket, subject });
-      return fake.limited ? { allowed: false, retryAfterSeconds: 42 } : { allowed: true };
+      return { allowed: true };
     }),
   };
 });
+
+const ADDRESS = "198.51.100.7";
+
+/** Use up the in-memory count for route at the test client's address. */
+function fillCount(route: keyof typeof joinLimits): void {
+  for (let n = 0; n < 100 && joinLimits[route].take(ADDRESS).allowed; n += 1);
+}
 
 import { csrfTokenForSession } from "../../../server/csrf";
 import { issueTicket } from "../../../server/paypal-login";
@@ -170,9 +184,10 @@ afterAll(() => {
 beforeEach(() => {
   fake.answers = { ...ANSWERS };
   fake.engineCalls = [];
+  fake.engineOptions = [];
   fake.pending = false;
-  fake.limited = false;
   fake.hits = [];
+  for (const limiter of Object.values(joinLimits)) limiter.clear();
   paypal.token = { status: 200, body: { access_token: USER_TOKEN, token_type: "Bearer", expires_in: "28800", refresh_token: REFRESH_TOKEN, id_token: ID_TOKEN } };
   paypal.userinfo = { status: 200, body: USERINFO };
   paypal.fallback = { status: 500, body: {} };
@@ -184,28 +199,54 @@ beforeEach(() => {
     return true;
   }) as typeof process.stdout.write);
   return () => {
+    // Nothing on these routes may count in the database's rate_limit_hits.
+    expect(fake.hits).toEqual([]);
     vi.restoreAllMocks();
     vi.unstubAllGlobals();
   };
 });
 
 describe("GET /api/join/consent", () => {
-  it("answers the shop name, the words and their hash from the engine", async () => {
+  it("answers the shop name, the words and their hash from the engine, counted against the client address", async () => {
     const { consent } = await routes();
     const response = await consent.GET(get("/api/join/consent"));
     expect(response.status).toBe(200);
     expect(await body(response)).toStrictEqual({ shopName: "Wolf and Wren Gifts", text: ANSWERS.consent_text.text, hash: HASH });
     expect(fake.engineCalls).toEqual([{ task: "consent_text", args: [] }]);
-    expect(fake.hits).toEqual([{ bucket: "join_consent", subject: "198.51.100.7" }]);
+    expect(fake.engineOptions).toEqual([{ address: ADDRESS }]);
   });
 
   it("refuses past the joinConsent limit before asking the engine", async () => {
-    fake.limited = true;
+    fillCount("consent");
     const { consent } = await routes();
     const response = await consent.GET(get("/api/join/consent"));
     expect(response.status).toBe(429);
-    expect(response.headers.get("retry-after")).toBe("42");
+    expect(Number(response.headers.get("retry-after"))).toBeGreaterThan(0);
     expect(fake.engineCalls).toEqual([]);
+  });
+
+  it("answers 429 when the engine refuses a third call running for this address", async () => {
+    fake.answers.consent_text = { ok: false, error: "too_many_running", ref: ENGINE_REF };
+    const { consent } = await routes();
+    const response = await consent.GET(get("/api/join/consent"));
+    expect(response.status).toBe(429);
+    expect(await body(response)).toEqual({ error: "too_many_running", message: "Too many requests. Try again later.", ref: ENGINE_REF });
+  });
+});
+
+describe("the join routes' counts", () => {
+  it("are kept in process memory, never in rate_limit_hits: 60 consent reads, 20 starts and 20 returns a minute per address", async () => {
+    const { consent, start, callback } = await routes();
+    for (let n = 0; n < 60; n += 1) expect((await consent.GET(get("/api/join/consent"))).status).toBe(200);
+    expect((await consent.GET(get("/api/join/consent"))).status).toBe(429);
+    for (let n = 0; n < 20; n += 1) expect((await start.GET(get("/api/join/paypal/start?intent=leave"))).status).toBe(200);
+    const refused = await start.GET(get("/api/join/paypal/start?intent=leave"));
+    expect(refused.status).toBe(429);
+    expect((await body(refused)).error).toBe("rate_limited");
+    for (let n = 0; n < 20; n += 1) expect((await callback.GET(get("/api/join/paypal/callback?state=x"))).status).toBe(400);
+    expect((await callback.GET(get("/api/join/paypal/callback?state=x"))).status).toBe(429);
+    const elsewhere = new Request(`${BASE}/api/join/consent`, { headers: { "x-forwarded-for": "198.51.100.8" } });
+    expect((await consent.GET(elsewhere)).status).toBe(200);
   });
 });
 
@@ -229,7 +270,7 @@ describe("GET /api/join/paypal/start", () => {
     expect(html).toContain('<button type="submit">Join with PayPal</button>');
     expect(html).not.toMatch(/<script|<style|style=/i);
     expect(fake.engineCalls).toEqual([{ task: "consent_text", args: [] }]);
-    expect(fake.hits).toEqual([{ bucket: "join_start", subject: "198.51.100.7" }]);
+    expect(fake.engineOptions).toEqual([{ address: ADDRESS }]);
     expect(paypal.calls).toEqual([]);
   });
 
@@ -273,13 +314,22 @@ describe("GET /api/join/paypal/start", () => {
   });
 
   it("refuses past the joinStart limit, which GET and POST share, before asking the engine", async () => {
-    fake.limited = true;
     const { start } = await routes();
+    for (let n = 0; n < 19; n += 1) joinLimits.start.take(ADDRESS);
+    expect((await start.POST(post([["intent", "leave"], ["csrf", "c2.x"]]))).status).toBe(403);
     const shown = await start.GET(get("/api/join/paypal/start?intent=join"));
     const clicked = await start.POST(post([["intent", "leave"], ["csrf", "c2.x"]]));
     expect([shown.status, clicked.status]).toEqual([429, 429]);
-    expect(fake.hits.map((hit) => hit.bucket)).toEqual(["join_start", "join_start"]);
     expect(fake.engineCalls).toEqual([]);
+  });
+
+  it("answers 429 with no page when the engine refuses a third call running for this address", async () => {
+    fake.answers.consent_text = { ok: false, error: "too_many_running", ref: ENGINE_REF };
+    const { start } = await routes();
+    const response = await start.GET(get("/api/join/paypal/start?intent=join"));
+    expect(response.status).toBe(429);
+    expect(await body(response)).toEqual({ error: "too_many_running", message: "Too many requests. Try again later.", ref: ENGINE_REF });
+    expect(response.headers.get("set-cookie")).toBeNull();
   });
 });
 
@@ -429,7 +479,17 @@ describe("GET /api/join/paypal/callback", () => {
       "https://api-m.sandbox.paypal.com/v1/oauth2/token",
       "https://api-m.sandbox.paypal.com/v1/identity/oauth2/userinfo?schema=paypalv1.1",
     ]);
-    expect(fake.hits.at(-1)).toEqual({ bucket: "join_callback", subject: "198.51.100.7" });
+    expect(fake.engineOptions.at(-1)).toEqual({ address: ADDRESS });
+  });
+
+  it("answers 429 when the engine refuses a third call running for this address, clearing the cookie", async () => {
+    fake.answers.join = { ok: false, error: "too_many_running", ref: ENGINE_REF };
+    const { cookie, state } = ticketCookie("join");
+    const { callback } = await routes();
+    const response = await callback.GET(get(`/api/join/paypal/callback?code=${CODE}&state=${state}`, cookie));
+    expect(response.status).toBe(429);
+    expect(await body(response)).toEqual({ error: "too_many_running", message: "Too many requests. Try again later.", ref: ENGINE_REF });
+    expectCleared(response);
   });
 
   it("leaves, handing the engine exactly the three identity fields", async () => {
@@ -504,10 +564,10 @@ describe("GET /api/join/paypal/callback", () => {
     let response = await callback.GET(get(`/api/join/paypal/callback?state=${state}`, cookie));
     expect([response.status, (await body(response)).error]).toEqual([400, "bad_request"]);
     expectCleared(response);
-    fake.limited = true;
+    fillCount("callback");
     response = await callback.GET(get(`/api/join/paypal/callback?code=${CODE}&state=${state}`, cookie));
     expect(response.status).toBe(429);
-    expect(response.headers.get("retry-after")).toBe("42");
+    expect(Number(response.headers.get("retry-after"))).toBeGreaterThan(0);
     expectCleared(response);
     expect(paypal.calls).toEqual([]);
   });

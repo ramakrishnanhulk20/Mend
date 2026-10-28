@@ -16,7 +16,7 @@ import { z } from "zod";
 import { currentPrincipal, type Principal } from "./auth";
 import { csrfSecret } from "./csrf";
 import { writeLog } from "./log";
-import { SECRET_SETTINGS } from "./secrets";
+import { secretValues } from "./secrets";
 
 export const ACTIONS = [
   "session.start",
@@ -39,6 +39,7 @@ export const ACTIONS = [
   "campaign.request_approval",
   "agent.chat",
   "paypal.read",
+  "paypal.read_disputes",
   "campaign.cancel_unclaimed",
 ] as const;
 
@@ -69,8 +70,11 @@ const PERMISSIONS: Readonly<Record<Action, readonly PrincipalRole[]>> = Object.f
   // Moves a draft into the approval queue only; approving stays campaign.approve, a person's click (C2).
   "campaign.request_approval": ["demo", "owner"],
   "agent.chat": ["demo", "owner"],
-  // The assistant's four read-only PayPal lookups through PayPal's MCP server, identity stripped (paypal-mcp.ts).
+  // The assistant's order and product lookups through PayPal's MCP server, identity stripped (paypal-mcp.ts).
+  // A demo visitor's get_order is further held to orders its own session bought (agent.ts, session-orders.ts).
   "paypal.read": ["demo", "owner"],
+  // The shop's disputes are the shop's PayPal data, not anything a demo visitor created (Developer Agreement 10.1.4(b)).
+  "paypal.read_disputes": ["owner"],
   // Pulls back sent rewards nobody has claimed, so the money returns to the shop; the engine holds demo to its own campaigns.
   "campaign.cancel_unclaimed": ["demo", "owner"],
 });
@@ -155,20 +159,13 @@ export function refuse(
   return response;
 }
 
-/**
- * The shortest secret value the checks look for: scrubbed() here, claude.ts
- * outboundProblem() and the audit detail rule all use this one number. A shorter value
- * would match ordinary text too often to be worth removing.
- */
-export const MIN_SECRET_CHARS = 6;
+// The one minimum scrubbed() here, claude.ts outboundProblem() and the audit detail rule share, through secretValues().
+export { MIN_SECRET_CHARS } from "./secrets";
 
-/** text with every secret setting's value and every token-shaped string removed, for a log line. */
+/** text with every secret setting's value (secrets.ts secretValues) and every token-shaped string removed, for a log line. */
 export function scrubbed(text: string): string {
   let clean = text;
-  for (const name of SECRET_SETTINGS) {
-    const value = process.env[name];
-    if (value !== undefined && value.length >= MIN_SECRET_CHARS) clean = clean.split(value).join("[removed]");
-  }
+  for (const value of secretValues()) clean = clean.split(value).join("[removed]");
   return clean
     .replace(/\b(?:s1|c1|c2|a1)\.[A-Za-z0-9_-]{20,}/g, "[token]")
     .replace(/\b[0-9a-f]{64}\b/g, "[hex64]")

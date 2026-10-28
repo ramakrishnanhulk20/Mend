@@ -1,8 +1,11 @@
-// Covers run ownership against a real Postgres schema, and how each task's engine
-// answer becomes its route's response: success bodies, refusals, malformed answers and
-// the no-email, no-UUID rule on summary and quiet-regular output. Does NOT cover: the
-// route handlers themselves (npm run prove:m7b polls a run from a second session), or
-// Render's own run store (engine.test.ts fakes it).
+// Covers run ownership against a real Postgres schema, how each task's engine answer
+// becomes its route's response (success bodies, refusals, malformed answers, results
+// with no p-value yet, and the no-email, no-UUID rule on summary and quiet-regular
+// output), and the orders a session bought through simulate being remembered for that
+// session alone, from the direct and the polled answer, at most 50 for 24 hours. Does
+// NOT cover: the route handlers themselves (npm run prove:m7b polls a run from a second
+// session), Render's own run store (engine.test.ts fakes it), or the agent reading those
+// orders (agent.test.ts).
 import { spawn } from "node:child_process";
 import { once } from "node:events";
 import { readFileSync } from "node:fs";
@@ -12,7 +15,8 @@ import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vites
 import { ENGINE_DIR, SCHEMA_PATH, type DevDatabase } from "../../scripts/dev-database";
 import { closeDatabase } from "./db";
 import type { EngineAnswer, TaskName } from "./engine";
-import { finishedResponse, ownedRunTask, pendingResponse, prefersAsync, recordRun, successBody } from "./runs";
+import { finishedResponse, ownedRunTask, pendingResponse, prefersAsync, recordRun, successBody, waitedResponse } from "./runs";
+import { MAX_ORDERS_PER_SESSION, ORDER_MEMORY_MS, rememberSessionOrder, sessionBoughtOrder } from "./session-orders";
 
 // Applies the schema to its own throwaway schema; only the database server is shared.
 async function holdDatabaseServer(): Promise<DevDatabase> {
@@ -75,11 +79,43 @@ const BACKTEST = {
   passed: true,
   computed_at: "2026-10-24T05:35:27.783038+00:00",
 };
+// The live segment and all customers as store_facts.py _group_fact writes them, with today's measured pooled numbers.
+const HEADLINE = {
+  group: "live segment",
+  regular_min_days: 3,
+  silent_min_days: 60,
+  confidence: 0.95,
+  resamples: 1000,
+  valid_cutoffs: 5,
+  model_wins: 3,
+  mean_auc_difference: -0.005,
+  interval_low: -0.024,
+  interval_high: 0.016,
+  cutoffs: [
+    { cutoff: "2011-09-09", customers: 812, returned: 97, auc_model: 0.612, auc_recency: 0.618, difference: -0.006, interval_low: -0.031, interval_high: 0.019 },
+    { cutoff: "2010-12-01", customers: 40, returned: 0, auc_model: null, auc_recency: null, difference: null, interval_low: null, interval_high: null },
+  ],
+};
+const ALL_CUSTOMERS = {
+  group: "all customers",
+  regular_min_days: null,
+  silent_min_days: null,
+  confidence: 0.95,
+  resamples: 1000,
+  valid_cutoffs: 5,
+  model_wins: 5,
+  mean_auc_difference: 0.052,
+  interval_low: 0.048,
+  interval_high: 0.057,
+  cutoffs: [{ cutoff: "2011-09-09", customers: 5256, returned: 1873, auc_model: 0.8007, auc_recency: 0.7626, difference: 0.0381, interval_low: 0.031, interval_high: 0.045 }],
+};
 const SUMMARY = {
   ok: true,
   as_of: "2026-10-16",
   shop_customers: 5852,
-  members: 41,
+  members_joined: 1,
+  members_seeded: 40,
+  members_seeded_label: "demo stand-ins",
   quiet_regulars: 1357,
   quiet_regulars_paid_12m_minor: 123456789,
   currency: "USD",
@@ -225,10 +261,65 @@ describe("finished runs become each route's own response", () => {
     const response = finished("shop_summary", SUMMARY);
     const body = await response.json();
     expect(response.status).toBe(200);
-    expect(Object.keys(body).sort()).toEqual(["asOf", "backtest", "benchmark", "currency", "members", "quietRegularsPaid12mMinor", "quietRegulars", "shopCustomers"].sort());
+    expect(Object.keys(body).sort()).toEqual(["asOf", "backtest", "benchmark", "currency", "membersJoined", "membersSeeded", "membersSeededLabel", "quietRegularsPaid12mMinor", "quietRegulars", "shopCustomers"].sort());
     expect(body.benchmark.fitted).toEqual({ r: 0.2426, alpha: 4.4136, a: 0.7929, b: 2.4259, logLikelihood: -9582.43 });
     expect(body.backtest.deciles).toEqual([{ decile: 10, customers: 525, returnedShare: 0.0952 }]);
     expect((await finished("shop_summary", { ...SUMMARY, benchmark: null, backtest: null }).json()).benchmark).toBeNull();
+  });
+
+  it("the summary keeps people who joined and the demo stand-ins apart, with the stand-ins' label, and no single members count", async () => {
+    const body = await finished("shop_summary", SUMMARY).json();
+    expect([body.membersJoined, body.membersSeeded, body.membersSeededLabel]).toEqual([1, 40, "demo stand-ins"]);
+    expect(body).not.toHaveProperty("members");
+  });
+
+  it.each([
+    ["the old single members count", { members: 41 }],
+    ["the old count in place of the new ones", { members: 41, members_joined: undefined, members_seeded: undefined, members_seeded_label: undefined }],
+    ["no stand-in count", { members_seeded: undefined }],
+    ["another label for the stand-ins", { members_seeded_label: "members" }],
+    ["a joined count that is not a whole number", { members_joined: 1.5 }],
+  ])("the summary's member counts are refused with 500 for %s", (_label, change) => {
+    expect(finished("shop_summary", { ...SUMMARY, ...change }).status).toBe(500);
+  });
+
+  it("the summary carries the live-segment headline before the all-customer result when the row has them, and null for both from a row stored before them", async () => {
+    const withGroups = await finished("shop_summary", { ...SUMMARY, backtest: { ...BACKTEST, headline: HEADLINE, all_customers: ALL_CUSTOMERS } }).json();
+    expect(Object.keys(withGroups.backtest).slice(0, 4)).toEqual(["source", "holdoutDays", "headline", "allCustomers"]);
+    expect(withGroups.backtest.headline).toEqual({
+      group: "live segment",
+      regularMinDays: 3,
+      silentMinDays: 60,
+      confidence: 0.95,
+      resamples: 1000,
+      validCutoffs: 5,
+      modelWins: 3,
+      meanAucDifference: -0.005,
+      intervalLow: -0.024,
+      intervalHigh: 0.016,
+      cutoffs: [
+        { cutoff: "2011-09-09", customers: 812, returned: 97, aucModel: 0.612, aucRecency: 0.618, difference: -0.006, intervalLow: -0.031, intervalHigh: 0.019 },
+        { cutoff: "2010-12-01", customers: 40, returned: 0, aucModel: null, aucRecency: null, difference: null, intervalLow: null, intervalHigh: null },
+      ],
+    });
+    expect(withGroups.backtest.allCustomers).toMatchObject({ group: "all customers", regularMinDays: null, silentMinDays: null, modelWins: 5, meanAucDifference: 0.052, intervalLow: 0.048, intervalHigh: 0.057 });
+    expect(withGroups.backtest.modelWins).toBe(1);
+
+    const before = await finished("shop_summary", SUMMARY).json();
+    expect([before.backtest.headline, before.backtest.allCustomers]).toEqual([null, null]);
+  });
+
+  it.each([
+    ["only the headline", { headline: HEADLINE }],
+    ["only the all-customer result", { all_customers: ALL_CUSTOMERS }],
+    ["a group with a field nobody listed", { headline: { ...HEADLINE, note: "x" }, all_customers: ALL_CUSTOMERS }],
+    ["a group missing a field", { headline: HEADLINE, all_customers: { ...ALL_CUSTOMERS, interval_high: undefined } }],
+    ["a segment rule given as text", { headline: { ...HEADLINE, regular_min_days: "3" }, all_customers: ALL_CUSTOMERS }],
+    ["a difference outside -1 to 1", { headline: { ...HEADLINE, mean_auc_difference: 1.5 }, all_customers: ALL_CUSTOMERS }],
+    ["a group cutoff without its returned count", { headline: { ...HEADLINE, cutoffs: [{ ...HEADLINE.cutoffs[0], returned: undefined }] }, all_customers: ALL_CUSTOMERS }],
+    ["a group label holding an email", { headline: { ...HEADLINE, group: "ram@shop.example" }, all_customers: ALL_CUSTOMERS }],
+  ])("the summary is refused with 500 for a backtest with %s", (_label, groups) => {
+    expect(finished("shop_summary", { ...SUMMARY, backtest: { ...BACKTEST, ...groups } }).status).toBe(500);
   });
 
   it.each([
@@ -318,5 +409,73 @@ describe("finished runs become each route's own response", () => {
 
   it("an approval request that reports any status but awaiting_approval is malformed", () => {
     expect(successBody("request_approval", { ok: true, campaign_id: CAMPAIGN, status: "approved" })).toBeNull();
+  });
+
+  // A regression guard: results already took a null p-value before this was asked for, so this passes before and after.
+  it("results with no p-value yet answer 200 with pValue null, and every other check still holds", async () => {
+    const arm = { members: 3, real_returns: 0, real_rate: 0, simulated_returns: 0 };
+    const results = {
+      ok: true as const,
+      campaign_id: CAMPAIGN,
+      status: "submitted",
+      rewarded: arm,
+      holdout: arm,
+      spend_minor: 10,
+      fees_minor: 25,
+      window_starts_at: "2026-10-24T05:00:00+00:00",
+      window_ends_at: "2026-11-23T05:00:00+00:00",
+      window_open: true,
+      p_value: null,
+      verdict: "too early to tell",
+      payouts: { items: 1, by_status: { UNCLAIMED: 1 }, claimed_minor: 0, unclaimed_minor: 10, returned_minor: 0, failed_minor: 0, pending_minor: 0, unclaimed_return_by: null },
+    };
+    const answered = finished("results", results);
+    expect(answered.status).toBe(200);
+    expect(await answered.json()).toMatchObject({ pValue: null, verdict: "too early to tell", windowOpen: true });
+    for (const change of [{ p_value: 1.5 }, { p_value: -0.1 }, { p_value: "0.5" }, { owner_email: "x" }, { verdict: "" }]) {
+      expect(finished("results", { ...results, ...change }).status, JSON.stringify(change)).toBe(500);
+    }
+  });
+});
+
+describe("orders a session bought through simulate", () => {
+  const bought = (orderId: string) => ({ ok: true as const, campaign_id: CAMPAIGN, ref: "R3", paypal_order_id: orderId, paypal_status: "COMPLETED" });
+
+  it("are remembered for the session that asked, from the direct answer", async () => {
+    const response = await waitedResponse(ROUTE, REF, "simulate_return", { state: "finished", runId: RUN, status: "succeeded", result: bought("1AB23456CD789012E") }, SESSION_A);
+    expect(response.status).toBe(201);
+    expect(sessionBoughtOrder(SESSION_A, "1AB23456CD789012E")).toBe(true);
+    expect(sessionBoughtOrder(SESSION_B, "1AB23456CD789012E")).toBe(false);
+  });
+
+  it("are remembered for the session the run is recorded under, from the polled answer", async () => {
+    const run = "brn-3c9e8f00-1111-4222-8333-944445555666";
+    await recordRun(run, SESSION_B, "simulate_return");
+    expect(await ownedRunTask(run, SESSION_B)).toBe("simulate_return");
+    expect(finishedResponse(ROUTE, REF, "simulate_return", run, { status: "succeeded", result: bought("2CD34567EF890123G") }).status).toBe(201);
+    expect(sessionBoughtOrder(SESSION_B, "2CD34567EF890123G")).toBe(true);
+    expect(sessionBoughtOrder(SESSION_A, "2CD34567EF890123G")).toBe(false);
+  });
+
+  it("are not remembered from a refusal, a malformed answer, a run nobody owns or another task", async () => {
+    const session = "f".repeat(64);
+    finishedResponse(ROUTE, REF, "simulate_return", RUN, { status: "succeeded", result: { ok: false, error: "over_cap", ref: REF } }, session);
+    finishedResponse(ROUTE, REF, "simulate_return", RUN, { status: "succeeded", result: { ...bought("3EF45678GH901234J"), extra: 1 } }, session);
+    finishedResponse(ROUTE, REF, "simulate_return", "brn-4c9e8f00-1111-4222-8333-944445555666", { status: "succeeded", result: bought("4GH56789JK012345L") });
+    finishedResponse(ROUTE, REF, "submit_campaign", RUN, { status: "succeeded", result: { ok: true, campaign_id: CAMPAIGN, status: "submitted", sent: true, payout_batch_id: "5JK67890LM123456N" } }, session);
+    for (const order of ["3EF45678GH901234J", "4GH56789JK012345L", "5JK67890LM123456N"]) expect(sessionBoughtOrder(session, order), order).toBe(false);
+  });
+
+  it("keep at most 50 per session, each for 24 hours from when it was bought", () => {
+    const session = "c".repeat(64);
+    const start = Date.now();
+    const order = (n: number) => `ORDER${String(n).padStart(12, "0")}`;
+    for (let n = 0; n <= MAX_ORDERS_PER_SESSION; n += 1) rememberSessionOrder(session, order(n), start + n);
+    expect(sessionBoughtOrder(session, order(0), start + 100)).toBe(false);
+    expect(sessionBoughtOrder(session, order(1), start + 100)).toBe(true);
+    expect(sessionBoughtOrder(session, order(MAX_ORDERS_PER_SESSION), start + 100)).toBe(true);
+    expect(sessionBoughtOrder(session, order(1), start + ORDER_MEMORY_MS + 1)).toBe(false);
+    expect(sessionBoughtOrder(session, order(MAX_ORDERS_PER_SESSION), start + ORDER_MEMORY_MS + MAX_ORDERS_PER_SESSION - 1)).toBe(true);
+    expect([MAX_ORDERS_PER_SESSION, ORDER_MEMORY_MS]).toEqual([50, 24 * 60 * 60 * 1000]);
   });
 });

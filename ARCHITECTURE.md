@@ -8,25 +8,31 @@ Everything runs against the PayPal sandbox. Security rules referenced as C1 to C
 
 | Part | Where it runs | Job |
 |---|---|---|
-| Web app (`packages/web`) | Next.js on a Render web service (mend-web, Starter) | Landing page, owner and demo console, join page, `/docs`; API routes for sign-in, campaigns and the agent; the PayPal webhook receiver. Calls the engine over Render's private network. After storing each verified webhook it asks the engine to run process_events at once, without waiting for the answer. Reads PayPal orders, disputes and products through PayPal's hosted MCP server from its own server: four read-only tools, with identity fields stripped before Claude sees anything. Runs Join with PayPal (Log in with PayPal, sandbox): the confirmation page, the sign-in redirect and the callback. Talks to Claude. Never sends money itself. |
-| Engine (`packages/engine`) | Python task server, a Render private service (mend-engine, Starter), reachable only on Render's private network at `http://mend-engine:10000` behind a shared token (`MEND_ENGINE_TOKEN`) | Imports the shop's own order records; scores customers with BG/NBD; builds campaign drafts (eligible set, holdout, amounts, all in code); sends approved batches through Payouts; reconciles and refreshes payout status; records purchases and attribution. The only code that moves money (C1). |
+| Web app (`packages/web`) | Next.js on a Render web service (mend-web, Starter) | Landing page at `/`, the demo console at `/demo`, `/docs`; API routes for sessions, campaigns and the agent; the PayPal webhook receiver, which checks each delivery's signature itself against PayPal's certificate chain and never calls PayPal's verify API (C9). Calls the engine over Render's private network. After storing each verified webhook it asks the engine to run process_events at once, without waiting for the answer. Reads PayPal orders, disputes and products for the agent from its own server: four read-only tools on PayPal's hosted MCP server, with identity fields stripped before Claude sees anything. Those reads use a second sandbox app made without the Payouts permission. When PayPal's MCP server fails with a setup error, cannot be reached or breaks the protocol, and at least 5 of the call's 15 seconds are left, the same four reads go straight to PayPal's REST API under the same rules, and each answer says which way it came. Runs Join with PayPal (Log in with PayPal, sandbox): the confirmation page, the sign-in redirect and the callback. Talks to Claude. Never sends money itself. |
+| Engine (`packages/engine`) | Python task server, a Render private service (mend-engine, Starter), reachable only on Render's private network at `http://mend-engine:10000` behind a shared token (`MEND_ENGINE_TOKEN`) | Imports the shop's own order records; scores customers with BG/NBD; builds campaign drafts (eligible set, holdout, amounts, all in code); reads the shop's PayPal balance before every send and sends nothing below the floor (C20); sends approved batches through Payouts; cancels unclaimed rewards on request; reconciles and refreshes payout status; records purchases and attribution. The only code that moves money (C1). |
 | Database | Render Postgres (mend-db, basic 256 MB, Postgres 18, virginia) | Shop order records, members and consent, customer scores, campaigns and snapshots, payout items, attribution, sessions, append-only audit log (C23). |
-| Scheduled jobs (`mend_engine.jobs`) | Render cron job every 5 minutes (mend-jobs, Starter) | Runs purge, process_events, reconcile, refresh_items (re-reads every unsettled payout item from PayPal after 15 minutes, so a lost webhook cannot leave the ledger stale) and cancel_demo_unclaimed (demo rewards still unclaimed after 10 minutes go back to the shop) directly in Python against the database. It never calls mend-engine and holds no engine token. process_events re-reads each stored webhook's resource from PayPal and acts only on PayPal's answer (C10); reconcile settles campaigns whose batch outcome is unknown without ever making a second batch (C3); purge deletes PayPal data older than 48 hours (C27). |
-| Operator scripts (`scripts/`) | A developer's machine | Import the real dataset as the demo shop's order records; reproduce the published benchmark; run the backtest; the prove-it command. |
-| PayPal (sandbox) | PayPal | OAuth, Transaction Search, Orders, Payouts, webhooks, Log in with PayPal. |
+| Scheduled jobs (`mend_engine.jobs`) | Render cron job every 5 minutes (mend-jobs, Starter) | Runs purge, process_events, reconcile, refresh_items (re-reads every unsettled payout item from PayPal after 15 minutes, so a lost webhook cannot leave the ledger stale) and cancel_demo_unclaimed (demo rewards still unclaimed after 10 minutes go back to the shop) directly in Python against the database. It never calls mend-engine and holds no engine token. process_events re-reads each stored webhook's resource from PayPal and acts only on PayPal's answer (C10); reconcile settles campaigns whose batch outcome is unknown without ever making a second batch (C3); purge runs first and deletes stored PayPal payloads at 47 hours, so none outlives 48 (C27). Locally, `npm run dev:console` runs the same command every 30 seconds. |
+| Operator scripts (`scripts/deploy/render.mjs`, `mend_engine.seed_demo`, `mend_engine.prove_*`, `packages/web/scripts`) | A developer's machine | Build and check the Render setup; import the real dataset as the demo shop's order records; reproduce the published benchmark; run the backtest; the live prove-it command; the local stack (`npm run dev:console`). |
+| PayPal (sandbox) | PayPal | OAuth, Payouts, Orders v2, Reporting balances, Webhooks, Log in with PayPal, the hosted MCP server, and read-only Disputes and Catalog Products calls for the REST fallback. Transaction Search is called by one proof script only. |
+| Read-only PayPal app | PayPal sandbox, the same business account | A second sandbox app created without the Payouts permission. Its keys (`PAYPAL_READ_CLIENT_ID`, `PAYPAL_READ_CLIENT_SECRET`) live on mend-web only and serve only the agent's four reads. PayPal answers 403 when its token asks for a payout batch, so a leaked read token cannot pay anyone. When the pair is not set, the reads use the main app's keys. |
 | Claude Haiku 5.5 | Anthropic API | Reads the owner's goal into structured campaign settings; writes one note per customer; answers the owner's questions through read-only tools. Never chooses an amount or a recipient (C4, C5, C11). |
 
 Where each PayPal call lives:
 
 | PayPal call | Caller | How |
 |---|---|---|
-| `POST /v1/oauth2/token` | web, engine | REST, token cached until `expires_in` |
-| Transaction Search `GET /v1/reporting/transactions` | M1 proof script only (`mend_engine.prove_m1`) | Server SDK `TransactionSearchController` (Python). Used only by the M1 proof script today; no live task calls it. |
-| Payouts create, show batch, show item, cancel unclaimed | engine | REST (no SDK covers Payouts) |
-| Webhooks create, list, verify signature | web | REST |
-| Orders create and capture (simulate purchase, seeding) | engine, scripts | Server SDK `OrdersController` |
-| Log in with PayPal (`/connect`, `/v1/oauth2/token`, userinfo `schema=paypalv1.1`) | web | REST; scopes openid, email, paypalattributes |
-| PayPal's hosted MCP server, four read-only tools (`get_order`, `list_disputes`, `get_dispute`, `show_product_details`) | web agent, through mend-web's own server | Mend's MCP client (`paypal-mcp.ts`) at `mcp.sandbox.paypal.com`; any other tool name is refused before a token is fetched, and each answer is rebuilt from listed fields with identity stripped before Claude sees it |
+| `POST /v1/oauth2/token` | web, engine, jobs | REST, token cached until `expires_in` |
+| Transaction Search `GET /v1/reporting/transactions` | M1 proof script only (`mend_engine.prove_m1`) | Server SDK (Python). Used only by the M1 proof script today; no live task calls it. |
+| Payouts create `POST /v1/payments/payouts` | engine (submit), jobs (reconcile resend with the same sender_batch_id, C3) | REST |
+| Payouts show batch and show item | engine (process_events), jobs (refresh_items, reconcile) | REST |
+| Payouts cancel unclaimed `POST /v1/payments/payouts-item/{id}/cancel` | engine (cancel_unclaimed task), jobs (cancel_demo_unclaimed) | REST, sent once and never retried in the same call |
+| Reporting balances `GET /v1/reporting/balances` | engine and jobs, before every send and resend | REST; nothing is sent when the batch, its fees and the floor (`MEND_BALANCE_FLOOR_MINOR`, USD 250 by default) do not fit, and a failed read counts as too low |
+| Orders v2 create with PayPal's sandbox test card, and read | engine (simulate task), jobs (refresh_items), web agent (get_order fallback) | REST; the order is captured at once with no buyer login |
+| Webhooks create, list, update event types | deploy script (`render.mjs`) | REST |
+| Webhook signing certificate `https://api.sandbox.paypal.com/v1/notifications/certs/CERT-<id>` | web | Downloaded only at that exact address, chained to a root Node ships, cached until it expires; the signature is checked in the app |
+| Log in with PayPal (`/connect`, `/v1/oauth2/token`, userinfo `schema=paypalv1.1`, then `schema=openid` only on a 404) | web | REST; scopes openid, email, paypalattributes |
+| PayPal's hosted MCP server, four read-only tools (`get_order`, `list_disputes`, `get_dispute`, `show_product_details`) | web agent, through mend-web's own server, with the read-only app's token | Mend's MCP client (`paypal-mcp.ts`) at `mcp.sandbox.paypal.com`; any other tool name is refused before a token is fetched, and each answer is rebuilt from listed fields with identity stripped before Claude sees it |
+| Direct REST fallback for the same four reads (`GET /v2/checkout/orders/{id}`, `/v1/customer/disputes`, `/v1/customer/disputes/{id}`, `/v1/catalogs/products/{id}`) | web agent (`paypal-read.ts`) | Only when the MCP server fails with a setup error, cannot be reached or breaks the protocol, with at least 5 seconds left; same inputs, host check, headers, 1 MB cap and rebuilt views; each answer is marked `via paypal_mcp` or `via paypal_rest` |
 
 ## 1. System overview
 
@@ -39,9 +45,9 @@ flowchart LR
   end
 
   subgraph Render
-    Web["mend-web<br/>Next.js web service<br/>console, API, webhook receiver, join"]
-    Engine["mend-engine<br/>Python private service<br/>score, draft, pay, attribute, purge,<br/>join and leave"]
-    Jobs["mend-jobs<br/>cron job every 5 minutes<br/>process events, reconcile, purge"]
+    Web["mend-web<br/>Next.js web service<br/>landing, demo console, API,<br/>webhook receiver, join"]
+    Engine["mend-engine<br/>Python private service<br/>score, draft, pay, cancel, attribute,<br/>join and leave"]
+    Jobs["mend-jobs<br/>cron job every 5 minutes<br/>purge, process events, reconcile,<br/>refresh items, cancel demo unclaimed"]
     DB[("mend-db<br/>Postgres<br/>shop orders, members and consent,<br/>scores, campaigns, payouts, audit log")]
   end
 
@@ -50,10 +56,12 @@ flowchart LR
   subgraph PayPal["PayPal sandbox"]
     Login["Log in with PayPal"]
     MCP["MCP server<br/>four read-only tools"]
-    TxSearch["Transaction Search"]
+    Reads["REST reads<br/>orders, disputes, products"]
     Payouts["Payouts"]
-    Orders["Orders"]
+    Orders["Orders v2"]
+    Balances["Reporting balances"]
     Hooks["Webhooks"]
+    TxSearch["Transaction Search"]
   end
 
   Owner --> Web
@@ -62,17 +70,20 @@ flowchart LR
   Web -- "sign-in redirect, code swap, userinfo" --> Login
   Web --> DB
   Web --> Claude
-  Web -- "orders, disputes, products;<br/>identity stripped" --> MCP
+  Web -- "read-only app token;<br/>identity stripped" --> MCP
+  Web -.->|"fallback when the MCP server fails"| Reads
   Web -- "POST /tasks/name<br/>private network, token" --> Engine
   Jobs --> DB
   Jobs --> Payouts
   Jobs --> Orders
+  Jobs --> Balances
   Engine --> DB
-  Engine -.->|"M1 proof script only, no live task"| TxSearch
+  Engine -- "floor checked before every send" --> Balances
   Engine --> Payouts
   Engine --> Orders
+  Engine -.->|"M1 proof script only, no live task"| TxSearch
   Payouts -- "cashback and note" --> Customer
-  Hooks -- "signed events" --> Web
+  Hooks -- "signed events, checked<br/>against the PayPal certificate" --> Web
 ```
 
 ## 2. Main sequence: one campaign, end to end
@@ -90,7 +101,8 @@ sequenceDiagram
 
   O->>W: Goal and budget ("bring back quiet regulars, 50 dollars")
   W->>C: Goal text only
-  C-->>W: Structured settings (segment, budget), schema checked
+  C-->>W: Structured settings (budget, reward, holdout share, customers considered), schema checked
+  W->>W: Code clamps every value to the caps
   W->>E: POST /tasks/draft_campaign (settings), with the engine token
   E->>D: Members with scores (expected purchases, value)
   E->>E: Eligible set, random holdout (CSPRNG), amounts under caps
@@ -105,15 +117,17 @@ sequenceDiagram
   W->>E: approve_campaign(id, hash the owner saw)
   E->>D: Approval recorded only if the hash matches the snapshot (C2)
   W->>E: submit_campaign(id)
+  E->>P: GET /v1/reporting/balances (C20)
+  E->>E: Batch, fees and the floor fit, else nothing is sent
   E->>D: approved to submitting, atomic (C3)
   E->>P: POST /v1/payments/payouts (sender_batch_id from snapshot)
   P-->>E: batch PENDING
   P-->>M: Cashback and note in their PayPal
   P->>W: PAYMENT.PAYOUTS-ITEM.SUCCEEDED (signed)
-  W->>W: Verify signature (C9)
+  W->>W: Check the signature against the PayPal certificate chain (C9)
   W->>D: Store the verified event once
   W-)E: process_events, not waited on
-  Note over W,E: mend-jobs also runs process_events every 5 minutes, in its own process
+  Note over W,E: mend-jobs also runs process_events every 5 minutes, and refresh_items re-reads any item still unsettled after 15 minutes
   E->>P: GET payout item (C10)
   E->>D: Status forward only
   O->>W: Simulate a return purchase by one member
@@ -127,6 +141,10 @@ sequenceDiagram
   E->>D: Purchase and attribution, rewarded or holdout, labelled simulated
   O->>W: Results
   W-->>O: Spend, return rate rewarded vs holdout, PayPal ids
+  O->>W: Take back unclaimed cashback
+  W->>E: cancel_unclaimed(id)
+  E->>P: POST /v1/payments/payouts-item/id/cancel for each UNCLAIMED item
+  E->>D: Each returned item recorded, with counts of what came back and what is still unclaimed
 ```
 
 ## 3. Module dependencies
@@ -134,14 +152,16 @@ sequenceDiagram
 ```mermaid
 flowchart TB
   subgraph web["packages/web (TypeScript)"]
-    pages["pages: landing, console, join, docs"]
-    api["api routes: auth, campaigns, agent, join"]
+    pages["pages: landing, demo console, docs"]
+    api["api routes: sessions, campaigns, agent, join and leave"]
     hook["webhook receiver"]
     agent["agent: Claude client + read-only tools"]
     perms["permissions table (C18)"]
     notes["note rules (C13)"]
-    ppweb["paypal client: token, webhook verify, sandbox host check (C16)"]
-    mcp["paypal mcp client: four read-only tools, identity stripped (C1, C15)"]
+    ppweb["paypal client: token, sandbox host check (C16)"]
+    sig["webhook signature: checked in the app against the PayPal certificate chain (C9)"]
+    mcp["paypal mcp client: four read-only tools, read-only app token, identity stripped (C1, C15)"]
+    pread["paypal read: direct REST fallback for the same four reads, same rules (C15, C16)"]
     login["log in with paypal: signed join cookie, code swap, userinfo (C17)"]
     enginecall["engine client: POST /tasks/name with token, run store"]
   end
@@ -156,6 +176,8 @@ flowchart TB
     draft["draft: eligibility, holdout, amounts (C4 to C6)"]
     money["money: decimal minor units"]
     payout["payouts: submit, reconcile, refresh (C3, C10)"]
+    balances["balances: floor read before every send and resend (C20)"]
+    cancel["cancel: unclaimed items back to the shop (C3)"]
     attrib["attribution (C8)"]
     purge["purge: PayPal data older than 48 hours (C27)"]
     ppeng["paypal client: sandbox host check (C16)"]
@@ -169,11 +191,13 @@ flowchart TB
   api --> notes
   api --> login
   api --> enginecall
-  hook --> ppweb
+  hook --> sig
   hook --> enginecall
   agent --> perms
   agent --> mcp
   mcp --> ppweb
+  mcp -.->|"server fails"| pread
+  pread --> ppweb
   login --> ppweb
   api --> db
   enginecall -- "private network" --> server
@@ -183,6 +207,7 @@ flowchart TB
   tasks --> events
   tasks --> draft
   tasks --> payout
+  tasks --> cancel
   tasks --> attrib
   tasks --> purge
   events --> payout
@@ -191,7 +216,11 @@ flowchart TB
   draft --> model
   draft --> money
   payout --> money
+  payout --> balances
   payout --> ppeng
+  balances --> ppeng
+  cancel --> ppeng
+  cancel --> db
   members --> db
   events --> db
   draft --> db
@@ -200,12 +229,46 @@ flowchart TB
   purge --> db
 ```
 
-## Interface the frontend will use
+## How the web calls the engine
 
-Filled in at the backend handoff (6l): every API route, its request and response shape, and the exact reads and writes each screen makes. Not written yet.
+Each task is one `POST /tasks/<name>` with the body `{"args": [...]}` and the `x-mend-engine-token` header, sent to `MEND_ENGINE_URL` (`http://mend-engine:10000`). The web refuses to send anything unless that address is plain `http` to a one-label host (a Render private network name: no dots, not an IP address, not localhost) with no path, query or userinfo, and the token is at least 32 printable characters. Redirects are refused, so the token cannot be carried to another host. The call runs in the background with a 120-second limit; the route answers with a run id, the run's state lives in an in-process run store (the latest 500 runs, none kept across a restart), and `GET /api/runs/<id>` polls it, answering only the session that started the run. A session has at most 2 engine calls in flight. An answer over 1 MB or of the wrong shape counts as a failed run (C12). The engine compares the token in constant time before it reads the path or body, runs at most 16 tasks at once (the five heavy reads share 6 of those slots), and answers 503 after 60 seconds without a free slot. mend-jobs does not use this path: it runs its five jobs in its own process. No service holds a Render API key.
+
+## The local stack
+
+`npm run dev:console` in `packages/web` runs the whole product on one machine with real data and real sandbox payouts:
+
+- A local Postgres (pgserver, from the engine's dev and test extras), with the demo shop in its own schema, `console_dev`. The first run applies the schema and runs `mend_engine.seed_demo`, which downloads UCI Online Retail II, imports it and measures the model (131 seconds on 28 Oct). Later runs reuse it in a few seconds.
+- The engine's dev bridge on `127.0.0.1` in place of mend-engine, behind a token made new for each run.
+- `python -m mend_engine.jobs all` every 30 seconds in place of mend-jobs. No PayPal webhook can reach the machine, so these runs read PayPal instead; locally they re-read a new batch's items after 45 seconds rather than 15 minutes (`MEND_DEV_REFRESH_AFTER_SECONDS`, honoured only in local development, never set on Render).
+- `next dev` on `127.0.0.1`, port 3001 unless `--port` says otherwise, with the console at `/demo`.
+
+It reads the repo's `.env`, prints no setting's value, and stops everything on Ctrl+C.
+
+## Console API
+
+The full reference, with every request and answer shape, is the API page of the docs: [`packages/web/content/docs/developers/api.mdx`](packages/web/content/docs/developers/api.mdx), served at https://mend-web.onrender.com/docs/developers/api. Every state-changing POST needs an `Origin` equal to this app's origin and the `x-mend-csrf` header. A route that waits on the engine answers `202 {status: "running", runId}` after its wait, and the browser polls `GET /api/runs/<runId>` for the answer.
+
+| Method and path | Who | What it does |
+|---|---|---|
+| `GET /api/session` | anyone | Says whether this browser is signed in and gives a CSRF token |
+| `POST /api/session/demo` | anyone | Opens a demo session (4 per address an hour, 10 a day) |
+| `POST /api/session/logout` | demo, owner | Ends the session |
+| `GET /api/shop/summary` | anyone | The shop's live counts, the benchmark and the backtest |
+| `GET /api/shop/quiet-regulars` | demo, owner | Quiet regulars ranked by the forecast, most at risk first |
+| `POST /api/campaigns/plan` | demo, owner | Claude reads a goal; the engine drafts a campaign within the caps |
+| `POST /api/campaigns` | demo, owner | Drafts a campaign from settings given directly |
+| `GET /api/campaigns/<id>` | own campaigns | Every reward, note and held-back row, with the review fingerprint |
+| `POST /api/campaigns/<id>/notes` | own campaigns | Claude writes one note per rewarded customer |
+| `POST /api/campaigns/<id>/approve` | own campaigns | Approves the exact plan whose fingerprint the visitor saw |
+| `POST /api/campaigns/<id>/submit` | own campaigns | Sends the approved plan as one PayPal Payouts batch |
+| `POST /api/campaigns/<id>/simulate` | own campaigns | Buys once from the shop with PayPal's sandbox test card for one customer |
+| `GET /api/campaigns/<id>/results` | own campaigns | Paid against held back, the verdict, and where every payout stands |
+| `POST /api/campaigns/<id>/cancel-unclaimed` | own campaigns | Asks PayPal to return every unclaimed reward to the shop |
+| `POST /api/agent` | demo, owner | One message to the assistant, answered from Mend's tools |
+| `GET /api/runs/<runId>` | the session that started the run | The answer of a route that was still waiting |
 
 ## Open items
 
-- Settled: how the web calls the engine. Each task is one `POST /tasks/<name>` with the body `{"args": [...]}` and the `x-mend-engine-token` header, sent to `MEND_ENGINE_URL` (`http://mend-engine:10000`). The web refuses to send anything unless that address is plain `http` to a one-label host (a Render private network name: no dots, not an IP address, not localhost) with no path, query or userinfo, and the token is at least 32 printable characters. Redirects are refused, so the token cannot be carried to another host. The call runs in the background with a 120-second limit; the route answers with a run id, the run's state lives in an in-process run store (the latest 500 runs, none kept across a restart), and `GET /api/runs/<id>` polls it, answering only the session that started the run. An answer over 1 MB or of the wrong shape counts as a failed run (C12). The engine compares the token in constant time before it reads the path or body, runs at most 16 tasks at once, and answers 503 after 60 seconds without a free slot. mend-jobs does not use this path: it runs its three tasks in its own process. This private service replaced Render Workflows on 24 Oct, because a Render API key is account-wide and would have had to sit on the web service.
-- Closed 26 Oct: Log in with PayPal returns `payer_id` under `schema=paypalv1.1`, in an answer that gives the email as an `emails` list of `{value, primary, confirmed}` (seen live on 26 Oct). The payer id is stored with the member, not matched on: members are found by their email, and the payer id is only compared to refuse a sign-in that conflicts with it.
-- Transaction Search lag on this app (M0 rows not visible after 27 minutes on 20 Oct): recheck.
+- Real return purchases are not attributed yet. The demo shop has no live storefront, so every return in the demo is a simulated sandbox purchase, labelled as simulated and kept out of the verdict. A production shop would match its own order record to the member first (`campaigns/attribution.py`).
+- Rate counts live in one process's memory. Render runs one mend-web instance today; the counts would multiply if it scaled out (threat model, 26 Oct round 2).
+- Transaction Search showed no rows 27 minutes after the M0 payments on 20 Oct. No live task uses it; recheck before one does.

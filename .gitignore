@@ -20,7 +20,7 @@ reference/
 # Build output and dependencies
 node_modules/
 .next/
-.next-verify/
+.next-*/
 dist/
 __pycache__/
 .venv/

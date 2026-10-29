@@ -1,0 +1,141 @@
+---
+title: API
+description: Every route the Mend console and the join pages call, with who may call it, what it takes, what it answers and its limits.
+---
+
+All routes live under https://mend-web.onrender.com/api. Bodies are JSON.
+
+## Rules for every route
+
+- Sessions use the cookie `__Host-mend_session`. A demo session lasts 24 hours at most, and ends after 2 hours without use.
+- Every state-changing POST needs an `Origin` header equal to the site's own origin and the `x-mend-csrf` header with the token from `GET /api/session`. After opening a session, use the new token it returns.
+- Errors answer `{"error": "<code>", "ref": "<id>"}`. The code is a short fixed word; the ref finds the matching line in the server log. Errors never carry PayPal's own message, a secret or a customer's details.
+- A route that waits on the engine answers `202 {"status": "running", "runId": "..."}` once its wait is over. Poll `GET /api/runs/<runId>` about every 2 seconds: it answers 202 while the run is going, then exactly what the original route would have answered.
+- "Own campaigns" means campaigns the caller's session created. Another session's campaign answers 404, the same as one that does not exist.
+- A 429 carries a `Retry-After` header where the limit has a clear end.
+
+## Sessions
+
+### `GET /api/session`
+
+Anyone. Answers `{"signedIn": false, "csrf": "..."}`, or `{"signedIn": true, "role": "demo", "expiresAt": "...", "csrf": "..."}` for a signed-in browser. Sets an anonymous cookie that the CSRF token is bound to.
+
+### `POST /api/session/demo`
+
+Anyone. No body. Opens a demo session and answers `{"signedIn": true, "role": "demo", "expiresAt": "...", "csrf": "..."}`. Limits: 4 demo sessions per address an hour and 10 a day. Errors: `403 csrf_refused`, `403 not_allowed`, `429 rate_limited`.
+
+### `POST /api/session/logout`
+
+Demo or owner. Ends the session and answers `{"signedIn": false}`.
+
+### `POST /api/session/owner`
+
+The owner's sign-in, with `{"password": "..."}`, at most 4 KB. 10 attempts per address in 15 minutes, counted before the password is checked. A wrong password answers 401 and is written to the audit log.
+
+## The shop
+
+### `GET /api/shop/summary`
+
+Anyone. The demo shop's live counts (customers, quiet regulars, members joined and demo stand-ins, what quiet regulars paid in the last year), the CDNOW benchmark and the backtest. Cached for 60 seconds. `503 engine_unavailable` with `Retry-After: 5` when the engine is slow.
+
+### `GET /api/shop/quiet-regulars?limit=1..50`
+
+Demo or owner. Answers `{"asOf", "total", "rows"}`, where each row has `position` (1 is most at risk), `displayName`, `purchaseDays`, `daysSilent`, `score` (expected purchases over the next 13 weeks), `paidNetMinor`, `member` (a member who could be paid) and `standIn` (a demo stand-in the seed script joined, never a person). Limit: 60 per session an hour. Waits up to 15 seconds. `422 model_not_converged` if the forecast could not be fitted.
+
+## Campaigns
+
+### `POST /api/campaigns/plan`
+
+Demo or owner. Body, at most 8,192 bytes:
+
+```json
+{ "goalText": "Win back my best lapsed regulars with 10 dollars", "budgetMinor": 1000 }
+```
+
+`goalText` is 1 to 500 characters and required. `budgetMinor`, `perRecipientMinor`, `holdoutShare` (text such as `"0.5"` or `"0.30"`) and `maxCandidates` are optional, and a value given here wins over one read from the goal.
+
+Claude reads the goal; code clamps every number to the caps; the engine drafts the campaign. Answers `201 {"campaignId", "candidates", "rewarded", "heldBack", "totalMinor", "plan", "aiCalls"}`, where `plan` holds the fitted `settings`, the list of `changes` in plain words, how the goal was read and any notice. Answers 202 with a run id after 60 seconds.
+
+Errors: `422 needs_budget` when no budget can be found, `422 no_shop_data`, `400`, `403`, `413`, `415`, `429`. Limits: 20 plans and drafts per session an hour, and 5 drafts per demo session a day.
+
+### `POST /api/campaigns`
+
+Demo or owner. Drafts a campaign from exact settings: `{"goalText", "asOf", "budgetMinor", "perRecipientMinor", "holdoutShare", "maxCandidates"}`, with `maxCandidates` from 2 to 250 (at most 20 for a demo session). An optional `Idempotency-Key` header makes a repeat return the same draft. Answers `201 {"campaignId", "candidates", "rewarded", "heldBack", "totalMinor"}`, or 202 after 20 seconds. Demo caps: 200 cents per customer, 1,000 cents per campaign, 5,000 cents a day across all demo visitors. Errors include `422 over_cap`, `429 limit_reached` and `429 over_demo_daily_cap`.
+
+### `GET /api/campaigns/<id>`
+
+Own campaigns. Answers the campaign: `status`, `goalText`, `asOf`, `budgetMinor`, `perRecipientMinor`, `holdoutShare`, `totalMinor`, `rows` and `reviewHash`, plus `reviewProblem` when the plan cannot be approved as it stands. Each row has `ref`, `role` (`reward` or `holdout`), `rank`, `amountMinor`, `note` and `standIn`. Rows name customers only by ref. Limit: 60 per session an hour. Waits up to 10 seconds.
+
+### `POST /api/campaigns/<id>/notes`
+
+Own campaigns, drafts only. No body. Claude writes one note per paid customer; a note that fails the note rule keeps the template. Answers `{"campaignId", "rewarded", "written", "template", "skipped", "ai", "stopped", "notice", "aiCalls"}`, where `ai` is `used` or `no_key`. Runs for up to 120 seconds and answers directly. `422 not_editable` once the campaign is approved. Counts against the plans and drafts limit and the Claude limits.
+
+### `POST /api/campaigns/<id>/approve`
+
+Own campaigns. Body: `{"presentedHash": "<reviewHash>"}`, at most 1 KB. Records the approval only if the hash still matches the plan. Answers `{"campaignId", "snapshotHash", "approvedAt"}`. Conflicts answer 409: `hash_mismatch`, `recipient_not_member`, `voided`, `not_open`, `approved_before`, `member_held`. Limits: 20 per session an hour, 10 per address an hour, 100 an hour across all demo visitors. Waits up to 20 seconds.
+
+### `POST /api/campaigns/<id>/submit`
+
+Own campaigns. No body. Sends the approved plan as one PayPal Payouts batch. Answers `{"campaignId", "status", "sent", "payoutBatchId"}`; `sent` is true only on the call that sent. Errors: `422 low_balance` when the shop's balance would fall under the floor, `503 balance_unavailable`, `503 paypal_unavailable`, `503 busy`, and `429` for `limit_reached` (2 sends per demo session a day), `over_demo_daily_cap`, `over_daily_cap` or `rate_limited`. Limits: 10 per session an hour, 4 demo sends per address a day. Waits up to 30 seconds.
+
+### `POST /api/campaigns/<id>/simulate`
+
+Own campaigns, once sent. Body: `{"ref": "R1"}`, a ref from the campaign. Buys once from the shop with PayPal's sandbox test card for that customer and answers `201 {"campaignId", "ref", "paypalOrderId", "paypalStatus"}`. The return is counted as simulated once a read of the order from PayPal says COMPLETED. Limits: 10 per campaign, 10 per session an hour, 10 per address an hour, 100 an hour across all demo visitors. `503 paypal_unavailable` when PayPal does not answer.
+
+### `GET /api/campaigns/<id>/results`
+
+Own campaigns. Answers, read from Mend's own records with no PayPal call:
+
+- `rewarded` and `holdout`: `members`, `realReturns`, `realRate`, `simulatedReturns`.
+- `spendMinor`, `feesMinor`, `windowStartsAt`, `windowEndsAt`, `windowOpen`.
+- `pValue` (null until the test may run) and `verdict`.
+- `payouts`: `items`, `byStatus`, `claimedMinor`, `unclaimedMinor`, `returnedMinor`, `failedMinor`, `pendingMinor`, `unclaimedReturnBy`.
+- `rows`: every paid and held-back row in rank order, by ref only, with `payoutStatus` (null for every held-back row), `simulatedReturn` and `realReturn`.
+
+Limit: 240 per session an hour. Waits up to 15 seconds.
+
+### `POST /api/campaigns/<id>/cancel-unclaimed`
+
+Own campaigns, once sent. No body. Asks PayPal to return every unclaimed reward. Answers `{"campaignId", "cancelled", "returnedMinor", "stillUnclaimed", "notCancellable", "incomplete", "paypalStatus", "paypalName"}`; when PayPal fails on an item, `incomplete` is true and the last failure's status and short error name are given. `409 not_submitted` before the campaign is sent. Limit: 10 per session an hour. Waits up to 30 seconds.
+
+## The assistant
+
+### `POST /api/agent`
+
+Demo or owner. Body, at most 64 KB: `{"message": "...", "history": [...]}`, with a message of 1 to 2,000 characters and at most 10 earlier turns of `{"role": "owner" | "agent", "text": "..."}`. Answers `{"reply", "toolsUsed", "stopped", "aiCalls"}`, where `stopped` is `tool_limit`, `declined` or null. Errors: `503 no_key` without an Anthropic key, `429 limit_reached` and `429 claude_token_cap`. Limits: 40 Claude calls per demo session a day, 80 per address a day, 50 an hour across all demo visitors.
+
+## Runs
+
+### `GET /api/runs/<runId>`
+
+The session that started the run. 202 while it runs, then the original route's answer. Any other session, and any id nobody started, gets the same 404. Limit: 1,800 polls per session an hour, one every 2 seconds.
+
+## Join and leave
+
+These need no session. Each is limited per address in memory.
+
+### `GET /api/join/consent`
+
+Answers `{"shopName", "text", "hash"}`: the exact words a customer agrees to by joining. 60 per address a minute.
+
+### `GET` and `POST` on `/api/join/paypal/start`
+
+`GET ?intent=join` or `?intent=leave` shows the confirmation page and changes nothing. The POST from that page, with exactly the fields `intent`, `csrf` and, for a join, `consent`, starts Log in with PayPal. 20 per address a minute, shared by GET and POST.
+
+### `GET /api/join/paypal/callback`
+
+Where PayPal sends the customer back. Records the join or the leave and answers `{"outcome": "joined", "linked": true}` or `{"outcome": "left"}`. 20 per address a minute.
+
+## Called by PayPal and Render
+
+### `POST /api/webhooks/paypal`
+
+PayPal's webhook deliveries. Bodies up to 256 KB. The signature is checked in the app; see [PayPal integration](/docs/developers/paypal-integration). Only rejected deliveries count against the limits: 120 a minute per address and 600 a minute in all.
+
+### `GET /api/health`
+
+Answers `ok` when the server is up. It says nothing about PayPal or the database.
+
+## Owner only
+
+`POST /api/admin/process-events`, `POST /api/admin/reconcile` and `POST /api/admin/purge` run the scheduled jobs on demand for the owner: 30 per session an hour. A demo session is refused.

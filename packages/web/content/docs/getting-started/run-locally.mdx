@@ -1,0 +1,137 @@
+---
+title: Run locally
+description: Run the whole of Mend on your own machine with one command, with the real demo shop and real PayPal sandbox payouts.
+---
+
+`npm run dev:console` runs the whole product on one machine: a local Postgres with the demo shop, the engine, the scheduled jobs and the web app. It uses real data and sends real PayPal sandbox payouts.
+
+Mend was built and tested on Windows 11. The macOS and Linux commands below follow the same scripts but have not been run on those systems.
+
+## What you need
+
+- Node.js 26 and Python 3.12. The live site runs Node 26.7.0 and Python 3.12.10.
+- A PayPal developer account at https://developer.paypal.com. In the sandbox you need:
+  - A US business account, and an app linked to it with Payouts and Log in with PayPal ticked. This app sends the cashback. PayPal funds new sandbox business accounts with test money.
+  - Optional: a second app on the same business account with Payouts not ticked. The assistant's four PayPal reads use it. Without it they use the first app's keys.
+  - A personal account. Its email is the test receiver: the one demo customer whose cashback can really be claimed.
+- An Anthropic API key, from https://platform.claude.com under Settings, API Keys.
+
+## Set up
+
+Clone the repository and copy the settings file:
+
+```bash
+git clone https://github.com/ramakrishnanhulk20/Mend.git
+cd Mend
+cp .env.example .env
+```
+
+Set up the engine's Python environment. `dev:console` looks for it at `packages/engine/.venv`:
+
+```bash
+cd packages/engine
+python -m venv .venv
+```
+
+Activate it with `.venv\Scripts\activate` on Windows or `source .venv/bin/activate` on macOS and Linux, then install the engine with its test and local-database extras:
+
+```bash
+pip install -e ".[test]"
+```
+
+Install the web app's packages:
+
+```bash
+cd ../web
+npm ci
+```
+
+## Fill in .env
+
+`.env` lives at the root of the repository. The web app and the engine both read it. Mend never prints a setting's value.
+
+| Setting | What it is | Where to get it |
+|---|---|---|
+| `PAYPAL_CLIENT_ID`, `PAYPAL_CLIENT_SECRET` | The sandbox app that sends payouts | developer.paypal.com, Apps & Credentials, Sandbox, your app |
+| `PAYPAL_ENV` | Must be `sandbox`; Mend refuses to start with anything else | Already set in `.env.example` |
+| `PAYPAL_READ_CLIENT_ID`, `PAYPAL_READ_CLIENT_SECRET` | Optional: the second app, without Payouts. It must be a different app from the first, or the web app refuses to start | The same page, your second app |
+| `MEND_TEST_RECEIVER` | The sandbox personal account's email | developer.paypal.com, Sandbox, Accounts |
+| `ANTHROPIC_API_KEY` | Claude, for plans, notes and the assistant. `dev:console` will not start without it | platform.claude.com, Settings, API Keys |
+| `MEND_PAYOUT_ITEM_CAP_MINOR`, `MEND_CAMPAIGN_CAP_MINOR`, `MEND_DAILY_CAP_MINOR` | The owner's caps in US cents. The engine will not start without them | Keep the values in `.env.example` |
+| `MEND_BALANCE_FLOOR_MINOR` | US cents every payout must leave in the shop's PayPal balance | Leave empty for 25000, which is USD 250 |
+| `MEND_DEV` | Local development | Keep `1` |
+| `DATABASE_URL` | Leave empty: the local run starts its own Postgres | |
+| `MEND_OWNER_PASSWORD` | Optional locally: the owner sign-in | Any long random value |
+| `PAYPAL_WEBHOOK_ID`, `RENDER_API_KEY` | Only for deploying to Render | Not needed locally |
+
+## Run it
+
+From `packages/web`:
+
+```bash
+npm run dev:console
+```
+
+It prints one line per step. On the first run it:
+
+1. Starts a local Postgres (pgserver) in `packages/engine/.pgdata`.
+2. Builds the demo shop in its own schema, `console_dev`: it applies the database schema, downloads UCI Online Retail II (a 45.6 MB file, checked against a fixed size and hash, saved in `packages/engine/.data`), imports 36,594 orders from 5,852 customers, measures the model and makes your test receiver a member. This took 131 seconds on 28 Oct 2026. Later runs reuse the schema and start in seconds.
+3. Starts the engine's dev bridge on `127.0.0.1` with a token made new for this run.
+4. Starts the web app on `127.0.0.1`, port 3001.
+5. Runs the scheduled jobs every 30 seconds, as `mend-jobs` does on Render every 5 minutes.
+
+When it prints `console ready: http://localhost:3001/demo`, open that address and follow [Try the demo](/docs/getting-started/try-the-demo). It then prints the shop's counts: customers and quiet regulars.
+
+Ctrl+C stops everything. If the engine bridge or the web server stops on its own, the rest stops too and a line names which one.
+
+## Money on a local run
+
+A campaign you send locally is a real PayPal sandbox Payouts batch from your sandbox business account, with PayPal's test money. The demo caps are the same as on the live site: USD 2.00 per customer, USD 10.00 per campaign and USD 50.00 a day across demo sessions. PayPal's sandbox charges USD 0.25 per item. Mend sends nothing when the batch and its fees would take the balance under the floor, USD 250 unless you set another.
+
+## Troubleshooting
+
+### Port already in use
+
+`dev:console` checks the port before it starts anything and stops with `port 3001 is already in use`. Pick another:
+
+```bash
+npm run dev:console -- --port 3005
+```
+
+`-p 3005` works too, and so does the `PORT` setting.
+
+### The first run seems slow
+
+Building the demo shop downloads the dataset and fits the model several times, which took 131 seconds on 28 Oct 2026. While a step runs, the script prints a line such as `demo shop: still seeding (40 s)` at least every 9 seconds, so a quiet screen means something has stopped. The seed step gives up after 60 minutes.
+
+### Payment statuses take about a minute
+
+No PayPal webhook can reach your machine, so statuses arrive through the scheduled jobs instead. They run every 30 seconds, and locally they read a new batch's items back after 45 seconds rather than the 15 minutes used on Render. Expect each thread to be stitched within a minute or two of sending. The 45-second wait is honoured only in local development with the sandbox, and never on Render.
+
+### Log in with PayPal does not work locally
+
+PayPal sends a customer back to a return address registered on the app, which must be one PayPal can reach. The local run skips joining: the seed script makes your test receiver a member, marked as a stand-in.
+
+### missing or invalid in .env
+
+The script names each setting that is missing or malformed, never its value. `MEND_TEST_RECEIVER` must be an email address. The engine refuses to start if `PAYPAL_ENV` is not exactly `sandbox` or a cap is not a positive whole number.
+
+### engine virtualenv not found
+
+The script looks for Python at `packages/engine/.venv`. Create it there as described above.
+
+### A send is refused with low_balance
+
+The sandbox business account's balance, less the batch and its fees, would fall under the floor. Lower `MEND_BALANCE_FLOOR_MINOR`, or link the app to a sandbox business account with a larger balance.
+
+## Run the tests
+
+```bash
+cd packages/engine
+python -m pytest -q
+
+cd ../web
+npx vitest run
+```
+
+The engine tests need no network; both suites start the local Postgres themselves. On 29 Oct 2026 the engine suite gave 935 passed and 1 skipped, and the web suite 1135 passed in 32 files.

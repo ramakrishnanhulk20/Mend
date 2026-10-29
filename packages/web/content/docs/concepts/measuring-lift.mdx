@@ -1,0 +1,45 @@
+---
+title: Measuring lift
+description: Why every Mend campaign holds a random group back, how the two groups are compared with Fisher's exact test, and when Mend says too early to tell.
+---
+
+## Why hold anyone back
+
+Some quiet customers come back on their own. Seasons, a new product or plain habit bring them back whether or not they got cashback. If Mend paid everyone and counted who returned, it would take credit for all of them.
+
+So every campaign splits its customers at random. One group gets cashback, the other gets nothing. Both groups were chosen the same way, so the held-back group shows what would have happened without the money. The difference between the two is the lift: the customers the cashback brought back.
+
+## How the held-back group is drawn
+
+- Code draws it from a secure random source before Claude sees any customer, so nothing Claude writes can move anyone in or out.
+- The share held back is 50 percent by default, and a goal may ask for anything from 20 to 50 percent. With the demo's defaults, 10 customers are considered, 5 are paid and 5 are held back.
+- Membership is stored with the campaign and never changes. Claude never sees it, and no held-back customer appears in the Payouts batch.
+- A measurement starts when a campaign is approved. From then until 30 days after it was sent, its customers are not eligible for another campaign of the same owner, or of the same demo session, so one measurement cannot spoil another. Drafts hold nobody.
+
+## The window
+
+Purchases count for 30 days from the moment the campaign was sent. A purchase is matched to a customer by the same rule for both groups, with times compared in UTC.
+
+## The test
+
+Mend uses Fisher's exact test, one-sided, at the 0.05 level: did the paid group come back more often than the held-back group?
+
+Fisher's exact test is used because campaigns are small. With a few returns in each group, the common shortcut (a z-test, which assumes large numbers) calls a lift where there is none. For example, 3 returns out of 30 against 0 out of 30 gives a z-test p-value of 0.038, which looks like a win. The exact p-value is 0.119, which is not.
+
+## When Mend says "too early to tell"
+
+A verdict and a p-value appear only when all of these hold:
+
+- The 30-day window has closed.
+- Each group has at least 30 members.
+- At least 5 returns are expected in the smaller group if the cashback made no difference.
+
+Until then the verdict is "too early to tell" and no p-value is shown at all, so no number appears for a test that has not earned one. If the window closes without enough members or returns, the verdict becomes "too few returns to tell", because no more data will come.
+
+Once a test runs, the verdict is either "rewarded customers came back more", with its p-value, or "no measurable difference yet", with its p-value.
+
+A five-person demo group never reaches 30, so the demo always says "too early to tell". That is the honest answer for a group that size.
+
+## Simulated returns
+
+The demo shop has no storefront, so the demo's return purchases are simulated: Mend buys from the shop with PayPal's sandbox test card for the customer you pick. Each one is matched only by the PayPal order id Mend stored when it created the order, never by a field a buyer can set. Simulated returns are shown beside real ones and counted apart. They never enter the rates, the test or the verdict.

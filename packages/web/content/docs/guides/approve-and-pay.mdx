@@ -1,0 +1,53 @@
+---
+title: Approve and pay
+description: How approving by fingerprint works, what Mend checks before it sends a PayPal Payouts batch, and what each payout status means.
+---
+
+## Review
+
+The approve screen lists every paid customer with their reward and note, and every held-back customer as a dotted thread. If something about the plan stops it from being approved, such as a customer who has since left the thank-you list, the screen says so in plain words and offers to draft a new plan.
+
+## Approve by fingerprint
+
+When the campaign view loads, Mend computes a fingerprint of the plan: a SHA-256 hash of every recipient, amount, currency and note, in one fixed format. The approve button sends back the fingerprint you were shown. Mend records the approval only if that fingerprint still matches the plan, and it freezes the plan exactly as approved. The batch is later built from that frozen copy, never from live tables.
+
+Approval is refused, with nothing recorded, when:
+
+- the plan changed since you looked (`hash_mismatch`; reload and look again),
+- a customer in it has left the thank-you list (`recipient_not_member`),
+- the campaign was cancelled (`voided`) or is no longer open,
+- another approved campaign of yours is already measuring one of its customers (`member_held`).
+
+At approval the caps are checked again against current data. Only a person's click on the campaign page can approve: Claude, the assistant, webhooks and scheduled jobs cannot. Every approval needs a same-origin request with a CSRF token.
+
+## Send
+
+Press **Send it with PayPal**, then **Send with PayPal**. Before anything leaves, the engine:
+
+1. Checks the demo limits: 2 sends per session a day, 4 per network a day, and USD 50.00 a day across all demo visitors.
+2. Reads the shop's PayPal balance, and sends nothing if the batch and PayPal's fees would leave less than the floor (USD 250 by default). A failed read counts as too low.
+3. Moves the campaign from approved to submitting in one atomic step, so two clicks, two tabs or a retry cannot both send.
+4. Right before the request, checks that every customer in the frozen plan is still a member. If one has left, nothing is sent and the campaign is cancelled.
+
+Then it sends one `POST /v1/payments/payouts` with a batch id derived from the frozen plan. PayPal refuses a second batch under the same id, so even an unclear answer and a retry can never pay twice. If PayPal's answer is unclear (a timeout or a 5xx), the campaign is marked "submission unknown" and a scheduled job settles it later by sending the same batch under the same id; PayPal's answer then says whether it already exists.
+
+## Watch it land
+
+PayPal sends a signed webhook as each payment moves. Mend checks the signature, stores the delivery once and asks the engine to read the payment back from PayPal at once. A scheduled job also re-reads any payment still unsettled after 15 minutes. Statuses only move forward, so a late or stale event cannot undo a final one.
+
+Each thread on the payout and results screens is labelled with where its payment stands:
+
+| Label | Meaning |
+|---|---|
+| not sent yet | Mend has no payment from PayPal for this customer yet |
+| PayPal is processing | PayPal reports the payment as PENDING |
+| sent, waiting to be claimed | PayPal reports it UNCLAIMED: sent, and the customer has not claimed it |
+| claimed by the customer | PayPal reports SUCCESS: the money is in the customer's PayPal balance |
+| returned to the shop | PayPal reports RETURNED, REFUNDED or REVERSED: the money is back in the shop's balance |
+| PayPal could not pay | PayPal reports FAILED or BLOCKED: the money never left |
+| status unclear, Mend will check again | Any other status; Mend never guesses at one it does not know |
+| held back, never paid | A held-back customer |
+
+## What a send costs
+
+PayPal's sandbox charges USD 0.25 per item, in test money. A demo campaign of 5 rewards sends USD 10.00 and pays USD 1.25 in fees. The payout screen shows the money claimed, waiting, returned and the fees.

@@ -1,0 +1,39 @@
+---
+title: Mend
+description: Mend finds a shop's quiet regulars, has Claude plan a small cashback thank-you, pays it through PayPal Payouts and measures whether it brought anyone back.
+---
+
+Mend repairs the relationship with customers who drifted away.
+
+Mend finds a shop's regulars who have gone quiet, has Claude draft a small cashback plan, pays it through PayPal Payouts to customers who joined with Log in with PayPal, and holds a random group back to measure whether it worked.
+
+## Who it is for
+
+A small online shop with repeat customers and a PayPal business account. Its best customers rarely leave with a complaint. They stop ordering, and the owner notices months later. A discount code sent to everyone gives money to people who would have bought anyway, and it never shows whether it changed anything.
+
+Mend works from the shop's own order history. It only pays customers who chose to join the shop's thank-you list with PayPal, it pays a few dollars each under hard caps, and it keeps a random group unpaid so the owner can see the difference.
+
+## Why PayPal
+
+The cashback lands in the PayPal wallet the customer already pays with. Customers opt in with Log in with PayPal, so Mend has a verified PayPal identity to pay and nobody is paid without saying yes. Each campaign is one PayPal Payouts batch, PayPal's signed webhooks say what happened to every payment, and cashback nobody claims goes back to the shop with one Payouts call. More in [Why PayPal](/docs/concepts/why-paypal).
+
+## The five steps
+
+1. See who went quiet: Mend's forecast ranks the shop's regulars, most at risk first.
+2. Ask Claude for a plan: say what you want in a sentence. Claude sets the budget and reward within the caps, and code checks every number.
+3. Approve the exact plan: read every reward and note, then approve that plan by its fingerprint. Nothing else can be sent.
+4. Watch PayPal pay it: one PayPal Payouts batch, and each customer's thread is stitched as PayPal confirms their payment.
+5. See if it worked: compare the paid group with the held-back group. Mend gives a verdict only when there is enough data, and says "too early to tell" until then.
+
+## What is real and what is simulated
+
+- The demo shop's order history is real: the sales of a UK gift-ware wholesaler from December 2009 to December 2011 (UCI Online Retail II), moved forward in time so the last order falls on 16 Oct 2026. Names and emails are made up.
+- The payouts are real PayPal sandbox payouts, with PayPal's test money.
+- One demo customer is a real PayPal sandbox account that joined with Log in with PayPal and can claim its reward. The other 40 members are stand-ins the seed script joined, and the console marks them as stand-ins.
+- Return purchases in the demo are simulated: Mend buys from the shop with PayPal's sandbox test card and labels the return as simulated. The demo shop has no storefront, so Mend does not yet match real purchases to campaigns.
+
+## Start here
+
+- [Try the demo](/docs/getting-started/try-the-demo) on the live site, in about two minutes: https://mend-web.onrender.com/demo
+- [Run it locally](/docs/getting-started/run-locally) from a clone with one command.
+- [How it works](/docs/concepts/how-it-works), then the [architecture](/docs/developers/architecture) and the [security overview](/docs/security/overview).

@@ -45,6 +45,16 @@ describe("next.config.ts dev-only summary rewrite", () => {
   });
 });
 
+describe("next.config.ts wrapped by Fumadocs", () => {
+  it("keeps the headers and the rewrites and adds the .mdx loaders", () => {
+    expect(typeof config.headers).toBe("function");
+    expect(typeof config.rewrites).toBe("function");
+    expect(config.pageExtensions).toContain("mdx");
+    expect(Object.keys(config.turbopack?.rules ?? {})).toContain("*.{md,mdx}");
+  });
+
+});
+
 describe("next.config.ts", () => {
   it("sends Strict-Transport-Security and X-Content-Type-Options nosniff on every answer", async () => {
     const rules = (await config.headers?.()) ?? [];

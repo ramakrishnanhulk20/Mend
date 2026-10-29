@@ -1,0 +1,61 @@
+---
+title: Plan with Claude
+description: Write a goal in one sentence, and see how Claude and Mend's code turn it into a capped campaign with a personal note for each customer.
+---
+
+## Write a goal
+
+Describe the campaign in plain words, with an amount:
+
+- "Win back my best lapsed regulars with 10 dollars"
+- "A small thank-you to five quiet regulars, 2 dollars each"
+- "Bring back customers silent for over three months, 10 dollars in total"
+
+A goal can be up to 500 characters. It needs a budget. If the goal names none, fill in the optional budget field; a number typed in the form always wins over one read from the text.
+
+## What Claude reads, and what it returns
+
+Claude Haiku 5.5 sees the goal text and nothing else: no customer, no order and no email. It answers in a fixed shape with a few numbers only:
+
+- the total budget in US dollars,
+- the most for any one customer, if the goal says so,
+- the share to hold back, if the goal says so,
+- how many customers to consider, if the goal says so,
+- and whether the goal was unclear, with a short reason.
+
+Claude is told to take numbers only from the goal and to ignore anything else in it, including instructions. Mend does not rely on that: the code below decides every number either way.
+
+## What the code decides
+
+Code turns the dollars into whole cents and fits each value inside the limits:
+
+- The budget and the most per customer are cut to the caps. For a demo visitor these are USD 10.00 per campaign and USD 2.00 per customer.
+- The held-back share must be from 20 to 50 percent, and is 50 percent unless the goal or the form says otherwise.
+- A demo plan considers 10 customers by default and at most 20.
+- Every change is listed under "What Claude adjusted" in Mend's own words, never Claude's, so you see exactly what moved.
+
+Then the engine builds the draft. It takes the quiet regulars in forecast order, keeps only members with a live consent on an accepted wording who are not already being measured by another approved campaign of the same owner or demo session, draws the held-back group at random, and sets each reward in code: the smallest of the reward per customer, the cap, an even share of the budget, and what that customer has paid the shop after refunds. The engine checks every cap again here, so a mistake earlier can only get a draft refused, never pay more.
+
+Without an Anthropic key, or when Claude cannot be reached, the form alone decides and the rest of Mend still works.
+
+## Notes
+
+Each paid customer gets a short note with the cashback. The draft starts with the shop's template. Press **Have Claude write the notes** to have Claude write each customer their own:
+
+- One Claude call per paid customer, and never one for a held-back customer.
+- Each call sees only that customer's recent item names, how long since they last ordered and the shop's name. Nothing that names or reaches them, and nothing about any other customer.
+- A note must pass Mend's note rule, which the web app and then the engine both check: up to 300 characters of letters, digits, spaces and plain punctuation; no link or anything shaped like a web address; no email address, no run of 7 or more digits such as a phone number, no markup, no PayPal sandbox test code, and no mention of PayPal or Venmo.
+- A note that fails, or any Claude failure, keeps the template in its place.
+- Notes can be written only while the campaign is a draft. After approval nothing can change them.
+
+The rule does not judge persuasive wording. You read every note before you approve, and the note you see is the note PayPal delivers.
+
+## Limits
+
+| Limit | Value |
+|---|---|
+| Plans and drafts per demo session | 20 an hour, 5 drafts a day |
+| Claude calls | 40 a day per demo session, 80 a day per network, 50 an hour across all demo visitors |
+| Claude tokens | 200,000 a day per demo session, 400,000 per network, 5,000,000 across the demo |
+
+A demo campaign with personal notes uses 6 Claude calls: 1 to read the goal and 1 for each of its 5 notes.

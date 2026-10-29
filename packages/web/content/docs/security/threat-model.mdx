@@ -1,0 +1,92 @@
+---
+title: Threat model
+description: A summary of Mend's threat model by theme, from who would attack it to the 28 rules the code must uphold, with a link to the full document.
+---
+
+The full threat model is [docs/security/threat-model.md on GitHub](https://github.com/ramakrishnanhulk20/Mend/blob/main/docs/security/threat-model.md). It was written on 20 Oct 2026, before any code, from a plain description of the system, and it has been amended with dated sections as the code and the reviews landed. Section C is the definition of done: 28 rules, C1 to C28, each an outcome the code must uphold, each with the test that shows it.
+
+This page summarises it.
+
+## What kind of system this is
+
+In security terms, Mend is five kinds of system at once:
+
+1. A service that spends money for its owner, through PayPal Payouts.
+2. A service where text written by strangers reaches a language model that can call tools.
+3. A service that shows and sends on text written by strangers and by the model, including notes PayPal delivers under the shop's name.
+4. A public webhook that changes financial records.
+5. A store of other people's personal data, behind a public demo login.
+
+The fact that drives the whole model: getting text in front of the model costs almost nothing. Item names, goals, chat messages and PayPal answers can all carry an instruction.
+
+## What an attacker would want
+
+- Get paid: talk the planner or the assistant into paying them, or pay twice through a race or a retry.
+- Use the shop to phish: put a link or a request for details into a note PayPal delivers to every customer.
+- Steal personal data or secrets: through script in a name, an image in a reply, or a secret in a log.
+- Fake the results: forged or replayed webhooks, or moving people in or out of the held-back group.
+- Break the demo: burn the Claude budget, drain the sandbox balance or flood the webhook.
+
+## The rules, by theme
+
+### Money (C1 to C6)
+
+- C1, one money path: money leaves only as one Payouts batch per approved plan, or as the simulate purchase. The assistant's PayPal tools are four reads named in code.
+- C2, approval is human and bound to content: a hash of the exact plan, built into the batch, voided by any change.
+- C3, at most one batch per campaign, under retries and races, with unclear sends settled by the same id.
+- C4, amounts from code under hard caps, checked at draft and at approval, never from the model.
+- C5, recipients from the member's own PayPal sign-in, only from the list code built.
+- C6, a random held-back group drawn before the model sees anyone, never paid.
+
+### Purchases and results (C7, C8)
+
+- C7, only real purchases count, through one classifier. Mend's own payouts and refunds never count as a return.
+- C8, returns matched on stable ids through one function for both groups; simulated returns marked by the order id Mend stored, and kept apart.
+
+### Webhooks (C9, C10)
+
+- C9, an unverified delivery changes nothing: signature checked in the app against PayPal's certificate, duplicate keys and replays refused.
+- C10, a webhook is a prompt to read the payment back from PayPal, not a fact. Statuses only move forward, and scheduled reads from Mend's own records catch anything a lost webhook would miss.
+
+### Claude (C11 to C15)
+
+- C11, untrusted text can inform the model but cannot steer an action: C1 to C6 hold whatever it outputs.
+- C12, every tool call is an untrusted request, with strict inputs and caps on calls, tokens and time.
+- C13, notes are safe to deliver: allowed characters only, no links, emails, long digit runs or markup.
+- C14, rendered output cannot run or fetch.
+- C15, personal data sent out is kept to a minimum: no emails, phones or PayPal ids in any prompt.
+
+### Secrets and access (C16 to C24)
+
+- C16, the deployment can only reach the PayPal sandbox, through an exact list of hosts, each with one use.
+- C17, secrets never leave the server: not in an answer, a log, a prompt or an error.
+- C18, two roles, demo and owner, deny by default, one permission table; the public join routes have their own rules.
+- C19, demo visitors are isolated from each other.
+- C20, no visitor can break the demo for the next one: per-session, per-address and shared limits, and a balance floor.
+- C21, the demo tools do only what they say.
+- C22, data cannot rewrite queries, and each service's database role cannot change the schema.
+- C23, the audit log is complete and the app can only add to it.
+- C24, addresses the server hands out come from config, never from request headers.
+
+### Data (C25 to C28)
+
+- C25, the seed data contains no real person.
+- C26, errors tell an attacker nothing useful.
+- C27, PayPal transaction data is gone within 48 hours.
+- C28, no payout without a live consent record; leaving cancels every unsent campaign that includes the member.
+
+## Five standards on top of the rules
+
+1. Rules over lists: one predicate that says what is meant, rather than a hand-kept list that misses the case nobody thought of.
+2. Compare values only after the same parser has read both sides.
+3. Treat every output as input to whatever reads it next: notes to an inbox, strings to a browser, tool results to the model.
+4. Fail closed: on any parse error, ambiguity or unknown state, refuse.
+5. Name the non-goals, so nobody assumes a defence that is not there.
+
+## Non-goals
+
+Mend does not defend against a compromised PayPal, Anthropic, host or database server; a careless owner acting within the caps; prompt injection reaching the model, which is assumed to work and made harmless by structure; persuasive wording that passes the note rule; fraud in incoming payments beyond netting refunds; volumetric attacks beyond what the host absorbs; or the legal, tax and compliance review a live launch would need.
+
+## Accepted residuals
+
+The dated amendments also record what was found and knowingly accepted, for example: rate counts live in one process's memory, so they would multiply if the web app ran on more than one instance; and PayPal's balance report can lag by a few hours, which the floor and the daily caps bound.

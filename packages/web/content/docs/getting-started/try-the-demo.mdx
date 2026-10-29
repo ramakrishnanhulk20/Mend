@@ -1,0 +1,82 @@
+---
+title: Try the demo
+description: Run a real cashback campaign on the demo shop in about two minutes, from the quiet regulars to the results, all on the PayPal sandbox.
+---
+
+Open https://mend-web.onrender.com/demo. There is no sign-up and no PayPal login. Everything runs on the PayPal sandbox: real Payouts batches and real PayPal webhooks, with PayPal's test money.
+
+The demo shop replays two years of a real store's orders. You play its owner.
+
+## 1. Start the demo
+
+The first screen says what will happen. Press **Start the demo**. Mend opens a demo session for this browser, which lasts up to 24 hours, or 2 hours without use.
+
+## 2. Quiet regulars
+
+The heading says how many regulars went quiet: 1,357 on 29 Oct 2026. A quiet regular has bought on 3 or more days and has been silent for 60 days or more. The list is ranked by Mend's forecast, most at risk first, and shows for each customer how many days they bought on, how long they have been silent, the forecast and what they have paid the shop.
+
+Only customers who joined the shop's thank-you list with Log in with PayPal can be paid. Rows tagged as stand-ins are demo customers the seed script joined, never people who signed up.
+
+Press **Ask Claude for a plan**.
+
+## 3. Plan
+
+Describe what you want in plain words, or pick a suggestion:
+
+- "Win back my best lapsed regulars with 10 dollars"
+- "A small thank-you to five quiet regulars, 2 dollars each"
+- "Bring back customers silent for over three months, 10 dollars in total"
+
+A goal needs an amount. If yours has none, fill in the optional budget field. Claude reads the goal, then Mend's engine picks the customers and holds a random group back. The plan shows the budget, the reward per customer, the share held back and how many customers were considered, plus a list of anything Claude or the code adjusted to fit the demo caps: USD 2.00 per customer and USD 10.00 per campaign. With the defaults, 10 customers are considered, 5 get cashback and 5 are held back.
+
+Press **Review the plan**.
+
+## 4. Approve
+
+Every reward is listed with its note, and every held-back customer is drawn as a dotted thread. The notes start as the shop's template. Press **Have Claude write the notes** to have Claude write each customer their own, from that customer's past items only. Every note must pass Mend's note rule before it can be sent.
+
+Press **Approve this exact plan**. Mend seals the plan and types out its fingerprint: a hash of every recipient, amount and note. Nothing but this exact plan can be sent. Press **Send it with PayPal**.
+
+## 5. Payout
+
+The screen shows the total and the number of customers in one batch. Press **Send with PayPal**.
+
+Mend reads the shop's PayPal balance, sends one Payouts batch and shows PayPal's batch id with a copy button. Each thread changes as PayPal reports on that customer:
+
+- A dot crosses the gap while PayPal processes the payment.
+- A red stitch closes the gap when the cashback is sent or claimed.
+- A dotted line across the gap means the cashback came back to the shop.
+
+The most at risk customer is the one real sandbox account. When the random draw pays it, PayPal marks its reward claimed, usually within a minute. The stand-ins have no PayPal account, so PayPal holds their cashback as unclaimed.
+
+Press **See the results**.
+
+## 6. Results
+
+The heading is the verdict. For a five-person demo group it is "Too early to tell": Mend compares the paid group with the held-back group only when each has 30 members and enough returns, after a 30-day window. [Measuring lift](/docs/concepts/measuring-lift) explains why.
+
+The results show, for each group, how many customers came back, real and simulated counted apart, plus where every payout stands and each customer's thread.
+
+Press **Simulate a return purchase** and pick a customer. Mend makes a real sandbox purchase from the shop with PayPal's test card for that customer and shows PayPal's order id. Within about a minute the return is counted for that customer's group as simulated, and a knot appears at the end of their thread.
+
+## 7. Take back unclaimed cashback
+
+Press **Take back**, which shows the amount still unclaimed. Mend asks PayPal to cancel each unclaimed payment, and the results show how much came back to the shop. If you leave it, Mend's scheduled job takes demo cashback back on its own once it has waited 10 minutes. [Take back unclaimed cashback](/docs/guides/take-back-unclaimed) covers the details, including when PayPal fails one item.
+
+## 8. Ask Mend
+
+Open Ask Mend in the side panel and ask, for example, "How many quiet regulars does my shop have right now?". The assistant answers from live data through Mend's own tools and says which tools it used. It can read, draft and put a plan in the approval queue. It cannot approve, pay or refund. See [Claude in Mend](/docs/developers/ai).
+
+## Demo limits
+
+The demo is shared by every visitor, so it has limits. Each one answers with a plain message when reached.
+
+| Limit | Value |
+|---|---|
+| Demo sessions per network | 4 an hour, 10 a day |
+| Campaigns drafted per session | 5 a day |
+| Campaigns sent per session | 2 a day |
+| Campaigns sent per network | 4 a day |
+| Money sent across all demo visitors | USD 50.00 a day |
+| Simulated purchases | 10 per campaign, 10 an hour per session |
+| Claude calls | 40 a day per session, 80 a day per network, 50 an hour across all visitors |

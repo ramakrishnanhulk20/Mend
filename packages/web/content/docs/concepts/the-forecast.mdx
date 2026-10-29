@@ -1,0 +1,92 @@
+---
+title: The forecast
+description: How Mend ranks quiet regulars with the BG/NBD model, the published benchmark it reproduces, and an honest backtest on two years of real orders.
+---
+
+## In plain words
+
+Mend uses a well-known customer model called BG/NBD (beta-geometric, negative binomial distribution), from Fader, Hardie and Lee (2005). It rests on two ideas:
+
+- While someone is still a customer, they buy at their own steady pace. Some customers buy every few weeks, some twice a year.
+- After any purchase, there is some chance they have quietly left for good.
+
+The model learns from the whole shop how those paces and those chances to leave vary between customers. Then, for each customer, it looks at three facts from the shop's own order records: how many days they came back to buy, when they last bought, and how long they have been a customer. From those it estimates how many purchases that customer will make in the next 13 weeks.
+
+Mend ranks the shop's quiet regulars by that estimate, lowest first. A quiet regular has bought on 3 or more days and has been silent for 60 days or more. The customer expected to buy least is the most at risk, and comes first in the list.
+
+## It reproduces the published model
+
+Fader, Hardie and Lee published the model's four parameters fitted on a sample of 2,357 CDNOW customers. Mend's own fit on the same sample gives the same numbers at the precision the paper reports:
+
+| Parameter | Published | Mend |
+|---|---|---|
+| r | 0.243 | 0.243 |
+| alpha | 4.414 | 4.414 |
+| a | 0.793 | 0.793 |
+| b | 2.426 | 2.426 |
+| log-likelihood | -9582.4 | -9582.4 |
+
+The landing page draws the same fit live, from the shop summary the engine stores.
+
+## The backtest on real orders
+
+The demo shop's history is UCI Online Retail II: two years of a UK gift-ware wholesaler's orders, December 2009 to December 2011. The backtest runs on the original dates:
+
+1. Pick a test date. Fit the model on every order before it.
+2. Look at the next 91 days and note who bought again.
+3. Score how well each ranking separates customers who came back from customers who did not, with AUC: the chance that a customer who came back is ranked safer than one who did not. 0.5 is a coin toss.
+4. Compare with the simplest ranking a shop owner would use: days since the last order (recency).
+5. Repeat on six test dates three months apart, from 9 Jun 2010 to 9 Sep 2011, with a 95 percent range from 1,000 resamples.
+
+The fit on 9 Jun 2010 did not converge, so that date is reported and left out, leaving 5 test dates.
+
+### Among quiet regulars: a tie
+
+Quiet regulars are the customers a campaign actually ranks, so this is the result that matters. The forecast won 3 of 5 test dates. The mean AUC difference is -0.005, with a 95 percent range of -0.024 to +0.016. That is a tie with ranking by most recent order.
+
+| Test date | Customers | Came back | Forecast AUC | Recency AUC | Difference | 95 percent range |
+|---|---|---|---|---|---|---|
+| 9 Jun 2010 | 117 | 69 | did not converge | 0.550 | | |
+| 9 Sep 2010 | 376 | 255 | 0.577 | 0.654 | -0.077 | -0.149 to -0.003 |
+| 9 Dec 2010 | 480 | 161 | 0.568 | 0.605 | -0.038 | -0.096 to +0.018 |
+| 9 Mar 2011 | 1,160 | 469 | 0.635 | 0.593 | +0.042 | +0.013 to +0.071 |
+| 9 Jun 2011 | 1,246 | 415 | 0.671 | 0.658 | +0.013 | -0.012 to +0.036 |
+| 9 Sep 2011 | 1,513 | 733 | 0.692 | 0.656 | +0.036 | +0.017 to +0.054 |
+
+Other rankings were tested under a rule fixed before the results were seen, and none beat recency among quiet regulars: purchase frequency won 0 of 5 (mean -0.228), an average of ranks 0 of 5 (mean -0.106), and the model's own chance that a customer is still active 1 of 5 (mean -0.018). Mend keeps the forecast: it is level with recency where campaigns rank, and better across the whole shop.
+
+### Across all customers: better than recency
+
+Over every customer with an order before the test date, the forecast won 5 of 5, with a mean AUC difference of +0.052 and a 95 percent range of +0.048 to +0.057.
+
+| Test date | Customers | Came back | Forecast AUC | Recency AUC | Difference | 95 percent range |
+|---|---|---|---|---|---|---|
+| 9 Jun 2010 | 2,775 | 1,347 | did not converge | 0.655 | | |
+| 9 Sep 2010 | 3,351 | 1,941 | 0.708 | 0.652 | +0.056 | +0.043 to +0.068 |
+| 9 Dec 2010 | 4,285 | 1,327 | 0.778 | 0.713 | +0.066 | +0.054 to +0.078 |
+| 9 Mar 2011 | 4,563 | 1,604 | 0.788 | 0.733 | +0.054 | +0.045 to +0.064 |
+| 9 Jun 2011 | 4,944 | 1,594 | 0.824 | 0.777 | +0.048 | +0.040 to +0.055 |
+| 9 Sep 2011 | 5,256 | 2,289 | 0.801 | 0.763 | +0.038 | +0.031 to +0.045 |
+
+### Who came back, by tenth
+
+On 9 Sep 2011, Mend split all 5,256 customers into tenths by the forecast and checked who bought within 91 days. The safest tenth came back 92 percent of the time. The most at risk tenth came back 10 percent of the time.
+
+| Tenth | Customers | Came back |
+|---|---|---|
+| 1, safest | 526 | 92 percent |
+| 2 | 526 | 78 percent |
+| 3 | 526 | 62 percent |
+| 4 | 526 | 52 percent |
+| 5 | 526 | 43 percent |
+| 6 | 526 | 34 percent |
+| 7 | 525 | 25 percent |
+| 8 | 525 | 22 percent |
+| 9 | 525 | 17 percent |
+| 10, most at risk | 525 | 10 percent |
+
+## What the forecast is not used for
+
+Mend uses the model to rank customers, never to promise how many orders the shop will get. On this seasonal shop, the model's totals for the whole shop were off by between -23 and +91 percent, so Mend does not show them.
+
+The live numbers behind these tables are served by `GET /api/shop/summary` and drawn on the landing page.

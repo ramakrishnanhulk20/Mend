@@ -1,3 +1,4 @@
+import { createMDX } from "fumadocs-mdx/next";
 import type { NextConfig } from "next";
 
 // Lets the lab page show the live site's real numbers on a machine with no engine running.
@@ -43,4 +44,8 @@ const nextConfig: NextConfig = {
   },
 };
 
-export default nextConfig;
+// Fumadocs reads content/docs and writes the .source folder the docs route imports. It keeps
+// every setting above and only adds the loaders for .mdx files.
+const withMDX = createMDX();
+
+export default withMDX(nextConfig);

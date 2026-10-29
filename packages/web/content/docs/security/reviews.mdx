@@ -1,0 +1,90 @@
+---
+title: Reviews
+description: Every security review of Mend by date, each finding class in one line, and how each was fixed and proven.
+---
+
+## How Mend was checked
+
+Mend is self-audited. No outside security firm has reviewed it. The reviews below were run with AI reviewers (Claude Opus) reading the code against the [threat model](/docs/security/threat-model): three rounds by one reviewer, then a separate audit by three fresh reviewers that had not seen the earlier rounds, each taking one area.
+
+The bar for every important finding was the same: fix it, prove the fix with a test that failed on the old code, and run the live proof again. Suggested additions to the standard that were declined are listed, with their reasons, in the threat model's amendments.
+
+## Timeline
+
+| Date | What happened |
+|---|---|
+| 20 Oct 2026 | Threat model written before any code: sections A, B and C, with 26 rules |
+| 20 Oct 2026 | Rules C27 and C28 added after reading PayPal's Developer Agreement: PayPal data deleted within 48 hours, no payout without consent |
+| 26 Oct 2026 | Review round 1: 9 important findings |
+| 26 Oct 2026 | Review round 2: 4 important findings, new or not fully fixed |
+| 27 Oct 2026 | Review round 3, the last: 3 important findings, and no way found to forge a webhook |
+| 27 Oct 2026 | Audit by three fresh reviewers: 16 important findings, 15 distinct |
+| 28 Oct 2026 | Audit closed: every finding fixed and proven, live proof 18 of 18 |
+| 29 Oct 2026 | Live proof 19 of 19, with the read-only PayPal keys check added |
+
+## Round 1, 26 Oct
+
+- An unclear send could be settled the wrong way. Now only a created answer or PayPal's "already exists" answer settles it, and 401, 403 and 429 never cancel a campaign.
+- A member who left between approval and sending could still be paid. Consent is now checked right before every send and resend.
+- One demo session could use the whole demo budget. Each session may send 2 campaigns a day, and unclaimed demo cashback is taken back after 10 minutes.
+- The webhook had no flood limits. It now has per-address and overall counts and a 256 KB cap read as a stream.
+- Nothing checked the shop's balance before paying. A balance floor is now read before every send.
+- The app's database role could disable a trigger. Each service now has a role with row access only, and the audit log only accepts new rows.
+- Sign-ins, assistant tool calls, limit hits and rejected webhooks were missing from the audit log. They are now recorded.
+- Phone numbers written with separators slipped past the note rule. Any 7 digits in a row, once separators are removed, are now refused.
+- Stored PayPal data could outlive 48 hours between purge runs. The purge now deletes it at 47 hours and runs first in every run.
+
+## Round 2, 26 Oct
+
+- Forged webhooks could use up the shared budget of PayPal verify calls and block genuine ones. Signatures are now checked in the app against PayPal's certificate, so a forgery spends nothing shared.
+- A few networks together could still fill the demo budget. Each network may send 4 demo campaigns a day, which stays under the USD 50.00 pool, and tests read the real numbers to prove it.
+- The note rule still listed separators one by one. It is now a rule over every character that is not a letter or a digit.
+- The cancel job could jam on an item PayPal refuses to cancel. A failing item now rests on its own, and the job moves on.
+
+## Round 3, 27 Oct
+
+- The certificate download cap was one pool any address could fill. Each address now has a share, and certificates that verified a genuine delivery are remembered across restarts.
+- The refresh job could not heal a record that a lost webhook never created. Scheduled reads now start from Mend's own records: batches missing item rows and simulated orders with no purchase.
+- One payout item PayPal kept failing on could hold up the items behind it. Failures are now handled per item, and a run stops only after 2 in a row.
+
+## The audit, 27 Oct
+
+Three reviewers took one area each: money and the ledger; the website's outer surface and the deploy script; and the AI assistant, customer data and the threat model itself. One finding was reported twice, leaving 15.
+
+### Money and the ledger
+
+- A late resend could pass the daily cap and the demo budget, which counted from the first attempt only. Both now count from the latest move into sending, and a resend checks them again.
+- A campaign could stay unresolved once its batch webhook was given up. A batch event is no longer given up while its campaign is unresolved.
+- Leaving matched by email only, so a customer who had changed their PayPal email could not leave. It now matches by email or by PayPal payer id. Two reviewers found this one.
+- An unverified sign-in could hold a verified owner's email. A verified sign-in now replaces it.
+- The paid-to-date check could miss refunds after a date the caller chose. The scoring day is now set by code, and every refund up to now is subtracted.
+- A payout item could freeze after a missed status. Any status reachable along the allowed moves is now recorded, never backwards.
+
+### The AI assistant, data and the standard
+
+- The backtest claim was measured over all customers, not the quiet regulars campaigns rank. It was measured again inside that group, where the forecast ties recency, and every claim now says so.
+- The lift verdict used a normal approximation where Fisher's exact test was needed, and could show a p-value too early. It now uses Fisher's exact test and shows no p-value before the minimum group sizes.
+- Demo stand-ins carried consent records as if a person had joined. They are now marked as stand-ins, counted apart and never shown as joined.
+- There was no token budget anywhere. Claude tokens now have daily budgets per session, per address, across the demo and for the owner.
+
+### The website and the deploy script
+
+- Database storage was an uncapped pool: rate-limit rows, rejection audit rows and run records could grow without end. Each now has a window or a cap.
+- One demo session could fill all 16 engine slots. A session now has at most 2 calls in flight, and the heavy reads share 6 slots.
+- About 10 addresses could close each shared demo pool, and approving and simulating charged the pool before checking the request. Pools now have per-address shares and a reserve for new sessions, and charge only valid requests.
+- The proof command could create a paid resource or point the services at an empty database. Every resource is now found by its recorded id, and created only with `--create`.
+- A genuine delivery could be stored a second time between the 47-hour purge and the 72-hour acceptance window. Processed transmission ids are now remembered past the purge.
+
+## Found by the live proofs, 28 Oct
+
+Running the live proof after the audit fixes found three more bugs, each fixed with a test:
+
+- The join page answered with an error because the new consent wording was longer than the website's limit for it.
+- An unapproved draft held its customers, so a visitor who drafted again got worse customers. Holds now start at approval.
+- Claude's notes ran more calls at once than the engine allows one session, so 3 of 5 notes were skipped. Notes now run within the session's limit.
+
+The same day, a cancel that PayPal failed on one item answered with a bare error and no counts. It now answers what came back and what is still waiting; see [Take back unclaimed cashback](/docs/guides/take-back-unclaimed).
+
+## Proof after the fixes
+
+The live proof on 29 Oct 2026, against commit `bdb4139`, passed 19 of 19. It includes the forgery check (an altered copy of a real delivery refused), the database role check (both service roles refused schema and audit log changes), the read-only keys check (PayPal answers 403 to the assistant's token on Payouts) and a secrets sweep across 225 answers and 612 log lines. On the same day the engine's tests gave 935 passed and 1 skipped, and the web app's 1135 passed.

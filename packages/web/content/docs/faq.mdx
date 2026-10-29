@@ -1,0 +1,50 @@
+---
+title: FAQ
+description: Short answers to the questions people ask first about Mend, its money, its demo data, its verdicts and its use of Claude and PayPal.
+---
+
+## Is real money moved?
+
+No. Mend runs on the PayPal sandbox only, and refuses to start with any other PayPal setting. The payouts in the demo are real PayPal sandbox Payouts batches, with real webhooks and real PayPal ids, but the money is PayPal's test money. The demo caps are USD 2.00 per customer, USD 10.00 per campaign and USD 50.00 a day across all visitors.
+
+## Why are most demo customers stand-ins?
+
+The demo shop's order history is real: two years of a UK gift-ware wholesaler's sales from UCI Online Retail II. The source holds only a customer number and a country, so Mend generates every name and email, on a domain that can never receive mail. To be paid, a customer must join with Log in with PayPal, and those generated customers have no PayPal accounts. So the seed script joins 40 of them as stand-ins, which lets the demo run a full campaign. The console marks each stand-in as one, and counts them apart from people who joined.
+
+One customer is a real PayPal sandbox account that joined through Log in with PayPal. When the random draw pays it, its cashback is claimed. The stand-ins' cashback waits as unclaimed until it is taken back.
+
+## Why does the verdict say "too early to tell"?
+
+A five-person demo group is far too small to tell. Mend compares the paid group with the held-back group using Fisher's exact test, and gives a verdict only after the 30-day window closes, with at least 30 customers in each group and enough returns expected to tell a difference. A five-person demo group never gets there. Showing a p-value for a group that small would invite a wrong conclusion, so Mend shows none. See [Measuring lift](/docs/concepts/measuring-lift).
+
+## What happens to unclaimed cashback?
+
+The owner can take it back at any time with one click: Mend asks PayPal to cancel each unclaimed payment, and PayPal returns the money to the shop. If nobody does, PayPal returns it on its own after 30 days. In the demo, a scheduled job takes it back once it has waited 10 minutes, so the shared demo budget refills. See [Take back unclaimed cashback](/docs/guides/take-back-unclaimed).
+
+## Are the return purchases real?
+
+In the demo, no. The demo shop has no storefront, so Mend simulates a return: it makes a real sandbox purchase from the shop with PayPal's test card, for the customer you pick, and labels it simulated. Simulated returns are shown beside real ones and never enter the verdict. Matching real purchases to campaigns would come from a live shop's own order records, and is not built yet.
+
+## What if PayPal's MCP server is down?
+
+The assistant's four PayPal reads go to PayPal's REST API instead, under the same rules: the same inputs, the same sandbox host, the same fields kept and the same identity removed. Each answer says which way it came. This happened on 28 Oct 2026, when PayPal's sandbox MCP server answered every call with a setup error, and the assistant kept answering. See [PayPal integration](/docs/developers/paypal-integration).
+
+## Can Claude send money?
+
+No. Claude reads the goal into a few numbers, writes notes and answers questions. Code sets every amount and every recipient, a person approves the exact plan by its fingerprint, and the engine, which Claude cannot reach, sends it. The assistant's PayPal keys come from an app without the Payouts permission, and PayPal refuses them on the Payouts API. See [Claude in Mend](/docs/developers/ai).
+
+## Can someone talk Claude into paying them?
+
+They can try. Mend assumes some injected text will get through to the model, so nothing depends on the model refusing. The model never chooses who is paid or how much, never approves and never calls PayPal itself. A note it writes must pass a character rule with no links, emails or long numbers before PayPal delivers it. The injected-text tests in `packages/web/evals` check that recipients, amounts and approvals stay as code set them.
+
+## Does Mend email customers?
+
+No. The only message a customer gets is the note PayPal delivers with their cashback, which the owner read and approved.
+
+## What does Mend keep about a customer who joins?
+
+Their PayPal email, whether PayPal verified it, their PayPal payer id, and which consent wording they agreed to, when, and through which app. PayPal transaction data Mend receives is deleted within 48 hours. Leaving deletes the member.
+
+## Can I run it myself?
+
+Yes, with one command after setup: `npm run dev:console` in `packages/web`. You need a PayPal developer account with a sandbox app, a sandbox personal account and an Anthropic API key. See [Run locally](/docs/getting-started/run-locally).

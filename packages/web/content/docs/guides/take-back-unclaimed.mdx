@@ -1,0 +1,54 @@
+---
+title: Take back unclaimed cashback
+description: How Mend asks PayPal to return cashback nobody has claimed, what the answer means, and what happens when PayPal fails on one item.
+---
+
+## Why cashback goes unclaimed
+
+PayPal holds a payout as UNCLAIMED when the person it was sent to has not accepted it, for example because the email has no PayPal account yet. In the demo this is the normal case: the stand-in customers have no PayPal account, so their cashback waits as unclaimed. Only the one real sandbox account can claim.
+
+PayPal returns an unclaimed payout to the shop on its own after 30 days. The results screen shows that date. Mend lets the owner take it back sooner.
+
+## Take it back
+
+On the results screen, press **Take back**, which shows the amount still unclaimed. Mend asks PayPal to cancel each unclaimed item with `POST /v1/payments/payouts-item/{id}/cancel`, one item at a time:
+
+- Only items Mend's ledger holds as UNCLAIMED are asked about, each under a lock on its own row.
+- PayPal cancels only while an item is unclaimed. If the customer claims it first, PayPal refuses the cancel and the claim stands. Mend then reads the item back from PayPal so its record matches.
+- Each cancel is sent once and never retried in the same request.
+- PayPal's answer goes through the same forward-only status rules as the webhooks, so a returned item can never be shown as unclaimed again.
+
+A cancel creates no payment. It only returns money that already left the shop.
+
+The answer says what happened:
+
+| Field | Meaning |
+|---|---|
+| `cancelled` | How many items PayPal returned to the shop |
+| `returnedMinor` | How much came back, in US cents |
+| `stillUnclaimed` | How many items still wait as unclaimed |
+| `notCancellable` | How many were already claimed or settled |
+| `incomplete` | True when PayPal failed on at least one item |
+
+The screen reads "Returned USD 8.00 to the shop." when everything came back.
+
+## When PayPal fails on one item
+
+On 28 Oct 2026, PayPal's sandbox returned three rewards in batch U27CC78V7J3KE and answered with a server error on the fourth. Mend now answers that case in full instead of with a bare error:
+
+- The three returns are counted in `cancelled` and `returnedMinor`.
+- The item PayPal failed on stays UNCLAIMED and counts in `stillUnclaimed`, never in `returnedMinor`, because PayPal gave no clear answer for it.
+- `incomplete` is true, with the last failure's HTTP status and PayPal's short error name. PayPal's full message and debug id stay in Mend's audit log, never in the answer.
+- The item then rests for an hour on its own, so it never holds up the others, and the scheduled job tries it again after that. If two items in a row fail, the run stops and leaves the rest for the next run.
+
+The screen then reads, for example, "Returned USD 6.00. PayPal didn't confirm 1 payment; Mend will check again."
+
+That item was later returned by the scheduled job's retry, and PayPal's own record of the batch shows 1 claimed and 4 returned. Mend logs each failure with PayPal's debug id, so a fault on PayPal's side can be traced.
+
+## The demo takes it back for you
+
+For demo campaigns, the scheduled job cancels any reward still unclaimed after 10 minutes, at most 50 items a run. That keeps the shared demo budget of USD 50.00 a day free for the next visitor: only money that really left the shop counts toward it. In the live proof on 29 Oct 2026, a campaign counted USD 10.00 toward the demo budget before its 4 unclaimed rewards were taken back, and USD 2.00 after.
+
+## Limits
+
+Take back works only after a campaign is sent; before that the answer is `not_submitted`. A demo session may take back 10 times an hour.

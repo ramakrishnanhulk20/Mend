@@ -1,0 +1,114 @@
+---
+title: PayPal integration
+description: Each PayPal piece Mend uses, how webhooks are verified in the app, the MCP server with its REST fallback, and the read-only app that cannot pay.
+---
+
+Mend talks to the PayPal sandbox only. Every request in the product is plain REST from Mend's own code, except the assistant's reads, which go through PayPal's hosted MCP server first. One proof script also calls Transaction Search through PayPal's Python Server SDK; no live task uses it.
+
+## Hosts
+
+Every PayPal address is parsed with the standard URL parser and refused unless its host equals one of these exactly. Each host has one use:
+
+| Host | Used for |
+|---|---|
+| `api-m.sandbox.paypal.com` | Every server API call: OAuth, Payouts, Orders, balances, webhooks, the Log in with PayPal code swap and profile read, and the REST fallback reads |
+| `www.sandbox.paypal.com` | Only the browser redirect to Log in with PayPal's sign-in page |
+| `mcp.sandbox.paypal.com` | Only Mend's MCP client, over https on the default port, with redirects refused |
+| `api.sandbox.paypal.com` | Only PayPal's webhook signing certificate, at exactly `/v1/notifications/certs/CERT-<id>` |
+| `cacerts.digicert.com` | Only a missing issuer certificate, which is checked up to a trusted root before use |
+
+The live host is never reachable: it is not a setting, and Mend refuses to start unless `PAYPAL_ENV` is `sandbox`.
+
+## Two PayPal apps
+
+- The main app, on the shop's sandbox business account, has Payouts and Log in with PayPal. Its keys are on the web app, the engine and the jobs.
+- The read-only app, on the same business account, was created without the Payouts permission. Its keys are on the web app only and serve only the assistant's four reads. It must be a different app from the main one, or the web app refuses to start.
+
+## Payouts
+
+Mend sends one batch per approved campaign with `POST /v1/payments/payouts`:
+
+- `sender_batch_id` is `mend-` followed by the first 40 characters of the approved plan's SHA-256 hash, so the same plan always gets the same id. PayPal refuses a second batch under an id it has seen, which is how a retry can never pay twice.
+- Each item is sent to the member's PayPal email (`recipient_type` `EMAIL`), with the amount, the approved note, a `sender_item_id` and the purpose `CASHBACK`.
+- The batch is built from the frozen approved plan, and checked against PayPal's limits on note length, amount format and receiver format before it is sent.
+- Only a created answer, or PayPal's answer that the id already exists, settles a send. After a timeout, no answer or a 5xx, the campaign waits as "submission unknown" until the reconcile job settles it by sending the same batch under the same id. 401, 403 and 429 never cancel a campaign.
+
+Statuses are read with `GET /v1/payments/payouts/{batch_id}` and `GET /v1/payments/payouts-item/{item_id}`. Unclaimed items are returned with `POST /v1/payments/payouts-item/{item_id}/cancel`; see [Take back unclaimed cashback](/docs/guides/take-back-unclaimed).
+
+## Reporting balances
+
+Before every send and every resend, the engine calls `GET /v1/reporting/balances?currency_code=USD`. Under one lock, it subtracts Mend's own payouts of the last 6 hours, since PayPal's balance report can lag, and sends nothing unless the batch, its fees and the floor fit. The floor is `MEND_BALANCE_FLOOR_MINOR`, USD 250 by default. A failed read counts as too low.
+
+## Orders v2
+
+The simulate button buys from the shop with `POST /v2/checkout/orders`: intent CAPTURE, a fixed USD 12.50, paid with PayPal's published sandbox test card, so PayPal captures it at once with no buyer login. Mend stores the order id from PayPal's answer, and only that stored id ever marks a purchase as simulated. The purchase counts only once a read of the order from PayPal says COMPLETED, prompted by the capture webhook or, after 15 minutes, by the refresh job.
+
+## Log in with PayPal
+
+- The sign-in redirect goes to `https://www.sandbox.paypal.com/connect` with the scopes openid, email and `https://uri.paypal.com/services/paypalattributes`, a state value and the fixed return address.
+- The callback swaps the code with `POST /v1/oauth2/token`, then reads `GET /v1/identity/oauth2/userinfo?schema=paypalv1.1`, and only if that answers 404, `GET /v1/identity/openidconnect/userinfo?schema=openid`.
+- PayPal's `paypalv1.1` answer gives the email as an `emails` list with `primary` and `confirmed` flags. Mend takes the one primary address and treats `confirmed` as verified.
+- Only the email, whether it is verified, and the payer id leave the callback. The customer's token is never stored or logged.
+
+The full flow is on [Join and leave](/docs/guides/join-and-leave).
+
+## Webhooks
+
+The webhook points at `https://mend-web.onrender.com/api/webhooks/paypal` (sandbox webhook `8N112937B9769545W`) and listens for 12 event types:
+
+- `PAYMENT.PAYOUTS-ITEM.SUCCEEDED`, `FAILED`, `BLOCKED`, `HELD`, `UNCLAIMED`, `RETURNED`, `REFUNDED` and `CANCELED`
+- `PAYMENT.PAYOUTSBATCH.DENIED`, `PROCESSING` and `SUCCESS`
+- `PAYMENT.CAPTURE.COMPLETED`
+
+The deploy script registers it and keeps its event types exactly at that list.
+
+### How a delivery is verified
+
+Mend checks every signature itself and never calls PayPal's verify API, so a forged delivery costs PayPal and the shop nothing. In order:
+
+1. Headers. `PAYPAL-AUTH-ALGO` must be `SHA256withRSA`, and `PAYPAL-CERT-URL` must be https on exactly `api.sandbox.paypal.com`, at `/v1/notifications/certs/CERT-` followed by an id.
+2. Size and shape. The body is read as raw bytes up to 256 KB, must be strict UTF-8, and is refused if any JSON key appears twice. The bytes that are verified are the bytes that are stored and parsed.
+3. Replays. A transmission id already stored, or already processed, is answered 200 with nothing written.
+4. The certificate. Mend uses a cached certificate, or downloads it from that exact address. It builds the chain from the served file, a bundled copy of PayPal's issuing authority (DigiCert EV RSA CA G2), or that issuer's address on `cacerts.digicert.com`, and checks every signature up to a root Node ships, with every certificate inside its dates and the signing certificate named exactly `messageverificationcerts.sandbox.paypal.com`. A good certificate is kept until it expires.
+5. The signature. PayPal signs the transmission id, the transmission time, Mend's webhook id (from config, never from the request) and a CRC-32 of the body, joined with `|`. Mend checks that signature against the certificate's key.
+6. Store once. A delivery that passes is stored under its transmission id, and the engine is asked to process it at once, without waiting for the answer.
+
+A CRC-32 of the body can be matched by anyone, so the signature alone does not prove the body is unchanged. Two required controls cover that: each transmission id is stored once, and no webhook is taken as fact. Before changing a payout status or recording a purchase, the engine reads that payout or order back from PayPal by id, acts only on PayPal's answer, and only for a batch Mend itself created. Statuses only move forward.
+
+The live proof on 29 Oct 2026 sent an altered copy of a real delivery under a new transmission id: the signature check refused it with 400, and nothing was stored.
+
+Rejected deliveries are counted in memory per address (120 a minute) and overall (600 a minute) before any database query. PayPal's own deliveries are never refused for a count. Certificate downloads of new addresses are capped at 2 a minute per address and 10 a minute overall.
+
+### When a webhook is lost
+
+A scheduled job starts from Mend's own records rather than PayPal's messages. Every payout item not yet final is re-read from PayPal once it is 15 minutes old, at most 50 a run, oldest first. A sent batch with fewer item rows than its approved plan is read from PayPal and its items recorded. A simulated order with no recorded purchase is read and recorded the same way the webhook would. A lost webhook only delays a status.
+
+## The MCP server, with a REST fallback
+
+The assistant has four PayPal tools: `get_order`, `list_disputes`, `get_dispute` and `show_product_details`. Mend's server is the MCP client. Claude never connects to PayPal and never sees a token.
+
+- The four names are listed one by one in code. Any other tool name is refused before a token is fetched or a byte is sent, so a tool PayPal adds to its server later cannot be reached.
+- Inputs are checked against strict, bounded shapes, twice.
+- Each answer is rebuilt from a list of fields, with emails, payer and shipping identity and control characters removed, before Claude sees it.
+- The stream address and the message address PayPal's server names must both be on `mcp.sandbox.paypal.com`; redirects are refused.
+- A demo visitor can read only orders its own session bought through simulate, and never the shop's disputes.
+
+When PayPal's MCP server fails with a setup error, cannot be reached or breaks the protocol, and at least 5 of the call's 15 seconds are left, the same four reads go straight to PayPal's REST API:
+
+| Tool | REST call |
+|---|---|
+| `get_order` | `GET /v2/checkout/orders/{id}` |
+| `list_disputes` | `GET /v1/customer/disputes?page_size=20`, with an optional state |
+| `get_dispute` | `GET /v1/customer/disputes/{id}` |
+| `show_product_details` | `GET /v1/catalogs/products/{id}` |
+
+The fallback follows the same rules: the same inputs, only `api-m.sandbox.paypal.com` through the same URL check, only the Accept and Authorization headers, no redirects followed, at most 1 MB of answer and the same rebuilt views. A refusal, a not-found, a tool error, a timeout or an oversized answer never falls back. Each answer says which way it came, `via paypal_mcp` or `via paypal_rest`, and each fallback writes one log line naming the tool and the reason.
+
+The fallback exists because PayPal's sandbox MCP server failed on 28 Oct 2026: every tool call, with either app's token, answered `PAYPAL_API_SETUP_ERROR`. The assistant's reads kept working through REST.
+
+## The read-only app, proven
+
+The read-only app's token still carries refund and checkout scopes, so the four-tool list stays the control for those. What it cannot do is pay. Two checks prove it against the live sandbox:
+
+- `npm run prove:read-keys` in `packages/web` reads the token's scopes, finds none for Payouts, and asks for a payout batch with both tokens: 403 with the read-only one, 200 with the main one.
+- The live proof's "read keys" check, on 29 Oct 2026: "the read-only app's token carries 27 scopes, none for payouts, and PayPal answers 403 when it asks for a payout batch".

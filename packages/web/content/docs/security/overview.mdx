@@ -1,0 +1,45 @@
+---
+title: Security overview
+description: The guardrails that keep Mend's money, its customers' data and its demo safe, in plain words.
+---
+
+Mend moves money, holds customers' details and runs a public demo where anyone can press the buttons. The guardrails below hold whatever a visitor types, whatever text reaches Claude and whatever arrives at the webhook. Each one is a rule in the [threat model](/docs/security/threat-model), with a test that shows it holds.
+
+## Money
+
+- One money path. Money leaves the shop only when an approved plan becomes one PayPal Payouts batch, or when the simulate button buys from the shop with PayPal's sandbox test card. No assistant tool, webhook or scheduled job can create a payment, an order, a capture or a refund. The one exception is the reconcile job resending a batch whose first send got no clear answer, from the same approved plan under the same id, so PayPal pays it at most once. Cancelling an unclaimed reward only returns money.
+- Approval by fingerprint. The owner approves a hash of every recipient, amount and note. The batch is built from that frozen copy, and any change voids the approval. Only a person's click can approve.
+- At most one batch per campaign. The move to sending is one atomic step, and the batch id is derived from the plan, so double clicks, two tabs and retries cannot pay twice. In a test, 20 approve requests at once produced one PayPal call.
+- Caps in code. Every amount is computed by code in whole cents and checked against the per-customer cap, the per-campaign cap and a rolling daily cap, when the draft is built and again at approval. The demo's caps are USD 2.00, USD 10.00 and USD 50.00 a day across all visitors. No one can change a cap from the site.
+- A balance floor. Before every send, Mend reads the shop's PayPal balance and sends nothing if the batch and its fees would take it under USD 250.
+
+## Customers
+
+- Opt-in only. Nobody is paid without joining with Log in with PayPal, on consent wording that names every use of their data. Leaving deletes them and cancels any unsent campaign that includes them.
+- Recipients from PayPal. The address paid comes from the member's own PayPal sign-in, never from an order record, a note or anything Claude wrote.
+- No customer email reaches Claude. Prompts carry opaque references, item names and counts.
+- PayPal data is deleted within 48 hours. Stored webhook payloads are purged at 47 hours.
+- Demo identities are made up. The demo shop's order history is real, and every name and email in it is generated.
+
+## PayPal
+
+- Sandbox only. The PayPal host is a constant, every PayPal address must equal a sandbox host exactly, and Mend refuses to start with any other environment.
+- Webhooks verified in the app against PayPal's certificate chain, then treated only as a prompt to read the payment back from PayPal.
+- Read-only keys for the assistant. Its PayPal token comes from an app without the Payouts permission, and only four read tools can be called.
+
+## The system
+
+- One database role per service. Neither the engine's nor the web app's role can change the schema or a trigger, and the audit log only accepts new rows.
+- A private engine. The only code that moves money runs on a service with no public address, behind a token, and no service holds a Render API key.
+- One permission table. Every console route and assistant tool asks the same table whether the caller's role may act, and anything not listed is refused. The public join pages and the webhook have their own rules instead.
+- Rendered output cannot run. Every string an attacker can influence renders as text, and the Content-Security-Policy blocks inline script and framing of the site.
+- Errors tell an attacker nothing. Callers get a short code and a reference; details stay in the server log, with secrets removed.
+- A shared demo stays usable. Every pool an anonymous visitor can draw on has a per-address share, so one network cannot use up the demo for everyone.
+
+## What Mend does not defend against
+
+The threat model names these on purpose, so nobody assumes otherwise: a compromised PayPal, Anthropic, Render or database server; an owner acting carelessly within the caps; persuasive wording that passes the note rule, which the owner reads before approving; fraud in incoming payments beyond netting refunds, which PayPal's own risk systems handle; and the legal, tax and compliance review a live launch would need. This deployment is sandbox only.
+
+## How it was checked
+
+See [Reviews](/docs/security/reviews) for the dated review rounds, the audit, and every finding class.

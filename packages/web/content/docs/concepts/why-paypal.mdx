@@ -1,0 +1,40 @@
+---
+title: Why PayPal
+description: Why Mend is built on PayPal, and what each PayPal piece does that the product could not do without it.
+---
+
+Mend's whole promise is to put a small thank-you where a lapsed customer will see it and use it, only with their permission, and to know what happened to every dollar. Each part of that rests on PayPal.
+
+## The money lands where the customer already pays
+
+Cashback paid through PayPal Payouts arrives in the customer's PayPal balance, the same wallet they use to check out. It needs no gift card, no code to remember and no new account. A thank-you that sits one tap from the next order is the point of the product.
+
+## Customers choose to join, with an identity Mend can pay
+
+A customer joins the shop's thank-you list with Log in with PayPal. PayPal shows its own consent screen, and Mend receives three things: the email on the PayPal account, whether PayPal has verified it, and the PayPal payer id. The cashback goes to that PayPal account. Mend never pays an address taken from an order record, a note or anything Claude wrote, and nobody who has not joined can be paid. Leaving takes one confirmation and a PayPal sign-in, and cancels any campaign not yet sent that includes the customer.
+
+## One batch per campaign, with the shop's own note
+
+Each approved campaign goes out as one PayPal Payouts batch. Every item carries the amount and the note the owner approved. Mend's own id for the batch is derived from the approved plan, and PayPal refuses a second batch under the same id, so a retry can never send it twice.
+
+## PayPal says what happened, and Mend checks
+
+PayPal's webhooks report every payment: sent, claimed, unclaimed, returned or failed. Mend checks each delivery's signature itself against PayPal's certificate, then reads the payment back from PayPal before it records anything. A scheduled job also re-reads any payment still unsettled after 15 minutes, so a lost webhook cannot leave the record wrong.
+
+## Unclaimed money comes back
+
+Cashback a customer has not claimed can be cancelled with one Payouts call per item, and PayPal returns it to the shop's balance. PayPal also returns unclaimed payouts on its own after 30 days.
+
+## A safe balance, read before every send
+
+Before every send, Mend reads the shop's PayPal balance and sends nothing if the batch and its fees would take it under a floor, USD 250 by default.
+
+## The assistant reads PayPal, and cannot pay
+
+The owner's assistant can look up an order, the shop's disputes or a product through PayPal's hosted MCP server. Mend's server makes those calls, with four read-only tools named one by one in code, and strips the buyer's identity before Claude sees the answer. The keys it uses belong to a second PayPal app created without the Payouts permission, and PayPal refuses that app's token on the Payouts API.
+
+## Without PayPal
+
+Take PayPal away and Mend has no wallet to pay into, no verified identity to pay, no signed record of what happened to each payment and no way to call unclaimed money back. The forecast and the plan would still run, with nothing to deliver them.
+
+The calls themselves are listed on the [PayPal integration page](/docs/developers/paypal-integration).

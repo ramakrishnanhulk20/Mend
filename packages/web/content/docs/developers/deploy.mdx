@@ -1,0 +1,89 @@
+---
+title: Deploy
+description: How Mend is deployed on Render with one repeatable script, what the live proof checks, and what the scheduled jobs do.
+---
+
+Mend runs on Render, in region virginia, and deploys the `main` branch on every push. One script, `scripts/deploy/render.mjs`, builds and checks the whole setup from the repo's `.env`, with no dashboard clicks.
+
+## What runs
+
+| Service | Kind | Plan | What it runs |
+|---|---|---|---|
+| `mend-web` | Web service, https://mend-web.onrender.com | Starter, about USD 7 a month | The Next.js app and the PayPal webhook receiver, on Node 26.7.0 |
+| `mend-engine` | Private service, no public URL | Starter, about USD 7 a month | The engine's task server on Python 3.12.10, reachable only on Render's private network |
+| `mend-jobs` | Cron job, every 5 minutes | Starter, USD 1 a month plus run minutes | `python -m mend_engine.jobs all` |
+| `mend-db` | Postgres 18 | basic 256 MB, about USD 6 a month | Every record Mend keeps |
+
+Plus one PayPal sandbox webhook pointing at mend-web. In all, about USD 22 a month.
+
+## Commands
+
+Run from the repository root:
+
+```bash
+node scripts/deploy/render.mjs status
+node scripts/deploy/render.mjs up
+node scripts/deploy/render.mjs up --migrate
+node scripts/deploy/render.mjs prove
+```
+
+- `status` only reads: each resource the state file records, found by its id, and the database role each service connects as.
+- `up` sets every service's settings and redeploys only what changed. A second run changes nothing. It never touches the database.
+- `up --migrate` also runs the engine's migrate command as the database's owner and its seed command as the engine's role, from this machine over TLS.
+- `up --create` is the only way to create a paid resource, and only when the state file records no id for it.
+- `prove` runs the live proof and changes nothing.
+
+Every command finds each resource by the id `scripts/deploy/render-state.json` records, which holds ids and addresses, never secrets. A recorded resource that is missing, renamed or on another plan stops the run before anything changes, and so does a service connected to another database. For the length of a run that reaches the database, the script allows this machine's public IPv4 address, and only that address, on the database, and removes it at the end however the run ends.
+
+## Settings and secrets
+
+The script reads `RENDER_API_KEY`, `PAYPAL_CLIENT_ID`, `PAYPAL_CLIENT_SECRET`, `PAYPAL_ENV`, the read-only pair, the three cap settings, `MEND_OWNER_PASSWORD`, `ANTHROPIC_API_KEY` and `MEND_TEST_RECEIVER` from `.env`. It generates `MEND_CSRF_SECRET`, `MEND_ENGINE_TOKEN` and the two database passwords once; those live only in Render. No service is given the Render API key, which is account-wide. No secret is printed or written to disk: every output line is checked, and a line carrying a secret is withheld and fails the run.
+
+Each service holds only what it needs. The read-only PayPal keys are on mend-web only. The engine token is on mend-web and mend-engine only; mend-jobs runs its jobs directly and holds none.
+
+## Database roles
+
+The migrate step creates one login role per service:
+
+- mend-engine and mend-jobs connect as `mend_engine`, which may read and write rows but only add to `audit_log`.
+- mend-web connects as `mend_web`, which may write only sessions, run owners, rate-limit counts, PayPal certificates and Claude usage, read and add to stored webhook deliveries, and add to `audit_log`. It cannot write payouts, members or campaigns.
+
+Neither role can change the schema or a trigger, and the database owner's address is never set on a service.
+
+## What prove checks
+
+`prove` makes a real demo journey on the live site and checks every setting, with Render and PayPal writes refused in code and `up` run inside it in plan-only mode, which must find nothing to change. It moves at most USD 10.00 of sandbox money. It ends `D2 RESULT: PASS` or `FAIL`. The checks:
+
+1. health: the site answers.
+2. plan: every service and the database are on the expected plans and region, and no other paid service exists.
+3. env: each service holds exactly the settings it needs, PayPal is sandbox everywhere, and each service uses its own database role.
+4. render key: no service holds a Render API key under any name.
+5. database role: both service roles are refused a new table and an audit log edit; the engine's role is also refused a trigger change, and the web's role an edit of payout items.
+6. private: mend-engine has no public URL and its name does not resolve on public DNS.
+7. journey plan: a demo session asks Claude for a plan and gets 5 rewards of 200 cents with 5 held back.
+8. journey notes: Claude writes the 5 notes.
+9. journey payout: the plan is viewed, approved with its hash and sent; PayPal holds the batch.
+10. read keys: the read-only app's token has no Payouts scope, and PayPal answers 403 to it on a payout batch.
+11. delivery: PayPal's webhook reaches mend-web, is verified, stored once and processed by the engine.
+12. cancel: the 4 unclaimed rewards are cancelled back to the shop.
+13. demo pool: only the money that left counts toward the demo's daily budget.
+14. forgery: an altered copy of a real delivery is refused, and a replay stores nothing.
+15. simulate: a return purchase is attributed to the right group as simulated.
+16. agent: the assistant answers a question with the live count.
+17. jobs: mend-jobs ran recently and the purge is on record.
+18. idempotent: `up` would change nothing.
+19. secrets: no secret appears in the output, the state file, the answers from mend-web or the service logs.
+
+On 29 Oct 2026 all 19 passed on their first run, against commit `bdb4139` (batch EY5YRBZFV4DX4). The condensed output is in the README.
+
+## The scheduled jobs
+
+`python -m mend_engine.jobs all` runs five jobs in order, each under its own database lock so two runs never act on the same thing. Every job runs even when an earlier one fails.
+
+1. purge: deletes stored PayPal payloads at 47 hours, so none outlives 48. It runs first so a slow PayPal can never hold it up.
+2. process_events: gives each stored webhook delivery its one outcome, after reading the payout or order back from PayPal.
+3. reconcile: settles any send whose outcome is unclear, never with a second batch, and flags one still unsettled after an hour.
+4. refresh_items: re-reads every payout item not yet final once it is 15 minutes old, reads batches that are missing item rows, and records simulated orders the webhook missed.
+5. cancel_demo_unclaimed: takes back demo cashback still unclaimed after 10 minutes, so the shared demo budget refills.
+
+Locally, `npm run dev:console` runs the same command every 30 seconds.

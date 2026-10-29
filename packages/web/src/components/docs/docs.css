@@ -1,0 +1,261 @@
+/* The docs in the same film as the site: Fumadocs' colour slots are filled with Mend's tokens,
+   and the rules below only reach inside .mend-docs or Fumadocs' own element ids. They sit outside
+   Tailwind's layers on purpose, so they win over Fumadocs' utility classes without !important. */
+
+:root,
+:root.dark,
+.dark {
+  --color-fd-background: var(--color-ink);
+  --color-fd-foreground: var(--color-bone);
+  --color-fd-muted: var(--color-ink-raised);
+  --color-fd-muted-foreground: var(--color-bone-dim);
+  --color-fd-popover: var(--color-ink-raised);
+  --color-fd-popover-foreground: var(--color-bone);
+  --color-fd-card: var(--color-ink-raised);
+  --color-fd-card-foreground: var(--color-bone);
+  --color-fd-border: var(--color-rule);
+  --color-fd-primary: var(--color-bone);
+  --color-fd-primary-foreground: var(--color-ink);
+  --color-fd-secondary: var(--color-ink-raised);
+  --color-fd-secondary-foreground: var(--color-bone);
+  --color-fd-accent: color-mix(in oklab, var(--color-bone) 6%, transparent);
+  --color-fd-accent-foreground: var(--color-bone);
+  --color-fd-ring: var(--color-bone-faint);
+  --color-fd-overlay: color-mix(in oklab, var(--color-ink) 70%, transparent);
+}
+
+:root:has(.mend-docs) {
+  color-scheme: dark;
+}
+
+/* Fumadocs offsets its sticky columns by this height. The top bar only exists from md up. */
+.mend-docs {
+  --fd-banner-height: 0px;
+}
+
+@media (min-width: 48rem) {
+  .mend-docs {
+    --fd-banner-height: 4rem;
+  }
+
+  /* The bar above carries the name from md up, so the copy at the top of the sidebar goes. */
+  .mend-docs #nd-sidebar > div:first-child > div:first-child {
+    display: none;
+  }
+}
+
+/* Sidebar */
+
+.mend-docs #nd-sidebar,
+.mend-docs #nd-sidebar-mobile {
+  background-color: var(--color-ink);
+}
+
+.mend-docs #nd-sidebar {
+  border-inline-end: 1px solid var(--color-rule);
+}
+
+.mend-docs [data-search-full] {
+  background-color: var(--color-ink-raised);
+  border: 1px solid var(--color-rule);
+  border-radius: 8px;
+  color: var(--color-bone-faint);
+}
+
+.mend-docs [data-search-full] kbd {
+  background-color: var(--color-ink);
+  border-color: var(--color-rule);
+  color: var(--color-bone-faint);
+}
+
+.mend-docs [data-search-full]:hover {
+  background-color: var(--color-ink-raised);
+  color: var(--color-bone);
+}
+
+/* A group is a folder in content/docs. Its name is the small heading; its pages follow flush left. */
+.mend-docs :is(#nd-sidebar, #nd-sidebar-mobile) [data-state][data-disabled]:not([id]) {
+  margin-top: 20px;
+}
+
+.mend-docs :is(#nd-sidebar, #nd-sidebar-mobile) [data-state][data-disabled]:not([id]) > div:first-child {
+  padding: 0 0 8px 14px;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  line-height: 1.2;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  color: var(--color-bone-faint);
+}
+
+.mend-docs :is(#nd-sidebar, #nd-sidebar-mobile) [data-state][data-disabled]:not([id]) > div:last-child::before {
+  display: none;
+}
+
+/* The padding is set inline by Fumadocs to indent by depth, so it needs !important to be reset. */
+.mend-docs :is(#nd-sidebar, #nd-sidebar-mobile) a[data-active] {
+  padding: 7px 8px 7px 14px !important;
+  border-radius: 0;
+  background-color: transparent;
+  font-size: 14px;
+  line-height: 1.4;
+  color: var(--color-bone-dim);
+  transition: color 150ms ease-out;
+}
+
+.mend-docs :is(#nd-sidebar, #nd-sidebar-mobile) a[data-active]:hover {
+  background-color: transparent;
+  color: var(--color-bone);
+}
+
+.mend-docs :is(#nd-sidebar, #nd-sidebar-mobile) a[data-active="true"] {
+  background-color: transparent;
+  color: var(--color-bone);
+}
+
+.mend-docs :is(#nd-sidebar, #nd-sidebar-mobile) a[data-active="true"]::before {
+  content: "";
+  position: absolute;
+  inset-block: 5px;
+  inset-inline-start: 0;
+  width: 2px;
+  background-color: var(--color-accent);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .mend-docs :is(#nd-sidebar, #nd-sidebar-mobile) a[data-active] {
+    transition: none;
+  }
+}
+
+/* Page */
+
+.mend-docs .prose {
+  --tw-prose-body: var(--color-bone-dim);
+  --tw-prose-headings: var(--color-bone);
+  --tw-prose-lead: var(--color-bone-dim);
+  --tw-prose-links: var(--color-bone);
+  --tw-prose-bold: var(--color-bone);
+  --tw-prose-counters: var(--color-bone-faint);
+  --tw-prose-bullets: var(--color-bone-faint);
+  --tw-prose-hr: var(--color-rule);
+  --tw-prose-quotes: var(--color-bone);
+  --tw-prose-quote-borders: var(--color-rule);
+  --tw-prose-code: var(--color-bone);
+  --tw-prose-th-borders: var(--color-rule);
+  --tw-prose-td-borders: var(--color-rule);
+  --tw-leading: 1.7;
+  font-family: var(--font-sans);
+  font-size: 16px;
+  line-height: 1.7;
+  color: var(--color-bone-dim);
+}
+
+.mend-docs .prose h2 {
+  font-size: 26px;
+  font-weight: 600;
+  line-height: 1.2;
+  color: var(--color-bone);
+}
+
+.mend-docs .prose h3 {
+  font-size: 20px;
+  font-weight: 600;
+  line-height: 1.3;
+  color: var(--color-bone);
+}
+
+.mend-docs .prose h4 {
+  font-weight: 600;
+  color: var(--color-bone);
+}
+
+.mend-docs .prose a:not(.not-prose a, [data-card]) {
+  color: var(--color-bone);
+  text-decoration-line: underline;
+  text-decoration-color: color-mix(in oklab, var(--color-bone) 35%, transparent);
+  text-underline-offset: 3px;
+  transition: text-decoration-color 150ms ease-out;
+}
+
+.mend-docs .prose a:not(.not-prose a, [data-card]):hover {
+  text-decoration-color: var(--color-bone);
+}
+
+/* The heading itself is the anchor link, so it keeps the heading look and no underline. */
+.mend-docs .prose a[data-card] {
+  color: inherit;
+  text-decoration: none;
+  font-weight: inherit;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .mend-docs .prose a:not(.not-prose a, [data-card]) {
+    transition: none;
+  }
+}
+
+.mend-docs .prose :not(pre) > code {
+  font-family: var(--font-mono);
+  font-size: 14px;
+  font-weight: 400;
+  color: var(--color-bone);
+  background-color: var(--color-ink-raised);
+  border: 0;
+  border-radius: 4px;
+  padding: 1px 4px;
+}
+
+.mend-docs .prose :not(pre) > code::before,
+.mend-docs .prose :not(pre) > code::after {
+  content: none;
+}
+
+/* Code blocks: the figure comes from Fumadocs' CodeBlock, with its copy button. */
+.mend-docs figure.shiki {
+  background-color: var(--color-ink-raised);
+  border: 1px solid var(--color-rule);
+  border-radius: 8px;
+}
+
+.mend-docs figure.shiki code {
+  font-family: var(--font-mono);
+}
+
+/* Tables: thin rules between rows, a small mono header, and no card around them. */
+.mend-docs .prose table {
+  background-color: transparent;
+  border: 0;
+  border-radius: 0;
+  border-collapse: collapse;
+  font-size: 15px;
+}
+
+.mend-docs .prose thead th {
+  padding: 0 16px 10px 0;
+  border: 0;
+  border-bottom: 1px solid var(--color-rule);
+  background-color: transparent;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  font-weight: 400;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  color: var(--color-bone-faint);
+  white-space: nowrap;
+}
+
+.mend-docs .prose tbody td {
+  padding: 12px 16px 12px 0;
+  border: 0;
+  border-bottom: 1px solid var(--color-rule);
+  vertical-align: top;
+}
+
+.mend-docs .prose tbody tr:last-child td {
+  border-bottom: 1px solid var(--color-rule);
+}
+
+.mend-docs .prose tr > :last-child {
+  padding-inline-end: 0;
+}

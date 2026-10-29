@@ -568,7 +568,7 @@ def check_reconcile(proof: Proof, conn: psycopg.Connection, http: PayPalHttp, re
 def check_guard(proof: Proof, conn: psycopg.Connection) -> None:
     campaign_id = conn.execute(
         "insert into campaigns (shop_name, goal_text, as_of, budget_minor, per_recipient_minor, holdout_share, status) "
-        "values ('Wolf and Wren Gifts', %s, %s, 100, 25, 0.5, 'draft') returning campaign_id",
+        "values ('Copperwick Gifts', %s, %s, 100, 25, 0.5, 'draft') returning campaign_id",
         (GOAL, AS_OF),
     ).fetchone()[0]
     void_draft(conn, campaign_id, "proof run: status guard check")

@@ -49,7 +49,7 @@ CONFIG = Config(
     campaign_cap_minor=10000,
     daily_cap_minor=20000,
 )
-NOTE = "Thank you for being a regular at Wolf and Wren Gifts. Here is a small thank-you from us."
+NOTE = "Thank you for being a regular at Copperwick Gifts. Here is a small thank-you from us."
 
 
 @pytest.fixture(scope="module")
@@ -126,7 +126,7 @@ def test_approval_freezes_exactly_the_snapshot_the_owner_was_shown(conn: psycopg
         ("c1@shop.example", 250, "R1"),
         ("c2@shop.example", 300, "R2"),
     ]
-    assert shown.email_subject == "A thank-you from Wolf and Wren Gifts" and shown.currency == "USD"
+    assert shown.email_subject == "A thank-you from Copperwick Gifts" and shown.currency == "USD"
     stored = conn.execute("select snapshot_hash, canonical_json, approved_at, approved_by from approved_snapshots").fetchall()
     assert stored == [(approval.snapshot_hash, canonical_json(shown), approval.approved_at, "owner")]
     assert frozen_snapshot(conn, campaign_id) == shown

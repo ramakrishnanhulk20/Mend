@@ -463,8 +463,8 @@ describe("finished runs become each route's own response", () => {
       itemCapMinor: 10,
     });
     expect(
-      await finished("note_context", { ok: true, shop_name: "Wolf and Wren Gifts", recent_items: ["red teapot"], days_since_last_order: 120 }).json(),
-    ).toEqual({ shopName: "Wolf and Wren Gifts", recentItems: ["red teapot"], daysSinceLastOrder: 120 });
+      await finished("note_context", { ok: true, shop_name: "Copperwick Gifts", recent_items: ["red teapot"], days_since_last_order: 120 }).json(),
+    ).toEqual({ shopName: "Copperwick Gifts", recentItems: ["red teapot"], daysSinceLastOrder: 120 });
     expect(await finished("set_note", { ok: true, campaign_id: CAMPAIGN, ref: "R3", template: false }).json()).toEqual({ campaignId: CAMPAIGN, ref: "R3", template: false });
     expect(await finished("request_approval", { ok: true, campaign_id: CAMPAIGN, status: "awaiting_approval" }).json()).toEqual({
       campaignId: CAMPAIGN,

@@ -114,7 +114,7 @@ beforeEach(() => {
   state.reply = (content) => `Thank you for the ${/"recent_items":\["([^"]+)"/.exec(content)?.[1] ?? "visits"}, we have missed you.`;
   state.engine = {
     view_campaign: () => view(),
-    note_context: (args) => ({ ok: true, shop_name: "Wolf and Wren Gifts", recent_items: ITEMS[args[1] as string], days_since_last_order: 120 }),
+    note_context: (args) => ({ ok: true, shop_name: "Copperwick Gifts", recent_items: ITEMS[args[1] as string], days_since_last_order: 120 }),
     set_note: (args) => ({ ok: true, campaign_id: CAMPAIGN, ref: args[1], template: args[2] === null }),
   };
   vi.stubEnv("ANTHROPIC_API_KEY", "fake-claude-key-for-tests-0123456789");
@@ -281,7 +281,7 @@ describe("writeNotes", () => {
     state.engine.note_context = (args) =>
       args[1] === "R3"
         ? { ok: false, error: "recipient_not_member", ref: randomUUID() }
-        : { ok: true, shop_name: "Wolf and Wren Gifts", recent_items: ITEMS[args[1] as string], days_since_last_order: 120 };
+        : { ok: true, shop_name: "Copperwick Gifts", recent_items: ITEMS[args[1] as string], days_since_last_order: 120 };
     const session = new ClaudeSession(OWNER, randomUUID(), 10_000, ADDRESS);
     const result = await writeNotes(OWNER, CAMPAIGN, session);
     session.close();

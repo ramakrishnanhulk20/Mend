@@ -56,7 +56,7 @@ SETTINGS = DraftSettings(
     holdout_share=Decimal("0.50"),
     max_candidates=20,
 )
-EXPECTED_NOTE = "Thank you for being a regular at Wolf and Wren Gifts. Here is a small thank-you from us."
+EXPECTED_NOTE = "Thank you for being a regular at Copperwick Gifts. Here is a small thank-you from us."
 UUID_SHAPE = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}", re.IGNORECASE)
 CUSTOMER_REF_SHAPE = re.compile(r"C[0-9]")
 

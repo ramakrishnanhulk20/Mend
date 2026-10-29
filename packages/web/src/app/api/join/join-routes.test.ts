@@ -86,7 +86,7 @@ const USERINFO = {
 };
 const IDENTITY = { email: EMAIL, email_verified: true, payer_id: "QWERTY1234567" };
 const ANSWERS = {
-  consent_text: { ok: true, shop_name: "Wolf and Wren Gifts", text: "Wolf and Wren Gifts may look at your past orders.", hash: HASH },
+  consent_text: { ok: true, shop_name: "Copperwick Gifts", text: "Copperwick Gifts may look at your past orders.", hash: HASH },
   join: { ok: true, member_id: MEMBER, created: true, linked: true },
   leave: { ok: true, left: true, voided: 1 },
 };
@@ -211,7 +211,7 @@ describe("GET /api/join/consent", () => {
     const { consent } = await routes();
     const response = await consent.GET(get("/api/join/consent"));
     expect(response.status).toBe(200);
-    expect(await body(response)).toStrictEqual({ shopName: "Wolf and Wren Gifts", text: ANSWERS.consent_text.text, hash: HASH });
+    expect(await body(response)).toStrictEqual({ shopName: "Copperwick Gifts", text: ANSWERS.consent_text.text, hash: HASH });
     expect(fake.engineCalls).toEqual([{ task: "consent_text", args: [] }]);
     expect(fake.engineOptions).toEqual([{ address: ADDRESS }]);
   });
@@ -262,7 +262,7 @@ describe("GET /api/join/paypal/start", () => {
     expect(response.headers.get("set-cookie")).toMatch(/^__Host-mend_csrf=a1\.[A-Za-z0-9_-]{43}; Path=\/; Max-Age=86400; HttpOnly; SameSite=Lax; Secure$/);
     expect(csrfCookie).toMatch(/^__Host-mend_csrf=a1\./);
     expect(csrf).toMatch(/^c2\.[A-Za-z0-9_-]{43}$/);
-    expect(html).toContain("<h1>Wolf and Wren Gifts</h1>\n<p>Wolf and Wren Gifts may look at your past orders.</p>");
+    expect(html).toContain("<h1>Copperwick Gifts</h1>\n<p>Copperwick Gifts may look at your past orders.</p>");
     expect(html).toContain('<form method="post" action="/api/join/paypal/start">');
     expect(html).toContain('<input type="hidden" name="intent" value="join">');
     expect(html).toContain(`<input type="hidden" name="consent" value="${HASH}">`);
@@ -288,7 +288,7 @@ describe("GET /api/join/paypal/start", () => {
   it("shows the leave sentence with no consent field", async () => {
     const { response, html, csrf } = await page("leave");
     expect(response.status).toBe(200);
-    expect(html).toContain("<p>Leave the thank-you list of Wolf and Wren Gifts. Any reward not yet sent to you is cancelled.</p>");
+    expect(html).toContain("<p>Leave the thank-you list of Copperwick Gifts. Any reward not yet sent to you is cancelled.</p>");
     expect(html).toContain('<input type="hidden" name="intent" value="leave">');
     expect(html).toContain('<button type="submit">Leave with PayPal</button>');
     expect(html).not.toContain('name="consent"');

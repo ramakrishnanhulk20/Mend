@@ -43,7 +43,7 @@ CONFIG = Config(
     campaign_cap_minor=10000,
     daily_cap_minor=20000,
 )
-NOTE = "Thank you for being a regular at Wolf and Wren Gifts. Here is a small thank-you from us."
+NOTE = "Thank you for being a regular at Copperwick Gifts. Here is a small thank-you from us."
 
 
 @pytest.fixture(scope="module")

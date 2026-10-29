@@ -12,12 +12,13 @@ import pgserver
 import psycopg
 import pytest
 from psycopg import sql
+from test_membership import CONSENT_2026_10_27
 
 from mend_engine.campaigns.eligibility import Candidate, quiet_regular_members
 from mend_engine.campaigns.scoring import ScoreSet, paid_net_of_refunds, score_customers
 from mend_engine.db.connect import PGDATA
 from mend_engine.db.migrate import apply_schema
-from mend_engine.members.consent import DEMO_SHOP_NAME
+from mend_engine.members.consent import DEMO_SHOP_NAME, consent_hash
 from mend_engine.members.membership import join_member
 from mend_engine.paypal.payouts import BatchSnapshot, PayoutItemSpec, canonical_json, sender_batch_id_for, snapshot_hash
 
@@ -193,6 +194,19 @@ def test_a_member_who_agreed_only_to_an_earlier_wording_is_not_eligible(conn: ps
     ids = {ref: member(conn, ref.lower() + "@shop.example") for ref in rows}
     conn.execute("update members set consent_version = '2026-10-20.1' where member_id = %s", (ids["C2"],))
     assert [c.member_id for c in quiet_regular_members(conn, scores(rows), AS_OF)] == [ids["C1"]]
+
+
+def test_a_member_who_agreed_under_the_shops_earlier_made_up_name_stays_eligible(conn: psycopg.Connection) -> None:
+    rows = {"C1": (0.1, 5, 100), "C2": (0.2, 5, 100)}
+    for ref in rows:
+        customer(conn, ref)
+    ids = {ref: member(conn, ref.lower() + "@shop.example") for ref in rows}
+    # The row exactly as a join before the rename wrote it: that version, and the hash of the words that member saw.
+    conn.execute(
+        "update members set consent_version = '2026-10-27.1', consent_text_sha256 = %s where member_id = %s",
+        (consent_hash(CONSENT_2026_10_27), ids["C2"]),
+    )
+    assert [c.member_id for c in quiet_regular_members(conn, scores(rows), AS_OF)] == [ids["C1"], ids["C2"]]
 
 
 ROUTE = {

@@ -513,11 +513,12 @@ describe("the agent's tools", () => {
     });
   });
 
-  it("report people who joined and demo stand-ins apart, never as one members number, and say the stand-ins are demo customers", async () => {
+  it("report people who joined and demo stand-ins apart, never as one members number, and always call the stand-ins demo stand-ins", async () => {
     const current = turn();
     const tools = agentTools(current);
     const description = runnable(tools).find((candidate) => candidate.name === "shop_summary")?.description ?? "";
-    expect(description).toContain("demo customers, not people who joined");
+    expect(description).toContain("Always call them demo stand-ins");
+    expect(description).not.toContain("demo customers");
     expect(description).toContain("never add the two into one number of members");
     const shown = JSON.parse(String(await tool(tools, "shop_summary")({}))) as Record<string, unknown>;
     current.session.close();
@@ -778,7 +779,7 @@ describe("POST /api/agent", () => {
     state.usage.set("demo_all", 5_000_000);
     state.engine.draft_limits = () => ({ ok: true, as_of: "2026-10-16", campaign_cap_minor: 1000, item_cap_minor: 200 });
     state.engine.draft_campaign = () => ({ ok: true, campaign_id: CAMPAIGN, candidates: 4, rewarded: 2, held_back: 2, total_minor: 20 });
-    state.engine.note_context = () => ({ ok: true, shop_name: "Wolf and Wren Gifts", recent_items: ["red teapot"], days_since_last_order: 120 });
+    state.engine.note_context = () => ({ ok: true, shop_name: "Copperwick Gifts", recent_items: ["red teapot"], days_since_last_order: 120 });
     state.engine.set_note = (args) => ({ ok: true, campaign_id: CAMPAIGN, ref: args[1], template: args[2] === null });
     const token = signIn("demo");
     const headers = { origin: BASE, cookie: `mend_session=${token}`, "content-type": "application/json", "x-mend-csrf": csrfTokenForSession(sessionIdFor(token)) };

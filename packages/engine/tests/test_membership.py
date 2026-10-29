@@ -89,7 +89,7 @@ def test_joining_records_the_consent_and_twice_returns_the_same_member(conn: psy
     ).fetchone()
     assert (email, version, client, verified) == ("maya.r@shop.example", CONSENT_VERSION, CLIENT_ID, True)
     assert digest == consent_hash(consent_text_for(DEMO_SHOP_NAME))
-    assert consent_text_for(DEMO_SHOP_NAME).startswith("Wolf and Wren Gifts may look at your past orders")
+    assert consent_text_for(DEMO_SHOP_NAME).startswith("Copperwick Gifts may look at your past orders")
     joined = conn.execute("select detail from audit_log where action = 'member_joined'").fetchall()
     assert joined == [({"member_id": str(first), "consent_version": CONSENT_VERSION},)]
 
@@ -191,20 +191,24 @@ def test_a_script_joins_stand_ins_as_seed_rows_under_its_own_name_and_never_cros
     assert bad_actor.value.reason == "bad_input"
 
 
-CONSENT_2026_10_27 = (
-    "Wolf and Wren Gifts may look at your past orders with them and send thank-you cashback to this PayPal account. "
+CONSENT_USES = (
+    " may look at your past orders with them and send thank-you cashback to this PayPal account. "
     "To learn whether it works, a random share of customers is held back each time and gets no cashback that round, "
     "and later purchases are counted to measure the result. Thank-you notes are written with AI from the names of "
     "items you bought. Mend keeps your PayPal email, its verification status and your PayPal account ID for this. "
     "You can leave at any time."
 )
+CONSENT_2026_10_29 = "Copperwick Gifts" + CONSENT_USES
+# Kept word for word: members who joined under 2026-10-27.1 saw the demo shop's first made-up name, and their row holds this hash.
+CONSENT_2026_10_27 = "Wolf and Wren Gifts" + CONSENT_USES
 
 
 def test_the_consent_names_the_holdout_the_measurement_the_ai_notes_and_the_data_kept() -> None:
     from mend_engine.members.consent import ACCEPTED_CONSENT_VERSIONS
 
-    assert (CONSENT_VERSION, consent_text_for(DEMO_SHOP_NAME)) == ("2026-10-27.1", CONSENT_2026_10_27)
-    assert ACCEPTED_CONSENT_VERSIONS == {"2026-10-27.1"}
+    assert (CONSENT_VERSION, consent_text_for(DEMO_SHOP_NAME)) == ("2026-10-29.1", CONSENT_2026_10_29)
+    # Only the shop's name changed, so the earlier wording names every use too.
+    assert ACCEPTED_CONSENT_VERSIONS == {"2026-10-27.1", "2026-10-29.1"}
 
 
 def test_a_verified_member_on_an_earlier_wording_who_joins_again_agrees_to_the_current_one(conn: psycopg.Connection) -> None:

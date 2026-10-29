@@ -37,7 +37,7 @@ export async function generateMetadata({ params }: DocsPageProps): Promise<Metad
   if (!page) notFound();
 
   return {
-    title: `${page.data.title} | Mend docs`,
+    title: slug === undefined || slug.length === 0 ? "Mend docs" : `${page.data.title} | Mend docs`,
     description: page.data.description,
   };
 }

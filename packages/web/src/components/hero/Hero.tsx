@@ -1,8 +1,9 @@
 "use client";
 
 import { useEffect, useRef } from "react";
-import { motion, useReducedMotion } from "motion/react";
+import { AnimatePresence, motion, useReducedMotion } from "motion/react";
 import { Mark } from "@/components/brand/Mark";
+import { formatCount, formatUsdCompact } from "@/components/live/summary";
 import { INTRO } from "./loom";
 import { Loom } from "./LoomCanvas";
 
@@ -47,7 +48,9 @@ function copyDelay(item: number) {
   return INTRO.copy.start + item * INTRO.copy.stagger;
 }
 
-export function Hero() {
+export type HeroLive = { quietRegulars: number; paid12mMinor: number };
+
+export function Hero({ live = null }: { live?: HeroLive | null }) {
   const sectionRef = useRef<HTMLElement>(null);
   const still = Boolean(useReducedMotion());
 
@@ -283,8 +286,51 @@ export function Hero() {
         className="absolute inset-x-0 bottom-0 flex items-center justify-between border-t border-rule px-4 py-3 font-mono text-[10px] font-medium uppercase tracking-[0.14em] text-bone/55 md:px-10 md:py-4 md:text-[11.5px]"
         {...fade(still, copyDelay(3), 600)}
       >
-        <span>Now showing in the PayPal sandbox</span>
-        <div className="hidden items-center xl:flex">
+        <div className="grid min-w-0 grid-cols-[minmax(0,1fr)] xl:mr-8 xl:max-w-[60%]">
+          <AnimatePresence initial={false}>
+            {live === null ? (
+              <motion.span
+                key="sandbox"
+                className="col-start-1 row-start-1 min-w-0 truncate"
+                initial={{ opacity: 0 }}
+                animate={{ opacity: 1 }}
+                exit={{ opacity: 0 }}
+                transition={{ duration: still ? 0 : 0.4, ease: EASE }}
+              >
+                Now showing in the PayPal sandbox
+              </motion.span>
+            ) : (
+              <motion.span
+                key="live"
+                className="col-start-1 row-start-1 flex min-w-0 items-center gap-2"
+                initial={{ opacity: 0 }}
+                animate={{ opacity: 1 }}
+                exit={{ opacity: 0 }}
+                transition={{ duration: still ? 0 : 0.4, ease: EASE }}
+              >
+                <span aria-hidden="true" className="relative block h-[6px] w-[6px] shrink-0">
+                  {!still && (
+                    <motion.span
+                      className="absolute inset-0 rounded-full bg-accent"
+                      initial={{ scale: 1, opacity: 0.6 }}
+                      animate={{ scale: 2.4, opacity: 0 }}
+                      transition={{ duration: 1.8, ease: "easeOut", repeat: Infinity }}
+                    />
+                  )}
+                  <span className="absolute inset-0 rounded-full bg-accent" />
+                </span>
+                <span className="min-w-0 truncate">
+                  Live: {formatCount(live.quietRegulars)} regulars went quiet
+                  <span className="hidden md:inline">
+                    {" "}&middot; {formatUsdCompact(live.paid12mMinor)} paid last year
+                  </span>
+                </span>
+              </motion.span>
+            )}
+          </AnimatePresence>
+        </div>
+        {/* shrink-0: when the live line is long, the left text gives way, never the credits. */}
+        <div className="hidden shrink-0 items-center xl:flex">
           {CREDITS.map((credit, i) => (
             <span key={credit} className="flex items-center">
               {i > 0 && <span aria-hidden="true" className="mx-[14px] h-[10px] w-px bg-bone/25" />}

@@ -6,8 +6,44 @@
 // which they do only over https.
 import { modifyRouteRegex } from "next/dist/lib/redirect-status";
 import { getPathMatch } from "next/dist/shared/lib/router/utils/path-match";
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import config from "../next.config";
+
+afterEach(() => {
+  vi.unstubAllEnvs();
+});
+
+describe("next.config.ts dev-only summary rewrite", () => {
+  const ORIGIN = "https://mend-web.onrender.com";
+
+  it("adds no rewrite in production, even with the variable set", async () => {
+    vi.stubEnv("NODE_ENV", "production");
+    vi.stubEnv("MEND_DEV_SUMMARY_ORIGIN", ORIGIN);
+    expect(await config.rewrites?.()).toEqual({ beforeFiles: [] });
+  });
+
+  it("adds no rewrite in development without the variable", async () => {
+    vi.stubEnv("NODE_ENV", "development");
+    vi.stubEnv("MEND_DEV_SUMMARY_ORIGIN", "");
+    expect(await config.rewrites?.()).toEqual({ beforeFiles: [] });
+  });
+
+  it("adds no rewrite for an http address, a path, or text that is not an address", async () => {
+    vi.stubEnv("NODE_ENV", "development");
+    for (const value of ["http://mend-web.onrender.com", `${ORIGIN}/api`, `${ORIGIN}?x=1`, "mend-web.onrender.com", "https://user:pass@mend-web.onrender.com"]) {
+      vi.stubEnv("MEND_DEV_SUMMARY_ORIGIN", value);
+      expect(await config.rewrites?.(), value).toEqual({ beforeFiles: [] });
+    }
+  });
+
+  it("sends only the summary route to the https address in development", async () => {
+    vi.stubEnv("NODE_ENV", "development");
+    vi.stubEnv("MEND_DEV_SUMMARY_ORIGIN", ORIGIN);
+    expect(await config.rewrites?.()).toEqual({
+      beforeFiles: [{ source: "/api/shop/summary", destination: `${ORIGIN}/api/shop/summary` }],
+    });
+  });
+});
 
 describe("next.config.ts", () => {
   it("sends Strict-Transport-Security and X-Content-Type-Options nosniff on every answer", async () => {

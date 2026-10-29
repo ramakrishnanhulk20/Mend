@@ -1,11 +1,17 @@
 "use client";
 
 import { useState } from "react";
+import { Closing } from "@/components/closing/Closing";
+import { Footer } from "@/components/closing/Footer";
 import { Hero } from "@/components/hero/Hero";
 import { HowItWorks } from "@/components/how/HowItWorks";
+import { useShopSummary } from "@/components/live/useShopSummary";
+import { ProofSection } from "@/components/proof/ProofSection";
+import { Guardrails } from "@/components/safety/Guardrails";
 
 export function LabStage() {
   const [key, setKey] = useState(0);
+  const { state, summary, slow, retry } = useShopSummary();
 
   const replay = () => {
     window.scrollTo(0, 0);
@@ -14,8 +20,15 @@ export function LabStage() {
 
   return (
     <>
-      <Hero key={key} />
+      <Hero
+        key={key}
+        live={summary ? { quietRegulars: summary.quietRegulars, paid12mMinor: summary.quietRegularsPaid12mMinor } : null}
+      />
       <HowItWorks />
+      <ProofSection state={state} summary={summary} slow={slow} retry={retry} />
+      <Guardrails />
+      <Closing />
+      <Footer />
 
       <section className="h-[120vh] border-t border-rule px-4 pt-24 md:px-10">
         {/* The lab control lives below the hero so it never sits on top of what is being judged. */}

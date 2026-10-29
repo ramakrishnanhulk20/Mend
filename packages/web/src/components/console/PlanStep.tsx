@@ -234,48 +234,42 @@ export function PlanStep({ api, onDrafted, onReview }: PlanStepProps) {
           placeholder={PLACEHOLDER}
           className={`mt-2 w-full resize-y rounded-[8px] border border-rule bg-ink-raised p-4 text-[16px] text-bone placeholder:text-bone-faint focus:border-bone-faint ${FOCUS_RING}`}
         />
-        <div className="mt-3 flex flex-wrap items-start justify-between gap-x-6 gap-y-3">
-          <div className="flex flex-wrap gap-2">
-            {SUGGESTIONS.map((text) => (
-              <button
-                key={text}
-                type="button"
-                onClick={() => suggest(text)}
-                className={`rounded-[8px] border border-rule px-3 py-[6px] text-left text-[13px] text-bone-dim transition-colors duration-150 ease-out hover:border-bone-faint hover:text-bone ${FOCUS_RING}`}
-              >
-                {text}
-              </button>
-            ))}
-          </div>
-          <div className="ml-auto shrink-0">
-            <div className="flex items-end gap-5">
-              <div>
-                <label htmlFor="plan-budget" className={`block ${LABEL}`}>
-                  Budget, USD (optional)
-                </label>
-                <input
-                  id="plan-budget"
-                  ref={budgetInput}
-                  type="number"
-                  inputMode="numeric"
-                  min={1}
-                  step={1}
-                  value={budget}
-                  onChange={(event) => setBudget(event.target.value)}
-                  aria-describedby={overLimit ? "plan-budget-hint" : undefined}
-                  className={`mt-2 h-10 w-[140px] rounded-[8px] border border-rule bg-ink-raised px-3 text-[16px] tabular-nums text-bone placeholder:text-bone-faint focus:border-bone-faint ${FOCUS_RING}`}
-                />
-              </div>
-              <span className="pb-[11px] font-mono text-[11px] tabular-nums text-bone-faint">
-                {goal.length} / {GOAL_LIMIT}
-              </span>
-            </div>
-            {overLimit && (
-              <p id="plan-budget-hint" className="mt-2 max-w-[300px] text-[14px] leading-[1.5] text-bone-dim">
-                {OVER_BUDGET_HINT}
-              </p>
-            )}
-          </div>
+        <p className="mt-2 text-right font-mono text-[11px] tabular-nums text-bone-faint">
+          {goal.length} / {GOAL_LIMIT}
+        </p>
+        <div className="mt-3 flex flex-wrap gap-2">
+          {SUGGESTIONS.map((text) => (
+            <button
+              key={text}
+              type="button"
+              onClick={() => suggest(text)}
+              className={`rounded-[8px] border border-rule px-3 py-[6px] text-left text-[13px] text-bone-dim transition-colors duration-150 ease-out hover:border-bone-faint hover:text-bone ${FOCUS_RING}`}
+            >
+              {text}
+            </button>
+          ))}
+        </div>
+        <div className="mt-6">
+          <label htmlFor="plan-budget" className={`block ${LABEL}`}>
+            Budget, USD (optional)
+          </label>
+          <input
+            id="plan-budget"
+            ref={budgetInput}
+            type="number"
+            inputMode="numeric"
+            min={1}
+            step={1}
+            value={budget}
+            onChange={(event) => setBudget(event.target.value)}
+            aria-describedby={overLimit ? "plan-budget-hint" : undefined}
+            className={`mt-2 h-10 w-[140px] rounded-[8px] border border-rule bg-ink-raised px-3 text-[16px] tabular-nums text-bone placeholder:text-bone-faint focus:border-bone-faint ${FOCUS_RING}`}
+          />
+          {overLimit && (
+            <p id="plan-budget-hint" className="mt-2 max-w-[300px] text-[14px] leading-[1.5] text-bone-dim">
+              {OVER_BUDGET_HINT}
+            </p>
+          )}
         </div>
 
         <button

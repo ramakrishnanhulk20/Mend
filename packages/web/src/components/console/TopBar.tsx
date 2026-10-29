@@ -3,16 +3,9 @@
 import Link from "next/link";
 import { Mark } from "@/components/brand/Mark";
 import { FOCUS_RING, StepRail, TextButton, type Step } from "./StepRail";
+import { UNDERLINE_DRAW } from "./ui";
 
 export type SessionInfo = { expiresAt: string };
-
-function localTime(iso: string): string | null {
-  const date = new Date(iso);
-  if (Number.isNaN(date.getTime())) return null;
-  const hours = String(date.getHours()).padStart(2, "0");
-  const minutes = String(date.getMinutes()).padStart(2, "0");
-  return `${hours}:${minutes}`;
-}
 
 type TopBarProps = {
   step: Step;
@@ -22,10 +15,8 @@ type TopBarProps = {
 };
 
 // From lg the step rail takes the middle of the bar. Between lg and xl there is no room left
-// for the console label and the session time as well, so they step aside until xl.
+// for the console label as well, so it steps aside until xl.
 export function TopBar({ step, session, ending, onEnd }: TopBarProps) {
-  const endsAt = session === null ? null : localTime(session.expiresAt);
-
   return (
     <header className="sticky top-0 z-40 flex h-16 items-center justify-between whitespace-nowrap border-b border-rule bg-ink/90 px-4 backdrop-blur md:px-10">
       <div className="flex flex-1 items-center gap-4">
@@ -48,11 +39,18 @@ export function TopBar({ step, session, ending, onEnd }: TopBarProps) {
       <StepRail step={step} />
 
       <div className="flex flex-1 items-center justify-end gap-5">
-        {session !== null && endsAt !== null && (
-          <span className="hidden font-mono text-[12px] text-bone-faint sm:block lg:hidden xl:block">
-            Session ends {endsAt}
+        <Link
+          href="/docs"
+          className={`group/docs hidden items-center py-2 text-[14px] text-bone-dim transition-colors duration-200 ease-out hover:text-bone focus-visible:text-bone md:inline-flex ${FOCUS_RING}`}
+        >
+          <span className="relative">
+            Docs
+            <span
+              aria-hidden="true"
+              className={`${UNDERLINE_DRAW} group-hover/docs:scale-x-100 group-focus-visible/docs:scale-x-100`}
+            />
           </span>
-        )}
+        </Link>
         {session !== null && (
           <TextButton onClick={onEnd} disabled={ending}>
             End session

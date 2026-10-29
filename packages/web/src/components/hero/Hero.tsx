@@ -26,7 +26,13 @@ const NAV_LINKS = [
   { label: "Docs", href: "/docs" },
 ];
 
-const CREDITS = ["PayPal Payouts", "Log in with PayPal", "BG/NBD forecast", "Random holdout"];
+const CREDITS = [
+  "PayPal Payouts",
+  "Log in with PayPal",
+  "Planned with Claude",
+  "BG/NBD forecast",
+  "Random holdout",
+];
 
 const LETTERS = ["M", "E", "N", "D"];
 
@@ -237,8 +243,9 @@ export function Hero({ live = null }: { live?: HeroLive | null }) {
               className="max-w-[36ch] text-[16px] font-normal leading-[1.55] text-bone-dim md:text-[18px]"
               {...fadeRise(still, copyDelay(1), 600, 24)}
             >
-              Mend finds the regulars who are drifting away, sends them a small cashback through
-              PayPal, and holds a random few back so you can measure whether it worked.
+              Mend finds the regulars who are drifting away, has Claude draft a small cashback
+              thank-you, pays it through PayPal, and holds a random few back so you can measure
+              whether it worked.
             </motion.p>
             <motion.div
               className="mt-6 flex flex-col gap-[10px] md:flex-row md:gap-4"

@@ -217,7 +217,8 @@ export function Console() {
             </aside>
 
             <main id="main" className="min-w-0 lg:col-span-8">
-              <AnimatePresence mode="wait">
+              {/* The next step starts at its own top; the jump happens while neither step is on screen. */}
+              <AnimatePresence mode="wait" onExitComplete={() => window.scrollTo({ top: 0 })}>
                 {checked && (
                   <motion.div
                     key={step}

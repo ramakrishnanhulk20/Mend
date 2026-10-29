@@ -316,6 +316,10 @@ export function RegularsStep({ api, onPlan }: RegularsStepProps) {
           {data.asOf !== null && (
             <p className="mt-2 font-mono text-[12px] text-bone-faint">Records run to {formatDay(data.asOf)}</p>
           )}
+          <p className="mt-2 max-w-[60ch] text-[13px] text-bone-faint">
+            The demo shop replays a UK giftware wholesaler&apos;s real orders, so its totals are large and many
+            regulars have been quiet for a long time.
+          </p>
 
           {rows.length === 0 ? (
             <p className="mt-10 border-t border-rule pt-6 text-[16px] text-bone-dim">No quiet regulars to show right now.</p>

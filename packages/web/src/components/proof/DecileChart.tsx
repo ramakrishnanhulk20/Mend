@@ -416,7 +416,7 @@ export function DecileChart({ state, summary }: BlockProps) {
 
   const deciles = [...backtest.deciles].sort((a, b) => a.decile - b.decile);
   const total = deciles.reduce((sum, d) => sum + d.customers, 0);
-  const caption = `All ${formatCount(total)} customers, ranked by Mend's forecast on ${formatDay(backtest.decileCutoff)} and split into ten groups. Each bar is the share who bought again within ${backtest.holdoutDays} days.`;
+  const caption = `All ${formatCount(total)} customers who had bought by ${formatDay(backtest.decileCutoff)}, ranked by Mend's forecast on that day and split into ten groups. Each bar is the share who bought again within ${backtest.holdoutDays} days.`;
 
   return (
     <ChartFrame titleId={titleId} title={title} caption={caption}>

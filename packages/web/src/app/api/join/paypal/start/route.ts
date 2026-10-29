@@ -23,7 +23,7 @@ const STYLESHEET = [
   "main{max-width:560px;margin:12vh auto;padding:32px 24px;border:1px solid rgba(237,230,218,0.12);border-radius:8px;background:#151312}",
   ".tag{margin:0;font-family:ui-monospace,Menlo,Consolas,monospace;font-size:11px;letter-spacing:0.14em;color:rgba(237,230,218,0.38)}",
   "svg{display:block;margin-top:16px}",
-  'h1{margin:24px 0 0;font-family:"Arial Narrow","Roboto Condensed",system-ui;font-size:40px;line-height:0.95;font-weight:800;letter-spacing:-0.01em;text-transform:uppercase}',
+  'h1{margin:24px 0 0;font-family:"Avenir Next Condensed",Bahnschrift,"Roboto Condensed","Arial Narrow",sans-serif-condensed,system-ui;font-stretch:condensed;font-size:40px;line-height:0.95;font-weight:800;letter-spacing:-0.01em;text-transform:uppercase}',
   ".words{margin:16px 0 0;font-size:16px;line-height:1.55;color:rgba(237,230,218,0.64)}",
   ".note{margin:16px 0 0;font-size:14px;color:rgba(237,230,218,0.38)}",
   "form{margin:32px 0 0}",
@@ -71,7 +71,7 @@ const MARK = [
   "</svg>",
 ].join("\n");
 
-const JOIN_NOTE = "You sign in on PayPal's own page. Mend keeps only your verified email and your PayPal account id, and you can leave at any time.";
+const JOIN_NOTE = "You sign in on PayPal's own page, so Mend never sees your password.";
 
 /**
  * The confirmation a visitor clicks to join or leave, as a Mend card: for a join, the

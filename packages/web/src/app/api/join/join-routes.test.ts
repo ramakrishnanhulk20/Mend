@@ -299,7 +299,7 @@ describe("GET /api/join/paypal/start", () => {
     expect(html).toContain('<path d="M13 12l6 8M19 12l-6 8" stroke="#ff4d2e" stroke-width="2.5" stroke-linecap="round"/>');
     expect(html).toContain(
       '<h1>Copperwick Gifts</h1>\n<p class="words">Copperwick Gifts may look at your past orders.</p>\n' +
-        "<p class=\"note\">You sign in on PayPal's own page. Mend keeps only your verified email and your PayPal account id, and you can leave at any time.</p>",
+        "<p class=\"note\">You sign in on PayPal's own page, so Mend never sees your password.</p>",
     );
     expect(html).toContain('<form method="post" action="/api/join/paypal/start">');
     expect(html).toContain('<input type="hidden" name="intent" value="join">');

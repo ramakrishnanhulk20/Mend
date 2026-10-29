@@ -1,7 +1,9 @@
 "use client";
 
 import { Fragment, useId, useRef } from "react";
-import { motion, useInView, useReducedMotion } from "motion/react";
+import Link from "next/link";
+import { motion, useInView } from "motion/react";
+import { useStill } from "@/components/motion/useStill";
 
 const EASE = [0.22, 1, 0.36, 1] as const;
 
@@ -39,7 +41,7 @@ function rise(still: boolean, delayMs: number) {
 }
 
 export function Closing() {
-  const still = Boolean(useReducedMotion());
+  const still = useStill();
   const titleId = useId();
   const sectionRef = useRef<HTMLElement>(null);
   const titleRef = useRef<HTMLHeadingElement>(null);
@@ -173,8 +175,8 @@ export function Closing() {
           className="mt-10 flex flex-col gap-[10px] md:flex-row md:gap-4"
           {...rise(still, 240)}
         >
-          <a
-            href="#demo-start"
+          <Link
+            href="/demo"
             className={`group/primary ${PRIMARY_BUTTON} h-12 gap-2 px-[22px] text-[15px] ${FOCUS_RING}`}
           >
             Run the live demo
@@ -194,9 +196,9 @@ export function Closing() {
                 strokeLinejoin="round"
               />
             </svg>
-          </a>
-          <a
-            href="#docs"
+          </Link>
+          <Link
+            href="/docs"
             className={`group/secondary inline-flex h-12 items-center text-[15px] text-bone ${FOCUS_RING}`}
           >
             <span className="relative inline-block">
@@ -207,7 +209,7 @@ export function Closing() {
                 className={`${UNDERLINE_DRAW} group-hover/secondary:scale-x-100`}
               />
             </span>
-          </a>
+          </Link>
         </motion.div>
 
         <motion.p

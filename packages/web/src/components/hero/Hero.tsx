@@ -1,7 +1,9 @@
 "use client";
 
 import { useEffect, useRef } from "react";
-import { AnimatePresence, motion, useReducedMotion } from "motion/react";
+import Link from "next/link";
+import { AnimatePresence, motion } from "motion/react";
+import { useStill } from "@/components/motion/useStill";
 import { Mark } from "@/components/brand/Mark";
 import { formatCount, formatUsdCompact } from "@/components/live/summary";
 import { INTRO } from "./loom";
@@ -19,9 +21,9 @@ const UNDERLINE_DRAW =
   "absolute inset-x-0 -bottom-1 h-px origin-left scale-x-0 bg-bone transition-transform duration-200 ease-out";
 
 const NAV_LINKS = [
-  { label: "How it works", href: "#how-it-works" },
-  { label: "Results", href: "#results" },
-  { label: "Docs", href: "#docs" },
+  { label: "How it works", href: "/#how-it-works" },
+  { label: "Results", href: "/#results" },
+  { label: "Docs", href: "/docs" },
 ];
 
 const CREDITS = ["PayPal Payouts", "Log in with PayPal", "BG/NBD forecast", "Random holdout"];
@@ -52,7 +54,7 @@ export type HeroLive = { quietRegulars: number; paid12mMinor: number };
 
 export function Hero({ live = null }: { live?: HeroLive | null }) {
   const sectionRef = useRef<HTMLElement>(null);
-  const still = Boolean(useReducedMotion());
+  const still = useStill();
 
   useEffect(() => {
     const section = sectionRef.current;
@@ -127,33 +129,33 @@ export function Hero({ live = null }: { live?: HeroLive | null }) {
         className="absolute inset-x-0 top-0 flex h-[60px] items-center justify-between px-4 md:h-[72px] md:px-10"
         {...fade(still, 200, 600)}
       >
-        <a href="#top" className={`group inline-flex items-center gap-[10px] text-bone ${FOCUS_RING}`}>
+        <Link href="/#top" className={`group inline-flex items-center gap-[10px] text-bone ${FOCUS_RING}`}>
           <Mark size={22} spinOnHover />
           {/* Inline, because .poster-title sits outside Tailwind's layers and would beat a tracking class. */}
           <span className="poster-title text-[24px]" style={{ letterSpacing: "0.04em" }}>
             Mend
           </span>
-        </a>
+        </Link>
 
         <div className="flex items-center">
           <div className="hidden items-center gap-8 md:flex">
             {NAV_LINKS.map((link) => (
-              <a
+              <Link
                 key={link.href}
                 href={link.href}
                 className={`group/link relative text-[15px] text-bone-dim transition-colors duration-200 ease-out hover:text-bone ${FOCUS_RING}`}
               >
                 {link.label}
                 <span aria-hidden="true" className={`${UNDERLINE_DRAW} group-hover/link:scale-x-100`} />
-              </a>
+              </Link>
             ))}
           </div>
-          <a
-            href="#demo"
+          <Link
+            href="/demo"
             className={`${PRIMARY_BUTTON} h-[38px] px-[14px] text-[14px] md:ml-6 md:h-10 md:px-4 ${FOCUS_RING}`}
           >
             Run the demo
-          </a>
+          </Link>
         </div>
       </motion.nav>
 
@@ -242,8 +244,8 @@ export function Hero({ live = null }: { live?: HeroLive | null }) {
               className="mt-6 flex flex-col gap-[10px] md:flex-row md:gap-4"
               {...fadeRise(still, copyDelay(2), 600, 24)}
             >
-              <a
-                href="#demo"
+              <Link
+                href="/demo"
                 className={`group/primary ${PRIMARY_BUTTON} h-12 gap-2 px-[22px] text-[15px] ${FOCUS_RING}`}
               >
                 Run the live demo
@@ -263,9 +265,9 @@ export function Hero({ live = null }: { live?: HeroLive | null }) {
                     strokeLinejoin="round"
                   />
                 </svg>
-              </a>
-              <a
-                href="#how-it-works"
+              </Link>
+              <Link
+                href="/#how-it-works"
                 className={`group/secondary inline-flex h-12 items-center text-[15px] text-bone ${FOCUS_RING}`}
               >
                 <span className="relative inline-block">
@@ -276,7 +278,7 @@ export function Hero({ live = null }: { live?: HeroLive | null }) {
                     className={`${UNDERLINE_DRAW} group-hover/secondary:scale-x-100`}
                   />
                 </span>
-              </a>
+              </Link>
             </motion.div>
           </div>
         </div>

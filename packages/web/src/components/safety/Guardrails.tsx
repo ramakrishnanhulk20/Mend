@@ -1,7 +1,8 @@
 "use client";
 
 import { useEffect, useId, useRef, useState } from "react";
-import { motion, useInView, useReducedMotion } from "motion/react";
+import { motion, useInView } from "motion/react";
+import { useStill } from "@/components/motion/useStill";
 
 const EASE = [0.22, 1, 0.36, 1] as const;
 
@@ -181,7 +182,7 @@ function Seam({ vertical, show, still }: { vertical: boolean; show: boolean; sti
 }
 
 export function Guardrails() {
-  const still = Boolean(useReducedMotion());
+  const still = useStill();
   const titleId = useId();
   const splitRef = useRef<HTMLDivElement>(null);
   const splitInView = useInView(splitRef, { once: true, amount: 0.3 });

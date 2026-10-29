@@ -1,7 +1,8 @@
 "use client";
 
 import { useEffect, useId, useState, type ReactNode } from "react";
-import { motion, useReducedMotion, type Variants } from "motion/react";
+import { motion, type Variants } from "motion/react";
+import { useStill } from "@/components/motion/useStill";
 import { formatCount, formatDay, formatShare, type ShopSummary } from "@/components/live/summary";
 
 export const EASE = [0.22, 1, 0.36, 1] as const;
@@ -181,7 +182,7 @@ function DecilePlot({
   holdoutDays: number;
   titleId: string;
 }) {
-  const still = Boolean(useReducedMotion());
+  const still = useStill();
   const { ref, box } = useMeasuredBox();
   const [active, setActive] = useState<number | null>(null);
   const [showNumbers, setShowNumbers] = useState(false);

@@ -3,13 +3,13 @@
 import "lenis/dist/lenis.css";
 import { useEffect } from "react";
 import Lenis from "lenis";
-import { useReducedMotion } from "motion/react";
+import { useStill } from "./useStill";
 
 export function SmoothScroll() {
-  const reduceMotion = useReducedMotion();
+  const still = useStill();
 
   useEffect(() => {
-    if (reduceMotion) return;
+    if (still) return;
 
     const lenis = new Lenis({ lerp: 0.1, smoothWheel: true });
     let frameId = 0;
@@ -23,7 +23,7 @@ export function SmoothScroll() {
       cancelAnimationFrame(frameId);
       lenis.destroy();
     };
-  }, [reduceMotion]);
+  }, [still]);
 
   return null;
 }

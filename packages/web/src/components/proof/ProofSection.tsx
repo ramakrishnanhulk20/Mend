@@ -1,7 +1,8 @@
 "use client";
 
 import { useId } from "react";
-import { motion, useReducedMotion } from "motion/react";
+import { motion } from "motion/react";
+import { useStill } from "@/components/motion/useStill";
 import type { ShopSummary } from "@/components/live/summary";
 import { BenchmarkTable } from "./BenchmarkTable";
 import { DecileChart, EASE, FOCUS_RING } from "./DecileChart";
@@ -27,7 +28,7 @@ export function ProofSection({
   slow: boolean;
   retry: () => void;
 }) {
-  const still = Boolean(useReducedMotion());
+  const still = useStill();
   const titleId = useId();
   const source = summary?.backtest?.source ?? null;
   const blockState = state === "ready" ? "ready" : "loading";

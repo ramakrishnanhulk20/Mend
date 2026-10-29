@@ -1,7 +1,8 @@
 "use client";
 
 import { useEffect, useRef, useState, type CSSProperties } from "react";
-import { AnimatePresence, motion, useReducedMotion } from "motion/react";
+import { AnimatePresence, motion } from "motion/react";
+import { useStill } from "@/components/motion/useStill";
 import { ForecastDrawing, JoinDrawing, MeasureDrawing, SplitDrawing } from "./illustrations";
 import { activePanel, sectionProgress } from "./progress";
 
@@ -79,7 +80,7 @@ function CrossStitch() {
 
 export function HowItWorks() {
   const sectionRef = useRef<HTMLElement>(null);
-  const still = Boolean(useReducedMotion());
+  const still = useStill();
   const [active, setActive] = useState(0);
 
   useEffect(() => {

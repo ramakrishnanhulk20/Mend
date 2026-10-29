@@ -1,7 +1,8 @@
 "use client";
 
 import { useId } from "react";
-import { motion, useReducedMotion, type Variants } from "motion/react";
+import { motion, type Variants } from "motion/react";
+import { useStill } from "@/components/motion/useStill";
 import { formatCount } from "@/components/live/summary";
 import { EASE, ChartFrame, ChartPlaceholder, NotMeasured, type BlockProps } from "./DecileChart";
 
@@ -42,7 +43,7 @@ function check(published: number, fitted: number, digits: number): string {
 
 export function BenchmarkTable({ state, summary }: BlockProps) {
   const titleId = useId();
-  const still = Boolean(useReducedMotion());
+  const still = useStill();
   const title = "Reproduces the published model";
   const benchmark = summary?.benchmark ?? null;
 

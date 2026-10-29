@@ -1,7 +1,7 @@
 "use client";
 
 import { useEffect, useRef } from "react";
-import { useReducedMotion } from "motion/react";
+import { useStill } from "@/components/motion/useStill";
 import {
   LOOM_RGB,
   heldProgress,
@@ -162,7 +162,7 @@ function drawLoom(ctx: CanvasRenderingContext2D, scene: Scene, t: number, push: 
 
 export function Loom() {
   const canvasRef = useRef<HTMLCanvasElement>(null);
-  const reduceMotion = useReducedMotion();
+  const still = useStill();
 
   useEffect(() => {
     const canvas = canvasRef.current;
@@ -170,7 +170,6 @@ export function Loom() {
     const ctx = canvas?.getContext("2d");
     if (!canvas || !parent || !ctx) return;
 
-    const still = Boolean(reduceMotion);
     const startedAt = performance.now();
     const pointer = {
       clientX: 0,
@@ -290,7 +289,7 @@ export function Loom() {
       document.documentElement.removeEventListener("pointerleave", onPointerLeave);
       document.removeEventListener("visibilitychange", syncLoop);
     };
-  }, [reduceMotion]);
+  }, [still]);
 
   return <canvas ref={canvasRef} aria-hidden="true" className="absolute inset-0 h-full w-full" />;
 }

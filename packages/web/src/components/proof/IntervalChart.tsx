@@ -1,7 +1,8 @@
 "use client";
 
 import { useId, useState, type ReactNode } from "react";
-import { motion, useReducedMotion, type Variants } from "motion/react";
+import { motion, type Variants } from "motion/react";
+import { useStill } from "@/components/motion/useStill";
 import {
   formatDifference,
   verdict,
@@ -88,7 +89,7 @@ function rangeText(row: Row): string {
 }
 
 function IntervalPlot({ rows, titleId }: { rows: readonly Row[]; titleId: string }) {
-  const still = Boolean(useReducedMotion());
+  const still = useStill();
   const { ref, box } = useMeasuredBox();
   const [active, setActive] = useState<number | null>(null);
   const [showNumbers, setShowNumbers] = useState(false);

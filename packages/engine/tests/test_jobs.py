@@ -17,6 +17,7 @@ import pgserver
 import psycopg
 import pytest
 from psycopg import sql
+from psycopg.types.json import Jsonb
 
 from mend_engine import jobs, tasks
 from mend_engine.config import SANDBOX_API_HOST, Config
@@ -636,6 +637,77 @@ def test_a_batch_read_that_answers_denied_records_every_snapshot_item_as_failed(
     rereads = [row[0] for row in database.execute("select detail from audit_log where action = 'payout_batch_reread' order by id")]
     assert [(r["outcome"], r["items_failed"]) for r in rereads] == [("denied", 3), ("denied", 2)]
     assert jobs.main(["refresh_items"]) == 0 and len(paypal.batch_reads) == 2
+
+
+def local_config(**changes: object) -> Config:
+    """The Config a jobs run under dev:console loads: MEND_DEV on and no DATABASE_URL, unless changed."""
+    settings: dict = {
+        "paypal_client_id": "cid", "paypal_client_secret": "csecret-for-job-tests", "paypal_api_host": SANDBOX_API_HOST,
+        "database_url": None, "dev": True, "test_receiver": None,
+        "item_cap_minor": 1000, "campaign_cap_minor": 10000, "daily_cap_minor": 20000,
+    }
+    return Config(**{**settings, **changes})
+
+
+DEV_WAIT_ENV = {"PAYPAL_ENV": "sandbox", "MEND_DEV_REFRESH_AFTER_SECONDS": "45"}
+
+
+@pytest.mark.parametrize(
+    ("changes", "env"),
+    [
+        ({"dev": False}, {}),
+        ({"database_url": "postgresql://mend@db.internal/mend"}, {}),
+        ({}, {"PAYPAL_ENV": "live"}),
+        ({}, {"MEND_DEV_REFRESH_AFTER_SECONDS": ""}),
+        ({}, {"MEND_DEV_REFRESH_AFTER_SECONDS": "29"}),
+        ({}, {"MEND_DEV_REFRESH_AFTER_SECONDS": "901"}),
+        ({}, {"MEND_DEV_REFRESH_AFTER_SECONDS": "abc"}),
+        ({}, {"MEND_DEV_REFRESH_AFTER_SECONDS": "60.5"}),
+    ],
+    ids=["mend_dev_off", "database_url_set", "paypal_env_live", "empty", "29", "901", "abc", "60.5"],
+)
+def test_the_dev_wait_is_ignored_off_a_local_machine_and_for_anything_but_30_to_900_whole_seconds(changes: dict, env: dict) -> None:
+    assert jobs.dev_refresh_after(local_config(**changes), {**DEV_WAIT_ENV, **env}) is None
+
+
+@pytest.mark.parametrize("raw", ["30", "45", "900"])
+def test_the_dev_wait_is_honoured_on_a_local_machine_from_30_to_900_seconds(raw: str) -> None:
+    assert jobs.dev_refresh_after(local_config(), {**DEV_WAIT_ENV, "MEND_DEV_REFRESH_AFTER_SECONDS": raw}) == timedelta(seconds=int(raw))
+
+
+def read_seconds_ago(conn: psycopg.Connection, campaign_id: uuid.UUID, seconds: int) -> None:
+    """The refresh job last read this campaign's batch seconds ago."""
+    sender_batch_id = conn.execute("select sender_batch_id from payout_batches where campaign_id = %s", (str(campaign_id),)).fetchone()[0]
+    conn.execute(
+        "insert into audit_log (at, actor, action, detail) values (now() - make_interval(secs => %s), 'refresh', 'payout_batch_reread', %s)",
+        (seconds, Jsonb({"sender_batch_id": sender_batch_id, "outcome": "read", "restored": 0, "moved": 0, "skipped": 0})),
+    )
+
+
+def test_on_a_local_machine_a_45_second_wait_reads_a_short_batch_read_50_seconds_ago_and_not_one_read_40_seconds_ago(
+    database: psycopg.Connection, paypal: JobsPayPal, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    due_id, due = sent_campaign(database, "owner", 30, 2)
+    recent_id, recent = sent_campaign(database, "owner", 30, 2)
+    lost_rows(database, due + recent)
+    due_batch, _ = held_batch(database, paypal, due_id, due)
+    held_batch(database, paypal, recent_id, recent)
+    read_seconds_ago(database, due_id, 50)
+    read_seconds_ago(database, recent_id, 40)
+    monkeypatch.setenv("PAYPAL_ENV", "sandbox")
+    monkeypatch.setenv("MEND_DEV_REFRESH_AFTER_SECONDS", "45")
+
+    # The fixture's Config has the deployed shape, MEND_DEV off and DATABASE_URL set, so the setting is ignored.
+    assert jobs.main(["refresh_items"]) == 0
+    assert paypal.batch_reads == []
+
+    # As dev:console runs the jobs: no DATABASE_URL, so the bundled pgserver, with PGOPTIONS naming the schema.
+    monkeypatch.setenv("PGOPTIONS", f"-c search_path={database.execute('select current_schema()').fetchone()[0]}")
+    monkeypatch.setattr(tasks, "_load_config", local_config)
+    assert jobs.main(["refresh_items"]) == 0
+
+    assert paypal.batch_reads == [due_batch] and statuses(database, due) == {"UNCLAIMED"}
+    assert printed(capsys) == [refreshed(), refreshed(batches=1, restored=2, after=45)]
 
 
 def sent_with_member(conn: psycopg.Connection) -> uuid.UUID:

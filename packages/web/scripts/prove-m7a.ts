@@ -20,6 +20,7 @@ import pg from "pg";
 import { closeDatabase } from "../src/server/db";
 import { ACTIONS, authorize, isAllowed, type Action, type PrincipalRole } from "../src/server/permissions";
 import { ENGINE_DIR, holdDevDatabase, SCHEMA_PATH } from "./dev-database";
+import { localEngineDatabase } from "./engine-env";
 
 const WEB_DIR = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const ENV_PATH = path.resolve(WEB_DIR, "..", "..", ".env");
@@ -305,8 +306,7 @@ async function main(): Promise<void> {
     PAYPAL_ENV: "sandbox",
     PAYPAL_CLIENT_ID: clientId,
     PAYPAL_CLIENT_SECRET: clientSecret,
-    MEND_DEV: "1",
-    DATABASE_URL: schemaUrl.href,
+    ...localEngineDatabase(schema),
     MEND_BRIDGE_TOKEN: bridgeToken,
   });
   line(true, `bridge: dev bridge listening on ${bridge.url} (127.0.0.1 only, token required)`);

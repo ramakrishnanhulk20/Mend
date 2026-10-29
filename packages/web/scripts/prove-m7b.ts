@@ -24,6 +24,7 @@ import pg from "pg";
 import { cookieHeader, sessionCookieName } from "../src/server/auth";
 import { anonymousCsrfCookieName } from "../src/server/csrf";
 import { ENGINE_DIR, holdDevDatabase, SCHEMA_PATH } from "./dev-database";
+import { localEngineDatabase } from "./engine-env";
 
 const WEB_DIR = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const ENV_PATH = path.resolve(WEB_DIR, "..", "..", ".env");
@@ -389,9 +390,10 @@ async function main(): Promise<void> {
   await db.query("insert into shop_customers (customer_ref, display_name, email, country) select customer_ref, display_name, email, country from public.shop_customers");
   await db.query("insert into shop_orders (order_ref, customer_ref, ordered_at, total_minor, currency) select order_ref, customer_ref, ordered_at, total_minor, currency from public.shop_orders");
   await db.query("insert into shop_refunds (refund_ref, customer_ref, refunded_at, amount_minor) select refund_ref, customer_ref, refunded_at, amount_minor from public.shop_refunds");
+  // source too, so the demo stand-ins stay stand-ins and the summary splits members as on the live site.
   await db.query(
-    `insert into members (member_id, paypal_email, paypal_payer_id, email_verified, consent_version, consent_text_sha256, client_id, joined_at)
-     select member_id, paypal_email, paypal_payer_id, email_verified, consent_version, consent_text_sha256, client_id, joined_at from public.members`,
+    `insert into members (member_id, paypal_email, paypal_payer_id, email_verified, consent_version, consent_text_sha256, client_id, joined_at, source)
+     select member_id, paypal_email, paypal_payer_id, email_verified, consent_version, consent_text_sha256, client_id, joined_at, source from public.members`,
   );
   await db.query("insert into model_facts (key, value, computed_at) select key, value, computed_at from public.model_facts");
   const copied = (
@@ -422,8 +424,7 @@ async function main(): Promise<void> {
     PAYPAL_ENV: "sandbox",
     PAYPAL_CLIENT_ID: clientId,
     PAYPAL_CLIENT_SECRET: clientSecret,
-    MEND_DEV: "1",
-    DATABASE_URL: schemaUrl.href,
+    ...localEngineDatabase(schema),
     MEND_BRIDGE_TOKEN: bridgeToken,
   });
   build();
@@ -448,7 +449,7 @@ async function main(): Promise<void> {
   const visitor = new Browser(base);
   const summary = await visitor.send("GET", "/api/shop/summary");
   const direct = (
-    await db.query<{ as_of: string; customers: number; members: number; quiet: number; paid: string }>(
+    await db.query<{ as_of: string; customers: number; joined: number; seeded: number; quiet: number; paid: string }>(
       `with days as (
          select customer_ref, (ordered_at at time zone '${LONDON_RULE}')::date as day from shop_orders where currency = 'USD'
        ), per as (
@@ -466,7 +467,8 @@ async function main(): Promise<void> {
        )
        select (select as_of::text from a) as as_of,
               (select count(*)::int from shop_customers) as customers,
-              (select count(*)::int from members) as members,
+              (select count(*)::int from members where source = 'paypal_login') as joined,
+              (select count(*)::int from members where source = 'seed') as seeded,
               (select count(*)::int from quiet) as quiet,
               (select coalesce(sum(greatest(p.total - coalesce(r.total, 0), 0)), 0)::text
                  from paid p join quiet q using (customer_ref) left join refunded r using (customer_ref)) as paid`,
@@ -480,7 +482,10 @@ async function main(): Promise<void> {
       visitor.cookies.size === 0 &&
       summary.body.asOf === direct.as_of &&
       summary.body.shopCustomers === direct.customers &&
-      summary.body.members === direct.members &&
+      summary.body.membersJoined === direct.joined &&
+      summary.body.membersSeeded === direct.seeded &&
+      typeof summary.body.membersSeededLabel === "string" &&
+      summary.body.membersSeededLabel !== "" &&
       summary.body.quietRegulars === direct.quiet &&
       summary.body.quietRegularsPaid12mMinor === Number(direct.paid) &&
       backtest !== null &&
@@ -493,7 +498,7 @@ async function main(): Promise<void> {
     "summary: public summary served without a session; numbers match a direct database read; backtest facts present",
   );
   note(
-    `as of ${String(summary.body.asOf)}: ${String(summary.body.shopCustomers)} customers, ${String(summary.body.members)} members, ${String(summary.body.quietRegulars)} quiet regulars who paid ${(Number(summary.body.quietRegularsPaid12mMinor) / 100).toFixed(2)} USD in 12 months (direct read ${direct.quiet} and ${(Number(direct.paid) / 100).toFixed(2)}); model beats recency at ${String(backtest?.modelWins)} of ${String(backtest?.converged)} cutoffs, CDNOW reproduction passed ${String(benchmark?.passed)}`,
+    `as of ${String(summary.body.asOf)}: ${String(summary.body.shopCustomers)} customers, ${String(summary.body.membersJoined)} members who joined and ${String(summary.body.membersSeeded)} ${String(summary.body.membersSeededLabel)} (direct read ${direct.joined} and ${direct.seeded}), ${String(summary.body.quietRegulars)} quiet regulars who paid ${(Number(summary.body.quietRegularsPaid12mMinor) / 100).toFixed(2)} USD in 12 months (direct read ${direct.quiet} and ${(Number(direct.paid) / 100).toFixed(2)}); model beats recency at ${String(backtest?.modelWins)} of ${String(backtest?.converged)} cutoffs, CDNOW reproduction passed ${String(benchmark?.passed)}`,
   );
 
   // 3. Quiet regulars for a demo session.
@@ -501,7 +506,7 @@ async function main(): Promise<void> {
   const quiet = await demo.settle(await demo.send("GET", "/api/shop/quiet-regulars?limit=50"));
   const rows = (quiet.body.rows ?? []) as Body[];
   const memberIds = (await db.query<{ member_id: string }>("select member_id::text from members")).rows.map((row) => row.member_id);
-  const rowKeys = ["daysSilent", "displayName", "member", "paidNetMinor", "position", "purchaseDays", "score"].join(",");
+  const rowKeys = ["daysSilent", "displayName", "member", "paidNetMinor", "position", "purchaseDays", "score", "standIn"].join(",");
   const anonymousList = await visitor.send("GET", "/api/shop/quiet-regulars?limit=50");
   line(
     quiet.status === 200 &&
@@ -516,7 +521,7 @@ async function main(): Promise<void> {
       anonymousList.status === 401,
     "quiet regulars: demo session sees up to 50 rows, no email, member id or customer ref",
   );
-  note(`${rows.length} of ${String(quiet.body.total)} rows; most at risk: ${String(rows[0]?.displayName)}, ${String(rows[0]?.purchaseDays)} purchase days, ${String(rows[0]?.daysSilent)} days silent`);
+  note(`${rows.length} of ${String(quiet.body.total)} rows, ${rows.filter((row) => row.standIn === true).length} of them demo stand-ins; most at risk: ${String(rows[0]?.displayName)}, ${String(rows[0]?.purchaseDays)} purchase days, ${String(rows[0]?.daysSilent)} days silent`);
 
   // 4 and 5. The journey: drafts until the test receiver is rewarded, view, a wrong hash, approve, submit.
   const receiverMember = (await db.query<{ member_id: string }>("select member_id::text from members where paypal_email = $1", [receiver])).rows[0].member_id;

@@ -20,10 +20,12 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
+import re
 import sys
 import traceback
 import uuid
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from datetime import timedelta
 
 import psycopg
@@ -44,6 +46,7 @@ from mend_engine.campaigns.cancel import (
 )
 from mend_engine.campaigns.simulate import read_order
 from mend_engine.config import Config
+from mend_engine.db.migrate import is_local_development
 from mend_engine.events.payout_status import FINAL_STATUSES
 from mend_engine.events.process import DENIED, batch_header, record_denied_batch, record_simulated_purchase
 from mend_engine.paypal.http import PayPalError, PayPalHttp, PayPalResponse
@@ -68,6 +71,10 @@ _DEMO_WAITING = (
 
 REFRESH_LOCK = 7731300007
 REFRESH_AFTER = timedelta(minutes=15)
+DEV_REFRESH_AFTER_SETTING = "MEND_DEV_REFRESH_AFTER_SECONDS"
+DEV_REFRESH_AFTER_SECONDS = range(30, 901)
+# At most three digits, so no value reaches int() long enough to be slow or to raise.
+_DEV_WAIT_SHAPE = re.compile(r"[0-9]{1,3}")
 REFRESH_MAX_ITEMS = 50
 REFRESH_MAX_BATCHES = 10
 REFRESH_MAX_ORDERS = 10
@@ -118,6 +125,27 @@ _ORDERS_DUE = (
 )
 
 
+def dev_refresh_after(config: Config, env: Mapping[str, str]) -> timedelta | None:
+    """The wait refresh_items uses in place of REFRESH_AFTER on a local machine, or None to keep REFRESH_AFTER.
+
+    No webhook reaches a local machine, so there this job is the only way a submitted
+    batch's items reach the ledger, and 15 minutes hides them from the demo. Returns
+    MEND_DEV_REFRESH_AFTER_SECONDS as a timedelta only when all of these hold:
+    is_local_development(config), the test migrate uses (MEND_DEV on, DATABASE_URL
+    unset); PAYPAL_ENV in env is exactly "sandbox" once trimmed, as load_config reads
+    it; and the setting, trimmed, is a whole number from 30 to 900. Otherwise None:
+    every deployed engine has DATABASE_URL set and MEND_DEV off, so it never applies
+    there. Both values come from env only, never the .env file, the same as the dev
+    bridge's token, because dev:console sets them for each jobs run.
+    """
+    if not is_local_development(config) or (env.get("PAYPAL_ENV") or "").strip() != "sandbox":
+        return None
+    raw = (env.get(DEV_REFRESH_AFTER_SETTING) or "").strip()
+    if not _DEV_WAIT_SHAPE.fullmatch(raw) or int(raw) not in DEV_REFRESH_AFTER_SECONDS:
+        return None
+    return timedelta(seconds=int(raw))
+
+
 def refresh_items() -> dict:
     """Read back from PayPal what Mend's own records say PayPal may still change, so the ledger catches up without a webhook (C10).
 
@@ -154,11 +182,14 @@ def refresh_items() -> dict:
     Every audit row's actor is "refresh". Any error is logged with secrets removed
     under its own ref with the item, batch or order id. Holds its own lock, so two
     runs never overlap; ran is False, with nothing read, when another run holds it.
+    On a local machine dev_refresh_after may replace the 15 minutes in all three
+    reads with 30 seconds to 15 minutes; anywhere else nothing changes.
 
     Returns ran, items (items read), moved (forward moves from item and batch reads),
     unchanged and refused (item reads), failed (item, batch and order reads that
     failed), batches (batches read), restored (rows inserted), skipped (batch items
-    not recorded), orders (orders read) and purchases (purchases attributed).
+    not recorded), orders (orders read) and purchases (purchases attributed), and
+    after, the wait in whole seconds, only when dev_refresh_after set it.
 
     Not covered: an item or batch whose payout_batch_id the ledger lacks is not
     read, nor a simulated order whose PayPal order id was never stored; the webhook
@@ -172,18 +203,21 @@ def refresh_items() -> dict:
             "items": 0, "moved": 0, "unchanged": 0, "refused": 0, "failed": 0,
             "batches": 0, "restored": 0, "skipped": 0, "orders": 0, "purchases": 0,
         }
+        dev_after = dev_refresh_after(config, os.environ)
+        after = REFRESH_AFTER if dev_after is None else dev_after
+        reported = {} if dev_after is None else {"after": int(dev_after.total_seconds())}
         if not conn.execute("select pg_try_advisory_lock(%s)", (REFRESH_LOCK,)).fetchone()[0]:
-            return {"ok": True, "ran": False, **totals}
+            return {"ok": True, "ran": False, **totals, **reported}
         try:
             items = [
                 payout_item_id
                 for (payout_item_id,) in conn.execute(
                     _REFRESH_DUE,
-                    {"settled": sorted(SETTLED_STATUSES), "after": REFRESH_AFTER, "most": REFRESH_MAX_ITEMS},
+                    {"settled": sorted(SETTLED_STATUSES), "after": after, "most": REFRESH_MAX_ITEMS},
                 )
             ]
-            batches = [row[0] for row in conn.execute(_SHORT_BATCHES_DUE, {"after": REFRESH_AFTER, "most": REFRESH_MAX_BATCHES})]
-            orders = [row[0] for row in conn.execute(_ORDERS_DUE, {"after": REFRESH_AFTER, "most": REFRESH_MAX_ORDERS})]
+            batches = [row[0] for row in conn.execute(_SHORT_BATCHES_DUE, {"after": after, "most": REFRESH_MAX_BATCHES})]
+            orders = [row[0] for row in conn.execute(_ORDERS_DUE, {"after": after, "most": REFRESH_MAX_ORDERS})]
             if items or batches or orders:
                 with tasks._paypal_client(config) as http:
                     _refresh_items(config, conn, http, items, totals)
@@ -191,7 +225,7 @@ def refresh_items() -> dict:
                     _record_orders(config, conn, http, orders, totals)
         finally:
             conn.execute("select pg_advisory_unlock(%s)", (REFRESH_LOCK,))
-        return {"ok": True, "ran": True, **totals}
+        return {"ok": True, "ran": True, **totals, **reported}
 
     return tasks._run("refresh_items", work)
 

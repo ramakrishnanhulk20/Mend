@@ -15,8 +15,9 @@ Spend is the amount of every item PayPal says is SUCCESS or still PENDING (an
 unknown status counts as PENDING), priced from the frozen approved snapshot by sender_item_id.
 The payouts block prices every item of the batch the same way and says where each
 one stands, so a reward that failed, waits unclaimed or came back is shown plainly.
-The rows say the same for each customer on their own, by ref only, read from Mend's
-ledger and records and never from PayPal, so a results read costs no PayPal call.
+The rows say the same for each customer on their own, by ref and the shop's synthetic
+display name only, read from Mend's ledger and records and never from PayPal, so a
+results read costs no PayPal call.
 """
 
 from __future__ import annotations
@@ -34,8 +35,8 @@ from mend_engine.campaigns.approval import frozen_snapshot
 from mend_engine.campaigns.attribution import attribution_window
 from mend_engine.campaigns.spend import database_now
 from mend_engine.events.payout_status import UNREADABLE, effective
-from mend_engine.members.membership import SOURCE_SEED
-from mend_engine.paypal.payouts import BatchSnapshot
+from mend_engine.members.membership import SOURCE_SEED, customer_refs_by_email
+from mend_engine.paypal.payouts import BatchSnapshot, normalise_email
 
 MIN_PER_ARM = 30
 MIN_EXPECTED_RETURNS = 5
@@ -95,9 +96,10 @@ class ArmResults:
 
 @dataclass(frozen=True)
 class RowStanding:
-    """One campaign row, rewarded or held back, by ref only: never a member, customer or PayPal identifier (C12, C15).
+    """One campaign row, rewarded or held back: never a member, customer or PayPal identifier (C12, C15).
 
-    payout_status is the reward's payout item status exactly as Mend's ledger stores
+    display_name is display_names' rule: the shop's synthetic name for the row's
+    customer, or None once its member left. payout_status is the reward's payout item status exactly as Mend's ledger stores
     it; None for a held-back row, whatever the ledger holds under its ref, and for a
     reward with no item in the ledger yet; UNKNOWN, the ledger's word for a status it
     cannot read, for an item stored twice or under a status that is not 1 to 32
@@ -109,6 +111,7 @@ class RowStanding:
     ref: str
     role: str
     rank: int
+    display_name: str | None
     stand_in: bool
     payout_status: str | None
     simulated_return: bool
@@ -233,9 +236,32 @@ def stand_in_refs(conn: psycopg.Connection, campaign_id: uuid.UUID) -> frozenset
     )
 
 
+def display_names(conn: psycopg.Connection, campaign_id: uuid.UUID) -> dict[str, str | None]:
+    """Each row's customer's synthetic display name (shop_customers), the name the quiet regulars list shows, by ref.
+
+    The customer is the one a verified member's email matches by the one email
+    normaliser, as eligibility matched them when the campaign was drafted. A row
+    whose member left has no member (its member_id is emptied once the campaign is
+    past approval) and maps to None, as would a member whose email no longer matches
+    exactly one shop customer. The name is never rebuilt from the snapshot's
+    receiver, so nobody who left is named again (C28).
+    """
+    emails = conn.execute(
+        "select cm.ref, m.paypal_email from campaign_members cm "
+        "left join members m on m.member_id = cm.member_id and m.email_verified where cm.campaign_id = %s",
+        (campaign_id,),
+    ).fetchall()
+    refs = customer_refs_by_email(conn)
+    customer_of = {ref: refs.get(normalise_email(email)) if email is not None else None for ref, email in emails}
+    wanted = sorted({customer for customer in customer_of.values() if customer is not None})
+    names = dict(conn.execute("select customer_ref, display_name from shop_customers where customer_ref = any(%s)", (wanted,)))
+    return {ref: names.get(customer) if customer is not None else None for ref, customer in customer_of.items()}
+
+
 def _row_standings(conn: psycopg.Connection, campaign_id: uuid.UUID) -> tuple[RowStanding, ...]:
     """Every row of the campaign in rank order, as RowStanding says."""
     stand_ins = stand_in_refs(conn, campaign_id)
+    names = display_names(conn, campaign_id)
     # A payout item's sender_item_id is its row's ref (approval.current_snapshot).
     ledger: dict[str, list[str]] = {}
     for sender_item_id, status in conn.execute(
@@ -253,6 +279,7 @@ def _row_standings(conn: psycopg.Connection, campaign_id: uuid.UUID) -> tuple[Ro
             ref=ref,
             role=role,
             rank=rank,
+            display_name=names.get(ref),
             stand_in=ref in stand_ins,
             payout_status=_shown_status(ledger.get(ref, [])) if role == "reward" else None,
             simulated_return=(ref, True) in returned,

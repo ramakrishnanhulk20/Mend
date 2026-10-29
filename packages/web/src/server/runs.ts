@@ -41,8 +41,14 @@ const campaignId = z.uuid();
 const status = z.string().regex(/^[a-z_]{1,32}$/);
 const memberRef = z.string().regex(/^R[1-9][0-9]{0,3}$/);
 // Letters, digits, spaces and ordinary punctuation only: no control or invisible
-// characters, and no "@" so an email can never pass for a name.
-const displayName = z.string().min(1).max(80).regex(/^[^\p{Cc}\p{Cf}@]+$/u);
+// characters, and no "@" so an email can never pass for a name. A member or campaign id
+// (a UUID) is refused too, so a mixed-up column cannot show an id as a name.
+const displayName = z
+  .string()
+  .min(1)
+  .max(80)
+  .regex(/^[^\p{Cc}\p{Cf}@]+$/u)
+  .refine((name) => !/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/i.test(name), "an id is not a name");
 // No character from Unicode's "other" group (controls, invisible format marks,
 // private-use, unassigned), the same rule the engine applies to a shop name.
 const shopName = z.string().min(1).max(100).regex(/^\P{C}+$/u);
@@ -87,6 +93,7 @@ const ROW_ANSWER = z.strictObject({
   ref: memberRef,
   role: z.enum(["reward", "holdout"]),
   rank: z.number().int().min(1),
+  display_name: displayName.nullable(),
   amount_minor: cents.nullable(),
   note: z.string().max(400).nullable(),
   stand_in: z.boolean(),
@@ -95,13 +102,14 @@ const ROW_ANSWER = z.strictObject({
 // A reward's payout item status as Mend's ledger stores it; the engine shows any other
 // stored text as UNKNOWN (campaigns/results.py _SHOWN_STATUS), so this matches its rule.
 const payoutStatus = z.string().regex(/^[A-Z_]{1,32}$/);
-// One customer's thread in a campaign, by ref only (C15). A held-back row never carries a
+// One customer's thread in a campaign, by ref and the shop's synthetic name only (C15). A held-back row never carries a
 // payout status: if one ever did, a held-back customer was paid, so the answer is refused.
 const RESULT_ROW_ANSWER = z
   .strictObject({
     ref: memberRef,
     role: z.enum(["reward", "holdout"]),
     rank: z.number().int().min(1),
+    display_name: displayName.nullable(),
     stand_in: z.boolean(),
     payout_status: payoutStatus.nullable(),
     simulated_return: z.boolean(),
@@ -112,6 +120,7 @@ const RESULT_ROW = z.strictObject({
   ref: memberRef,
   role: z.enum(["reward", "holdout"]),
   rank: z.number().int().min(1),
+  displayName: displayName.nullable(),
   standIn: z.boolean(),
   payoutStatus: payoutStatus.nullable(),
   simulatedReturn: z.boolean(),
@@ -123,6 +132,7 @@ function resultRow(answer: z.output<typeof RESULT_ROW_ANSWER>): z.input<typeof R
     ref: answer.ref,
     role: answer.role,
     rank: answer.rank,
+    displayName: answer.display_name,
     standIn: answer.stand_in,
     payoutStatus: answer.payout_status,
     simulatedReturn: answer.simulated_return,
@@ -373,7 +383,15 @@ const SPECS: Readonly<Record<TaskName, Spec>> = {
       perRecipientMinor: a.per_recipient_minor,
       holdoutShare: a.holdout_share,
       totalMinor: a.total_minor,
-      rows: a.rows.map((row) => ({ ref: row.ref, role: row.role, rank: row.rank, amountMinor: row.amount_minor, note: row.note, standIn: row.stand_in })),
+      rows: a.rows.map((row) => ({
+        ref: row.ref,
+        role: row.role,
+        rank: row.rank,
+        displayName: row.display_name,
+        amountMinor: row.amount_minor,
+        note: row.note,
+        standIn: row.stand_in,
+      })),
       reviewHash: a.review_hash,
       reviewProblem: a.review_problem,
     }),
@@ -392,6 +410,7 @@ const SPECS: Readonly<Record<TaskName, Spec>> = {
             ref: memberRef,
             role: z.enum(["reward", "holdout"]),
             rank: z.number().int().min(1),
+            displayName: displayName.nullable(),
             amountMinor: cents.nullable(),
             note: z.string().max(400).nullable(),
             standIn: z.boolean(),

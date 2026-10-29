@@ -1,7 +1,8 @@
 // Covers run ownership against a real Postgres schema, how each task's engine answer
 // becomes its route's response (success bodies, refusals, malformed answers, results
-// with no p-value yet, each campaign row's payout status, returns and stand-in flag in
-// results and the view and on each quiet regular, a cancel PayPal cut short, and the
+// with no p-value yet, each campaign row's payout status, returns, display name (or null
+// for a member who left) and stand-in flag in results and the view and on each quiet
+// regular, a cancel PayPal cut short, and the
 // no-email, no-UUID rule on summary and quiet-regular output), and the orders a session bought through simulate
 // being remembered for that session alone, from the direct and the polled answer, at
 // most 50 for 24 hours. Does NOT cover: the route handlers themselves (npm run
@@ -123,13 +124,13 @@ const SUMMARY = {
   benchmark: BENCHMARK,
   backtest: BACKTEST,
 } as const;
-// Three rows exactly as the engine's results task answered them in its own test: a held-back
+// Three rows in the shape the engine's results task answers them in its own tests: a held-back
 // customer with a real return, a demo stand-in's reward still unclaimed, and a claimed reward
-// with a simulated return.
+// with a simulated return whose member has since left, so it carries no name.
 const RESULT_ROWS = [
-  { ref: "R1", role: "holdout", rank: 1, stand_in: false, payout_status: null, simulated_return: false, real_return: true },
-  { ref: "R2", role: "reward", rank: 2, stand_in: true, payout_status: "UNCLAIMED", simulated_return: false, real_return: false },
-  { ref: "R5", role: "reward", rank: 5, stand_in: false, payout_status: "SUCCESS", simulated_return: true, real_return: false },
+  { ref: "R1", role: "holdout", rank: 1, display_name: "Priya X.", stand_in: false, payout_status: null, simulated_return: false, real_return: true },
+  { ref: "R2", role: "reward", rank: 2, display_name: "Arjun K.", stand_in: true, payout_status: "UNCLAIMED", simulated_return: false, real_return: false },
+  { ref: "R5", role: "reward", rank: 5, display_name: null, stand_in: false, payout_status: "SUCCESS", simulated_return: true, real_return: false },
 ];
 const RESULTS = {
   ok: true as const,
@@ -158,8 +159,8 @@ const VIEW = {
   holdout_share: "0.50",
   total_minor: 200,
   rows: [
-    { ref: "R1", role: "holdout", rank: 1, amount_minor: null, note: null, stand_in: false },
-    { ref: "R2", role: "reward", rank: 2, amount_minor: 200, note: "Thank you for shopping with us.", stand_in: true },
+    { ref: "R1", role: "holdout", rank: 1, amount_minor: null, note: null, display_name: "Priya X.", stand_in: false },
+    { ref: "R2", role: "reward", rank: 2, amount_minor: 200, note: "Thank you for shopping with us.", display_name: "Arjun K.", stand_in: true },
   ],
   review_hash: "e".repeat(64),
   review_problem: null,
@@ -513,13 +514,13 @@ describe("finished runs become each route's own response", () => {
     }
   });
 
-  it("results carry every row in camelCase: its payout status, its returns and whether it is a demo stand-in", async () => {
+  it("results carry every row in camelCase: its customer's name or null, its payout status, its returns and whether it is a demo stand-in", async () => {
     const answered = finished("results", RESULTS);
     expect(answered.status).toBe(200);
     expect((await answered.json()).rows).toEqual([
-      { ref: "R1", role: "holdout", rank: 1, standIn: false, payoutStatus: null, simulatedReturn: false, realReturn: true },
-      { ref: "R2", role: "reward", rank: 2, standIn: true, payoutStatus: "UNCLAIMED", simulatedReturn: false, realReturn: false },
-      { ref: "R5", role: "reward", rank: 5, standIn: false, payoutStatus: "SUCCESS", simulatedReturn: true, realReturn: false },
+      { ref: "R1", role: "holdout", rank: 1, displayName: "Priya X.", standIn: false, payoutStatus: null, simulatedReturn: false, realReturn: true },
+      { ref: "R2", role: "reward", rank: 2, displayName: "Arjun K.", standIn: true, payoutStatus: "UNCLAIMED", simulatedReturn: false, realReturn: false },
+      { ref: "R5", role: "reward", rank: 5, displayName: null, standIn: false, payoutStatus: "SUCCESS", simulatedReturn: true, realReturn: false },
     ]);
   });
 
@@ -535,6 +536,14 @@ describe("finished runs become each route's own response", () => {
     ["the stand-in flag as text", { rows: [{ ...reward, stand_in: "true" }] }],
     ["no stand-in flag", { rows: [{ ...reward, stand_in: undefined }] }],
     ["a held-back row with a payout status", { rows: [{ ...RESULT_ROWS[0], payout_status: "SUCCESS" }] }],
+    ["no display name", { rows: [{ ...reward, display_name: undefined }] }],
+    ["an email for a name", { rows: [{ ...reward, display_name: "maya@shop.example" }] }],
+    ["a member id for a name", { rows: [{ ...reward, display_name: CAMPAIGN }] }],
+    ["an empty name", { rows: [{ ...reward, display_name: "" }] }],
+    ["a name of 81 characters", { rows: [{ ...reward, display_name: "M".repeat(81) }] }],
+    ["a control character in a name", { rows: [{ ...reward, display_name: "Maya\u202eR." }] }],
+    ["a customer ref", { rows: [{ ...reward, customer_ref: "C1042" }] }],
+    ["a payer id", { rows: [{ ...reward, payer_id: "PAYERX7K2M9QZ" }] }],
     ["more than 250 rows", { rows: Array.from({ length: 251 }, () => reward) }],
   ])("results with %s are refused with a generic 500", async (_label, change) => {
     const response = finished("results", { ...RESULTS, ...change });
@@ -542,15 +551,35 @@ describe("finished runs become each route's own response", () => {
     expect(await response.text()).not.toMatch(/maya|ITEM1|0b6c2f8e|script/i);
   });
 
-  it("a campaign view's rows carry the stand-in flag, and a row without it or with an extra key is refused", async () => {
+  it("a campaign view's rows carry the customer's name and the stand-in flag, and a row without either or with an extra key is refused", async () => {
     expect((await finished("view_campaign", VIEW).json()).rows).toEqual([
-      { ref: "R1", role: "holdout", rank: 1, amountMinor: null, note: null, standIn: false },
-      { ref: "R2", role: "reward", rank: 2, amountMinor: 200, note: "Thank you for shopping with us.", standIn: true },
+      { ref: "R1", role: "holdout", rank: 1, amountMinor: null, note: null, displayName: "Priya X.", standIn: false },
+      { ref: "R2", role: "reward", rank: 2, amountMinor: 200, note: "Thank you for shopping with us.", displayName: "Arjun K.", standIn: true },
     ]);
     const row = VIEW.rows[1];
-    for (const changed of [{ ...row, stand_in: undefined }, { ...row, stand_in: 1 }, { ...row, member_id: CAMPAIGN }]) {
+    for (const changed of [{ ...row, stand_in: undefined }, { ...row, stand_in: 1 }, { ...row, member_id: CAMPAIGN }, { ...row, display_name: undefined }]) {
       expect(finished("view_campaign", { ...VIEW, rows: [changed] }).status, JSON.stringify(changed)).toBe(500);
     }
+  });
+
+  it("a view row whose member left carries a null name", async () => {
+    const left = { ...VIEW.rows[1], display_name: null };
+    expect((await finished("view_campaign", { ...VIEW, rows: [left] }).json()).rows).toEqual([
+      { ref: "R2", role: "reward", rank: 2, amountMinor: 200, note: "Thank you for shopping with us.", displayName: null, standIn: true },
+    ]);
+  });
+
+  it.each([
+    ["an email for a name", "maya@shop.example"],
+    ["a member id for a name", CAMPAIGN],
+    ["an empty name", ""],
+    ["a name of 81 characters", "M".repeat(81)],
+    ["a control character in a name", "Maya\u202eR."],
+    ["a name as a number", 7],
+  ])("a campaign view is refused with a generic 500 for %s", async (_label, name) => {
+    const response = finished("view_campaign", { ...VIEW, rows: [{ ...VIEW.rows[1], display_name: name }] });
+    expect(response.status).toBe(500);
+    expect(await response.text()).not.toMatch(/maya|0b6c2f8e/i);
   });
 
   // The live run of 28 Oct: three rewards returned, PayPal failing the fourth with a 500.

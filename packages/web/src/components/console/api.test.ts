@@ -299,6 +299,36 @@ describe("the campaign calls", () => {
     expect(view.reviewHash).toBe(HASH);
   });
 
+  it("keeps a row's displayName when it is a string", async () => {
+    const named = { ...VIEW, rows: [{ ...VIEW.rows[0], displayName: "Priya X." }] };
+    const { fetchFn } = fakeFetch(() => json(200, named));
+    const view = await createConsoleApi(fetchFn).view(CAMPAIGN);
+
+    expect(view.rows[0].displayName).toBe("Priya X.");
+  });
+
+  it("reads a row whose displayName is null because the customer left the list", async () => {
+    const left = { ...VIEW, rows: [{ ...VIEW.rows[0], displayName: null }] };
+    const { fetchFn } = fakeFetch(() => json(200, left));
+    const view = await createConsoleApi(fetchFn).view(CAMPAIGN);
+
+    expect(view.rows[0].displayName).toBeNull();
+  });
+
+  it("reads a row with no displayName at all, as older answers have", async () => {
+    const { fetchFn } = fakeFetch(() => json(200, VIEW));
+    const view = await createConsoleApi(fetchFn).view(CAMPAIGN);
+
+    expect(view.rows[0].displayName).toBeUndefined();
+  });
+
+  it("refuses a view whose displayName is not text", async () => {
+    const bad = { ...VIEW, rows: [{ ...VIEW.rows[0], displayName: 7 }] };
+    const { fetchFn } = fakeFetch(() => json(200, bad));
+
+    await expect(createConsoleApi(fetchFn).view(CAMPAIGN)).rejects.toMatchObject({ code: "unexpected_answer" });
+  });
+
   it("sends the presented hash with an approval", async () => {
     let sent: unknown = null;
     const fetchFn = (async (input: RequestInfo | URL, init?: RequestInit) => {
@@ -442,6 +472,17 @@ describe("the payout and results calls", () => {
       ["R2", "UNCLAIMED", true],
       ["R6", null, false],
     ]);
+  });
+
+  it("reads a results row's displayName as a string, as null, or absent", async () => {
+    const mixed = {
+      ...RESULTS,
+      rows: [{ ...RESULTS.rows[0], displayName: "Priya X." }, { ...RESULTS.rows[1], displayName: null }, RESULTS.rows[2]],
+    };
+    const { fetchFn } = fakeFetch(() => json(200, mixed));
+    const results = await createConsoleApi(fetchFn).results(CAMPAIGN);
+
+    expect(results.rows.map((row) => row.displayName)).toEqual(["Priya X.", null, undefined]);
   });
 
   it("refuses results whose rows have an unknown role", async () => {

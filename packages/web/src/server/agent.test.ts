@@ -193,9 +193,9 @@ const VIEW = {
   holdout_share: "0.50",
   total_minor: 20,
   rows: [
-    { ref: "R1", role: "reward", rank: 1, amount_minor: 10, note: "Thank you for the teapot.", stand_in: false },
-    { ref: "R2", role: "holdout", rank: 2, amount_minor: null, note: null, stand_in: false },
-    { ref: "R3", role: "reward", rank: 3, amount_minor: 10, note: "Thank you for the mug.", stand_in: true },
+    { ref: "R1", role: "reward", rank: 1, amount_minor: 10, note: "Thank you for the teapot.", display_name: "Anya O.", stand_in: false },
+    { ref: "R2", role: "holdout", rank: 2, amount_minor: null, note: null, display_name: "Priya X.", stand_in: false },
+    { ref: "R3", role: "reward", rank: 3, amount_minor: 10, note: "Thank you for the mug.", display_name: "Arjun K.", stand_in: true },
   ],
   review_hash: "a".repeat(64),
   review_problem: null,
@@ -600,10 +600,10 @@ describe("the agent's tools", () => {
         unclaimed_return_by: "2026-11-23T05:00:00+00:00",
       },
       rows: [
-        { ref: "R1", role: "reward", rank: 1, stand_in: false, payout_status: "SUCCESS", simulated_return: true, real_return: false },
-        { ref: "R2", role: "holdout", rank: 2, stand_in: false, payout_status: null, simulated_return: true, real_return: false },
-        { ref: "R3", role: "reward", rank: 3, stand_in: true, payout_status: "UNCLAIMED", simulated_return: false, real_return: false },
-        { ref: "R4", role: "reward", rank: 4, stand_in: true, payout_status: "RETURNED", simulated_return: false, real_return: false },
+        { ref: "R1", role: "reward", rank: 1, display_name: "Anya O.", stand_in: false, payout_status: "SUCCESS", simulated_return: true, real_return: false },
+        { ref: "R2", role: "holdout", rank: 2, display_name: "Priya X.", stand_in: false, payout_status: null, simulated_return: true, real_return: false },
+        { ref: "R3", role: "reward", rank: 3, display_name: "Arjun K.", stand_in: true, payout_status: "UNCLAIMED", simulated_return: false, real_return: false },
+        { ref: "R4", role: "reward", rank: 4, display_name: null, stand_in: true, payout_status: "RETURNED", simulated_return: false, real_return: false },
       ],
     });
     const current = turn("demo");

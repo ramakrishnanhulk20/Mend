@@ -291,6 +291,9 @@ function ThreadRow({
       </div>
 
       <div className="col-span-2 row-start-3 min-w-0 md:col-span-1 md:col-start-3 md:row-start-1">
+        {typeof row.displayName === "string" && row.displayName !== "" && (
+          <p className="text-[15px] font-medium leading-[1.5] text-bone">{row.displayName}</p>
+        )}
         {reward ? (
           row.note !== null && <p className="text-[15px] leading-[1.5] text-bone">{row.note}</p>
         ) : (

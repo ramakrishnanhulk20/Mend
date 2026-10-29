@@ -55,7 +55,7 @@ from mend_engine.campaigns.cancel import _error_detail as paypal_error_detail
 from mend_engine.campaigns.drafts import NOTE_TEMPLATE, DraftRefused, DraftSettings, build_draft, draft_view
 from mend_engine.campaigns.eligibility import OWNER_SCOPE, REGULAR_MIN_DAYS, SILENT_MIN_DAYS, DraftScope, drafting_for
 from mend_engine.campaigns.reconcile import reconcile as reconcile_campaigns
-from mend_engine.campaigns.results import ArmResults, PayoutStanding, RowStanding, campaign_results, stand_in_refs
+from mend_engine.campaigns.results import ArmResults, PayoutStanding, RowStanding, campaign_results, display_names, stand_in_refs
 from mend_engine.campaigns.scoring import SHOP_ZONE, ScoreSet, score_customers
 from mend_engine.campaigns import spend
 from mend_engine.campaigns.spend import (
@@ -292,8 +292,10 @@ def draft_campaign(settings: object, actor: object) -> dict:
 def view_campaign(campaign_id: object, actor: object) -> dict:
     """The campaign as its creator (or the owner) may see it: settings, rows and the hash to approve.
 
-    Rows carry ref, role, rank, amount_minor, note and stand_in only: no email,
-    member id or customer ref (C12, C15). stand_in is True for a row whose member the
+    Rows carry ref, role, rank, amount_minor, note, display_name and stand_in only:
+    no email, member id or customer ref (C12, C15). display_name is the shop's
+    synthetic name for the row's customer, the one quiet_regulars shows, or None once
+    its member left (results.display_names). stand_in is True for a row whose member the
     demo seed script joined (results.stand_in_refs). review_hash is the hash
     approve_campaign needs back, or None when the campaign is not open or cannot be
     approved as it stands (review_problem then names the fixed reason).
@@ -307,7 +309,8 @@ def view_campaign(campaign_id: object, actor: object) -> dict:
             (cid,),
         ).fetchone()
         stand_ins = stand_in_refs(conn, cid)
-        rows = [{**row, "stand_in": row["ref"] in stand_ins} for row in draft_view(conn, cid)]
+        names = display_names(conn, cid)
+        rows = [{**row, "display_name": names.get(row["ref"]), "stand_in": row["ref"] in stand_ins} for row in draft_view(conn, cid)]
         hash_shown: str | None = None
         problem: str | None = None
         if status in OPEN_STATUSES:
@@ -444,9 +447,11 @@ def results(campaign_id: object, actor: object) -> dict:
     items, by_status, claimed_minor, unclaimed_minor, returned_minor, failed_minor,
     pending_minor and unclaimed_return_by (UTC ISO 8601 text, or None). rows holds
     every rewarded and held-back row in rank order (campaigns.results.RowStanding):
-    ref, role, rank, stand_in, payout_status, simulated_return and real_return, read
-    from Mend's ledger and records with no PayPal call, and never a name, email,
-    member id, customer ref, payer id, payout item id or receiver (C12, C15).
+    ref, role, rank, display_name (the shop's synthetic name for the customer, as
+    quiet_regulars shows it, or None once the row's member left), stand_in,
+    payout_status, simulated_return and real_return, read from Mend's ledger and
+    records with no PayPal call, and never an email, member id, customer ref, payer
+    id, payout item id or receiver (C12, C15).
     """
 
     def work(config: Config, conn: psycopg.Connection) -> dict:
@@ -1285,6 +1290,7 @@ def _row(row: RowStanding) -> dict:
         "ref": row.ref,
         "role": row.role,
         "rank": row.rank,
+        "display_name": row.display_name,
         "stand_in": row.stand_in,
         "payout_status": row.payout_status,
         "simulated_return": row.simulated_return,

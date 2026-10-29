@@ -94,8 +94,8 @@ const ANSWERS: Record<string, unknown> = {
     holdout_share: "0.2",
     total_minor: 900,
     rows: [
-      { ref: "R1", role: "holdout", rank: 1, amount_minor: null, note: null, stand_in: false },
-      { ref: "R2", role: "reward", rank: 2, amount_minor: 100, note: "Thank you for shopping with us.", stand_in: true },
+      { ref: "R1", role: "holdout", rank: 1, amount_minor: null, note: null, display_name: "Priya X.", stand_in: false },
+      { ref: "R2", role: "reward", rank: 2, amount_minor: 100, note: "Thank you for shopping with us.", display_name: "Anya O.", stand_in: true },
     ],
     review_hash: HASH,
     review_problem: null,
@@ -118,8 +118,8 @@ const ANSWERS: Record<string, unknown> = {
     verdict: "too early to tell",
     payouts: PAYOUTS,
     rows: [
-      { ref: "R1", role: "holdout", rank: 1, stand_in: false, payout_status: null, simulated_return: false, real_return: false },
-      { ref: "R2", role: "reward", rank: 2, stand_in: true, payout_status: "UNCLAIMED", simulated_return: true, real_return: false },
+      { ref: "R1", role: "holdout", rank: 1, display_name: "Priya X.", stand_in: false, payout_status: null, simulated_return: false, real_return: false },
+      { ref: "R2", role: "reward", rank: 2, display_name: "Anya O.", stand_in: true, payout_status: "UNCLAIMED", simulated_return: true, real_return: false },
     ],
   },
   cancel_unclaimed: {

@@ -257,7 +257,8 @@ export function ResultsStep({ api, campaignId, onNewPlan, onOrder }: ResultsStep
               >
                 {results.rows.map((row) => (
                   <option key={row.ref} value={row.ref}>
-                    #{row.rank} &middot; {row.role === "reward" ? "paid" : "held back"}
+                    #{row.rank} &middot; {typeof row.displayName === "string" && row.displayName !== "" ? `${row.displayName} · ` : ""}
+                    {row.role === "reward" ? "paid" : "held back"}
                   </option>
                 ))}
               </select>

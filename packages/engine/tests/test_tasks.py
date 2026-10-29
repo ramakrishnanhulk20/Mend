@@ -31,7 +31,7 @@ from mend_engine.config import SANDBOX_API_HOST, Config, ConfigError
 from mend_engine.db.connect import PGDATA, connect
 from mend_engine.db.migrate import apply_schema
 from mend_engine.members.consent import DEMO_SHOP_NAME
-from mend_engine.members.membership import join_member
+from mend_engine.members.membership import join_member, leave_member
 from mend_engine.paypal import payouts
 from mend_engine.paypal.http import PayPalError, PayPalHttp
 from mend_engine.paypal.payouts import BatchSnapshot, PayoutItemSpec, SnapshotRefused, canonical_json, sender_batch_id_for, snapshot_hash
@@ -446,7 +446,7 @@ def test_a_demo_actor_approves_and_submits_under_demo_caps(conn: psycopg.Connect
     campaign_id = tasks.draft_campaign(DEMO_SETTINGS, demo)["campaign_id"]
     view = tasks.view_campaign(campaign_id, demo)
     assert view["ok"] and view["status"] == "draft" and len(view["rows"]) == 10
-    assert all(set(row) == {"ref", "role", "rank", "amount_minor", "note", "stand_in"} for row in view["rows"])
+    assert all(set(row) == {"ref", "role", "rank", "amount_minor", "note", "display_name", "stand_in"} for row in view["rows"])
     assert "@" not in json.dumps(view["rows"])
 
     approval = tasks.approve_campaign(campaign_id, demo, view["review_hash"])
@@ -693,8 +693,8 @@ def test_each_row_shows_its_payout_its_returns_and_whether_it_is_a_stand_in_and_
     shown = {stand_in: "UNCLAIMED", joined: "SUCCESS", rewards[2]: "PROCESSING_LATER", rewards[3]: "UNKNOWN"}
     assert found["ok"] is True and found["rows"] == [
         {
-            "ref": ref, "role": roles[ref], "rank": int(ref[1:]), "stand_in": ref == stand_in, "payout_status": shown.get(ref),
-            "simulated_return": ref == joined, "real_return": ref == holdouts[0],
+            "ref": ref, "role": roles[ref], "rank": int(ref[1:]), "display_name": "Maya R.", "stand_in": ref == stand_in,
+            "payout_status": shown.get(ref), "simulated_return": ref == joined, "real_return": ref == holdouts[0],
         }
         for ref in ordered
     ]
@@ -703,6 +703,46 @@ def test_each_row_shows_its_payout_its_returns_and_whether_it_is_a_stand_in_and_
     item_ids = [r[0] for r in conn.execute("select payout_item_id from payout_items")]
     assert "@" not in text and "PAYERX7K2M9QZ" not in text and not re.search(r"C1[0-9]{3}", text)
     assert not any(member_id in text for member_id in member_ids) and not any(item_id in text for item_id in item_ids)
+
+
+def test_each_row_carries_the_name_the_quiet_regulars_list_shows_for_its_customer_and_none_once_its_member_left(
+    conn: psycopg.Connection, paypal: FakePayPal
+) -> None:
+    seed_shop(conn)
+    # Every row looks alike in the seed, so each customer gets its own name to check its row by.
+    refs = [ref for (ref,) in conn.execute("select customer_ref from shop_customers order by customer_ref")]
+    named = {f"Shopper {n}": ref for n, ref in enumerate(refs)}
+    with conn.cursor() as cur:
+        cur.executemany("update shop_customers set display_name = %s where customer_ref = %s", list(named.items()))
+    demo = actor(conn, "demo")
+    listed = {named[row["display_name"]]: row["display_name"] for row in tasks.quiet_regulars(demo, 50)["rows"]}
+    campaign_id = tasks.draft_campaign(DEMO_SETTINGS, demo)["campaign_id"]
+    cid = uuid.UUID(campaign_id)
+    ordered = [ref for (ref,) in conn.execute("select ref from campaign_members where campaign_id = %s order by rank", (cid,))]
+    expected = {ref: listed[customer_behind(conn, campaign_id, ref)] for ref in ordered}
+    gone = conn.execute("select ref, member_id from campaign_members where campaign_id = %s and role = 'reward' order by rank limit 1", (cid,)).fetchone()
+    conn.execute("update members set paypal_payer_id = 'PAYERX7K2M9QZ' where member_id = %s", (gone[1],))
+
+    view = tasks.view_campaign(campaign_id, demo)
+    assert [(row["ref"], row["display_name"]) for row in view["rows"]] == list(expected.items())
+    assert tasks.approve_campaign(campaign_id, demo, view["review_hash"])["ok"] is True
+    assert [(row["ref"], row["display_name"]) for row in tasks.results(campaign_id, demo)["rows"]] == list(expected.items())
+    assert tasks.submit_campaign(campaign_id, demo)["sent"] is True
+    sender_batch_id = conn.execute("select sender_batch_id from payout_batches where campaign_id = %s", (campaign_id,)).fetchone()[0]
+    conn.execute("insert into payout_items values ('ITEM1', %s, %s, 'UNCLAIMED', 25, now())", (sender_batch_id, gone[0]))
+    member_ids = [str(r[0]) for r in conn.execute("select member_id from campaign_members where campaign_id = %s", (cid,))]
+
+    # Past approval the row stays with no member, and nothing names who left (C28).
+    assert leave_member(conn, gone[1]).removed is True
+    view, found = tasks.view_campaign(campaign_id, demo), tasks.results(campaign_id, demo)
+
+    still = {**expected, gone[0]: None}
+    assert [(row["ref"], row["display_name"]) for row in view["rows"]] == list(still.items())
+    assert [(row["ref"], row["display_name"]) for row in found["rows"]] == list(still.items())
+    text = json.dumps(view) + json.dumps(found)
+    assert json.dumps(expected[gone[0]]) not in text
+    assert "@" not in text and "PAYERX7K2M9QZ" not in text and "ITEM1" not in text and not re.search(r"C1[0-9]{3}", text)
+    assert not any(member_id in text for member_id in member_ids)
 
 
 def sent_with_items(conn: psycopg.Connection, sender: dict, statuses: tuple[str, ...] = ("UNCLAIMED", "SUCCESS")) -> tuple[str, int]:

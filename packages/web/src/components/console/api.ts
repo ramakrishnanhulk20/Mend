@@ -141,6 +141,8 @@ const CampaignRowSchema = z.looseObject({
   ref: z.string().min(1),
   role: z.enum(["reward", "holdout"]),
   rank: z.number().int().min(1),
+  // Null when the customer has left the list. Older answers have no such field. Either way the row shows only its rank.
+  displayName: z.string().nullish(),
   amountMinor: count.nullable(),
   note: z.string().nullable(),
   standIn: z.boolean(),
@@ -214,6 +216,7 @@ const ResultRowSchema = z.looseObject({
   ref: z.string().min(1),
   role: z.enum(["reward", "holdout"]),
   rank: z.number().int().min(1),
+  displayName: z.string().nullish(),
   standIn: z.boolean(),
   // Mend's ledger word for the reward's payment, such as UNCLAIMED. Null for a held-back row or a reward not sent yet.
   payoutStatus: z.string().nullable(),

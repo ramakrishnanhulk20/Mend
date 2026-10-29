@@ -145,7 +145,7 @@ function RegularRow({ row, longest, index, still }: { row: QuietRegular; longest
     <motion.li
       role="listitem"
       tabIndex={0}
-      title={`Paid ${paid} in total`}
+      title={`Spent ${paid} in total`}
       className={`group border-b border-rule px-3 py-4 transition-colors duration-200 ease-out hover:bg-ink-raised focus:bg-ink-raised ${FOCUS_RING}`}
       initial={still ? false : { opacity: 0, y: 8 }}
       animate={{ opacity: 1, y: 0 }}
@@ -182,7 +182,7 @@ function RegularRow({ row, longest, index, still }: { row: QuietRegular; longest
       <div className="grid grid-rows-[0fr] transition-[grid-template-rows] duration-200 ease-[cubic-bezier(0.22,1,0.36,1)] group-hover:grid-rows-[1fr] group-focus:grid-rows-[1fr] motion-reduce:transition-none">
         <div className="min-h-0 overflow-hidden">
           <p className="pt-3 text-[13px] leading-[1.5] text-bone-dim">
-            Paid {paid} in total &middot; forecast {row.score.toFixed(4)} orders in the next 13 weeks &middot;{" "}
+            Spent {paid} in total &middot; forecast {row.score.toFixed(4)} orders in the next 13 weeks &middot;{" "}
             {row.standIn ? "demo stand-in, joined by a script" : row.member ? "can be paid" : "cannot be paid until they join"}
           </p>
         </div>

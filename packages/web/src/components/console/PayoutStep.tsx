@@ -259,6 +259,9 @@ export function PayoutStep({ api, campaignId, onNewPlan, onResults }: PayoutStep
                 {formatUsd(view.totalMinor)} to {plural(rewarded, "customer", "customers")} in one batch.
               </p>
               <p className="mt-2 max-w-[60ch] text-[14px] leading-[1.5] text-bone-dim">
+                This is PayPal&apos;s sandbox: the money is PayPal&apos;s test money, and no real account is charged.
+              </p>
+              <p className="mt-2 max-w-[60ch] text-[14px] leading-[1.5] text-bone-dim">
                 Demo stand-ins have no real PayPal account, so PayPal holds their cashback as unclaimed. You can
                 take it back in the results step.
               </p>

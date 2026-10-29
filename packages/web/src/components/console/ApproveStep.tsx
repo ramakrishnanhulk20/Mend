@@ -190,14 +190,18 @@ function TypedFingerprint({ text, still }: { text: string; still: boolean }) {
 
 function SealPanel({ seal, still, onSend }: { seal: Seal; still: boolean; onSend: () => void }) {
   const send = useRef<HTMLButtonElement>(null);
+  const panel = useRef<HTMLDivElement>(null);
   const clock = seal.approvedAt === null ? null : localClock(seal.approvedAt);
 
+  // The seal lands at the end of a long plan, so it is brought into view rather than left below the fold.
   useEffect(() => {
     send.current?.focus({ preventScroll: true });
-  }, []);
+    panel.current?.scrollIntoView({ behavior: still ? "auto" : "smooth", block: "nearest" });
+  }, [still]);
 
   return (
     <motion.div
+      ref={panel}
       className="mt-6 rounded-[8px] border border-rule bg-ink-raised p-6"
       initial={still ? false : { opacity: 0, y: 12 }}
       animate={{ opacity: 1, y: 0 }}
@@ -216,7 +220,8 @@ function SealPanel({ seal, still, onSend }: { seal: Seal; still: boolean; onSend
       </p>
       {seal.snapshotHash !== null && <TypedFingerprint text={shortHash(seal.snapshotHash)} still={still} />}
       <p className="mt-4 max-w-[52ch] text-[14px] leading-[1.5] text-bone-dim">
-        Nothing is sent yet. The next screen lists each payment and asks you to confirm before PayPal moves any money.
+        Nothing is sent yet. The next screen lists each payment, and PayPal moves money only when you press Send with
+        PayPal there.
       </p>
       <button
         ref={send}

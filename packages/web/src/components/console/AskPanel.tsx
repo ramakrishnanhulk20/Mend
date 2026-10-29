@@ -141,6 +141,13 @@ export function AskPanel({ api, orderId, openRequest = 0 }: AskPanelProps) {
     list.scrollTo({ top: list.scrollHeight, behavior: still ? "auto" : "smooth" });
   }, [messages, pending, open, still]);
 
+  // From lg the panel sits in a sticky column that scrolls inside itself, and a long answer can push the
+  // box to type in past that column's edge. Below lg the panel is in the page, which is left alone.
+  useEffect(() => {
+    if (pending || messages.length === 0 || !window.matchMedia("(min-width: 64rem)").matches) return;
+    textarea.current?.scrollIntoView({ behavior: still ? "auto" : "smooth", block: "nearest" });
+  }, [messages, pending, still]);
+
   async function send(text: string) {
     const question = text.trim();
     if (question === "" || pending) return;

@@ -74,9 +74,16 @@ function Figure({ label, value }: { label: string; value: string | number }) {
 function PlanPanel({ draft, still, onReview }: { draft: Draft; still: boolean; onReview: () => void }) {
   const settings = draft.plan?.settings ?? null;
   const changes = draft.plan?.changes ?? [];
+  const panel = useRef<HTMLDivElement>(null);
+
+  // The plan lands under the goal form, below the fold on most screens; "nearest" brings its button into view.
+  useEffect(() => {
+    panel.current?.scrollIntoView({ behavior: still ? "auto" : "smooth", block: "nearest" });
+  }, [still]);
 
   return (
     <motion.div
+      ref={panel}
       className="mt-8 rounded-[8px] border border-rule bg-ink-raised p-6"
       initial={still ? false : { opacity: 0, y: 16 }}
       animate={{ opacity: 1, y: 0 }}

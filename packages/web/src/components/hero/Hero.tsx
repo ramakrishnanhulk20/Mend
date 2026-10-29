@@ -344,10 +344,11 @@ export function Hero({ live = null }: { live?: HeroLive | null }) {
             )}
           </AnimatePresence>
         </div>
-        {/* shrink-0: when the live line is long, the left text gives way, never the credits. */}
+        {/* shrink-0: when the live line is long, the left text gives way, never the credits. Below 2xl only
+            the first three show, so at 1440 the live line keeps its "last year" and is not misread. */}
         <div className="hidden shrink-0 items-center xl:flex">
           {CREDITS.map((credit, i) => (
-            <span key={credit} className="flex items-center">
+            <span key={credit} className={`items-center ${i < 3 ? "flex" : "hidden 2xl:flex"}`}>
               {i > 0 && <span aria-hidden="true" className="mx-[14px] h-[10px] w-px bg-bone/25" />}
               {credit}
             </span>

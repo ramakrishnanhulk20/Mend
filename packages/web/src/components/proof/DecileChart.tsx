@@ -121,7 +121,7 @@ export function NumbersToggle({
       onClick={onToggle}
       className={`mt-4 font-mono text-[12px] uppercase tracking-[0.14em] text-bone-dim underline-offset-4 hover:underline ${FOCUS_RING}`}
     >
-      Show the numbers
+      {open ? "Hide the numbers" : "Show the numbers"}
     </button>
   );
 }

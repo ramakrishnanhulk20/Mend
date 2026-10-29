@@ -25,7 +25,7 @@ export function Footer() {
             Mend
           </span>
         </div>
-        <p className="text-[13px] text-bone-dim md:mt-2">Sandbox only. No real money moves.</p>
+        <p className="text-[14px] text-bone-dim md:mt-2">Sandbox only. No real money moves.</p>
       </div>
 
       <nav aria-label="Footer" className="flex flex-wrap gap-x-7 gap-y-3">

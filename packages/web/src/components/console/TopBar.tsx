@@ -23,7 +23,7 @@ export function TopBar({ step, session, ending, onEnd }: TopBarProps) {
         <Link href="/" className={`group inline-flex items-center gap-[10px] text-bone ${FOCUS_RING}`}>
           <Mark size={20} spinOnHover />
           {/* Inline, because .poster-title sits outside Tailwind's layers and would beat a tracking class. */}
-          <span className="poster-title text-[20px]" style={{ letterSpacing: "0.04em" }}>
+          <span className="poster-title hidden text-[20px] min-[400px]:inline" style={{ letterSpacing: "0.04em" }}>
             Mend
           </span>
         </Link>
@@ -38,10 +38,10 @@ export function TopBar({ step, session, ending, onEnd }: TopBarProps) {
 
       <StepRail step={step} />
 
-      <div className="flex flex-1 items-center justify-end gap-5">
+      <div className="flex flex-1 items-center justify-end gap-4">
         <Link
           href="/docs"
-          className={`group/docs hidden items-center py-2 text-[14px] text-bone-dim transition-colors duration-200 ease-out hover:text-bone focus-visible:text-bone md:inline-flex ${FOCUS_RING}`}
+          className={`group/docs inline-flex items-center py-2 text-[14px] text-bone-dim transition-colors duration-200 ease-out hover:text-bone focus-visible:text-bone ${FOCUS_RING}`}
         >
           <span className="relative">
             Docs

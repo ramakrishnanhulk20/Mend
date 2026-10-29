@@ -14,11 +14,12 @@ import { ShopCard } from "./ShopCard";
 import { StartStep } from "./StartStep";
 import { StepProgress, type Step } from "./StepRail";
 import { TopBar, type SessionInfo } from "./TopBar";
-import { EASE } from "./ui";
+import { EASE, FOCUS_RING } from "./ui";
 
 const STEP_KEY = "mend-console-step";
 const CAMPAIGN_KEY = "mend-console-campaign";
 const ENDED_NOTICE = "Your demo session ended. Start a new one to carry on.";
+const ASK_VISIBLE_RATIO = 0.15;
 
 // Steps that need a drafted plan fall back to drafting one when a reload finds none.
 const NEEDS_CAMPAIGN: readonly Step[] = ["approve", "payout", "results"];
@@ -68,6 +69,9 @@ export function Console() {
   // The PayPal order this session simulated on the results step. It belongs to the session, so a
   // new plan keeps it and only a new or ended session clears it.
   const [orderId, setOrderId] = useState<string | null>(null);
+  const [askRequest, setAskRequest] = useState(0);
+  const [askOnScreen, setAskOnScreen] = useState(false);
+  const signedIn = session !== null;
 
   const forgetEverything = useCallback(() => {
     writeSaved(STEP_KEY, null);
@@ -115,6 +119,19 @@ export function Console() {
       current = false;
     };
   }, [api]);
+
+  // The Ask Mend shortcut steps aside while the panel (toggle included) is on screen.
+  useEffect(() => {
+    if (!signedIn) return;
+    const panel = document.getElementById("ask-mend");
+    if (panel === null) return;
+    const observer = new IntersectionObserver(
+      ([entry]) => setAskOnScreen(entry.intersectionRatio >= ASK_VISIBLE_RATIO),
+      { threshold: ASK_VISIBLE_RATIO },
+    );
+    observer.observe(panel);
+    return () => observer.disconnect();
+  }, [signedIn]);
 
   const goTo = useCallback((next: Step) => {
     setStep(next);
@@ -213,7 +230,7 @@ export function Console() {
                 From lg up it scrolls inside itself when shop card and a long chat are taller than the screen, so the box to type in is never out of reach. */}
             <aside className="contents lg:block lg:order-last lg:col-span-4 lg:sticky lg:top-24 lg:max-h-[calc(100svh-7rem)] lg:self-start lg:overflow-y-auto lg:[scrollbar-color:var(--color-bone-faint)_transparent] lg:[scrollbar-width:thin]">
               <ShopCard />
-              {session !== null && <AskPanel api={api} orderId={orderId} />}
+              {session !== null && <AskPanel api={api} orderId={orderId} openRequest={askRequest} />}
             </aside>
 
             <main id="main" className="min-w-0 lg:col-span-8">
@@ -234,6 +251,24 @@ export function Console() {
             </main>
           </div>
         </div>
+
+        <AnimatePresence>
+          {session !== null && !askOnScreen && (
+            <motion.button
+              key="ask-shortcut"
+              type="button"
+              onClick={() => setAskRequest((count) => count + 1)}
+              className={`fixed bottom-4 right-4 z-30 inline-flex h-11 items-center gap-2 rounded-full border border-rule bg-ink-raised/95 px-4 text-[14px] text-bone shadow-[0_8px_24px_rgb(0_0_0/0.45)] backdrop-blur lg:hidden ${FOCUS_RING}`}
+              initial={still ? false : { opacity: 0, y: 8 }}
+              animate={{ opacity: 1, y: 0 }}
+              exit={{ opacity: 0, transition: { duration: still ? 0 : 0.15 } }}
+              transition={{ duration: still ? 0 : 0.3, ease: EASE }}
+            >
+              <span aria-hidden="true" className="h-[6px] w-[6px] rounded-full bg-accent" />
+              Ask Mend
+            </motion.button>
+          )}
+        </AnimatePresence>
       </div>
     </MotionConfig>
   );

@@ -31,11 +31,10 @@ function threadY(index: number) {
   return THREAD_TOP + (index * (THREAD_BOTTOM - THREAD_TOP)) / (THREAD_COUNT - 1);
 }
 
-function rise(still: boolean, delayMs: number) {
+function rise(still: boolean, shown: boolean, delayMs: number) {
   return {
     initial: still ? (false as const) : { opacity: 0, y: 32 },
-    whileInView: { opacity: 1, y: 0 },
-    viewport: { once: true, amount: 0.3 },
+    animate: still || shown ? { opacity: 1, y: 0 } : { opacity: 0, y: 32 },
     transition: { duration: 0.8, delay: delayMs / 1000, ease: EASE },
   };
 }
@@ -165,7 +164,7 @@ export function Closing() {
 
         <motion.p
           className="mt-8 max-w-[52ch] text-[16px] leading-[1.55] text-bone-dim md:text-[18px]"
-          {...rise(still, 120)}
+          {...rise(still, sectionInView, 120)}
         >
           No sign-up. A sandbox shop with two years of real order history, real PayPal sandbox
           payouts and Claude. Plan a campaign, approve it, and watch the money land.
@@ -173,7 +172,7 @@ export function Closing() {
 
         <motion.div
           className="mt-10 flex flex-col gap-[10px] md:flex-row md:gap-4"
-          {...rise(still, 240)}
+          {...rise(still, sectionInView, 240)}
         >
           <Link
             href="/demo"
@@ -214,7 +213,7 @@ export function Closing() {
 
         <motion.p
           className="mt-24 border-t border-rule pt-6 text-left font-mono text-[10.5px] uppercase leading-[2] tracking-[0.18em] text-bone-faint md:mt-32 md:text-justify md:text-[11px]"
-          {...rise(still, 360)}
+          {...rise(still, sectionInView, 360)}
         >
           Mend. A win-back engine for shops. Built on PayPal Payouts, Log in with PayPal and
           PayPal&apos;s MCP server. Forecast by a BG/NBD model. Planned and written with Claude. Every

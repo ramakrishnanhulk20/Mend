@@ -82,6 +82,8 @@ type AskPanelProps = {
   api: ConsoleApi;
   /** The PayPal order this session simulated on the results step, when there is one. */
   orderId: string | null;
+  /** The page raises this number each time the visitor taps the Ask Mend shortcut. */
+  openRequest?: number;
 };
 
 /**
@@ -90,7 +92,7 @@ type AskPanelProps = {
  * a reload clears it. Below lg the panel folds behind a button but stays mounted, so a question
  * in flight is not lost when it is closed.
  */
-export function AskPanel({ api, orderId }: AskPanelProps) {
+export function AskPanel({ api, orderId, openRequest = 0 }: AskPanelProps) {
   const still = useStill();
   const [open, setOpen] = useState(false);
   const [messages, setMessages] = useState<Message[]>([]);
@@ -102,6 +104,9 @@ export function AskPanel({ api, orderId }: AskPanelProps) {
   const controller = useRef<AbortController | null>(null);
   const nextId = useRef(1);
   const elapsed = useElapsedSeconds(pending);
+  // Starts at the value the panel mounted with, so a panel that remounts later (a new session)
+  // does not replay a tap from the old one.
+  const handledRequest = useRef(openRequest);
 
   useEffect(
     () => () => {
@@ -109,6 +114,25 @@ export function AskPanel({ api, orderId }: AskPanelProps) {
     },
     [],
   );
+
+  // The panel is display:none below lg until it is opened, so it opens first and the scroll and
+  // the focus wait two frames: React's render of the open panel can land after one.
+  useEffect(() => {
+    if (openRequest <= 0 || openRequest <= handledRequest.current) return;
+    setOpen(true);
+    let inner = 0;
+    const outer = requestAnimationFrame(() => {
+      inner = requestAnimationFrame(() => {
+        handledRequest.current = openRequest;
+        document.getElementById("ask-mend")?.scrollIntoView({ behavior: still ? "auto" : "smooth", block: "start" });
+        textarea.current?.focus({ preventScroll: true });
+      });
+    });
+    return () => {
+      cancelAnimationFrame(outer);
+      cancelAnimationFrame(inner);
+    };
+  }, [openRequest, still]);
 
   // Scrolls the list itself, never the page, so a new line never pulls the visitor away from the step.
   useEffect(() => {
@@ -154,7 +178,7 @@ export function AskPanel({ api, orderId }: AskPanelProps) {
   const empty = messages.length === 0;
 
   return (
-    <div className="order-last lg:mt-6">
+    <div id="ask-mend" className="order-last scroll-mt-20 lg:mt-6">
       <button
         type="button"
         aria-expanded={open}

@@ -144,6 +144,12 @@ export function Hero({ live = null }: { live?: HeroLive | null }) {
         </Link>
 
         <div className="flex items-center">
+          <Link
+            href="/docs"
+            className={`mr-5 text-[14px] text-bone-dim transition-colors duration-200 ease-out hover:text-bone md:hidden ${FOCUS_RING}`}
+          >
+            Docs
+          </Link>
           <div className="hidden items-center gap-8 md:flex">
             {NAV_LINKS.map((link) => (
               <Link

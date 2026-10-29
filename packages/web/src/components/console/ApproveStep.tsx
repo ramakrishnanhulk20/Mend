@@ -40,9 +40,12 @@ function isBusy(error: ApiError): boolean {
 function localClock(iso: string): string | null {
   const date = new Date(iso);
   if (Number.isNaN(date.getTime())) return null;
-  const hours = String(date.getHours()).padStart(2, "0");
-  const minutes = String(date.getMinutes()).padStart(2, "0");
-  return `${hours}:${minutes}`;
+  return new Intl.DateTimeFormat(undefined, {
+    hour: "2-digit",
+    minute: "2-digit",
+    hourCycle: "h23",
+    timeZoneName: "short",
+  }).format(date);
 }
 
 type Load =
@@ -212,13 +215,16 @@ function SealPanel({ seal, still, onSend }: { seal: Seal; still: boolean; onSend
         {clock === null ? "Approved" : `Approved at ${clock}`}
       </p>
       {seal.snapshotHash !== null && <TypedFingerprint text={shortHash(seal.snapshotHash)} still={still} />}
+      <p className="mt-4 max-w-[52ch] text-[14px] leading-[1.5] text-bone-dim">
+        Nothing is sent yet. The next screen lists each payment and asks you to confirm before PayPal moves any money.
+      </p>
       <button
         ref={send}
         type="button"
         onClick={onSend}
         className={`${PRIMARY_BUTTON} mt-6 h-12 px-[22px] text-[15px] ${FOCUS_RING}`}
       >
-        Send it with PayPal
+        Review the payout
       </button>
     </motion.div>
   );
@@ -458,13 +464,24 @@ export function ApproveStep({ api, campaignId, onNewPlan, onSend }: ApproveStepP
         </>
       ) : (
         <>
-          <h1 id="approve-title" className="sr-only">
-            Approve the plan
-          </h1>
           {load.kind === "failed" ? (
-            <NoticePanel action={load.canRetry ? <TextButton onClick={retryLoad}>Try again</TextButton> : undefined}>{load.text}</NoticePanel>
+            <>
+              <h1 id="approve-title" className="sr-only">
+                Approve the plan
+              </h1>
+              <NoticePanel action={load.canRetry ? <TextButton onClick={retryLoad}>Try again</TextButton> : undefined}>{load.text}</NoticePanel>
+            </>
           ) : (
-            <PlaceholderRows still={still} />
+            <>
+              <h1 id="approve-title" className="poster-title mt-4 text-[40px] text-bone md:text-[56px]" style={{ lineHeight: 0.9 }}>
+                Opening the plan.
+              </h1>
+              <p role="status" className="mt-4 flex items-center gap-3 text-[14px] leading-[1.5] text-bone-dim">
+                <Spinner />
+                Reading the draft
+              </p>
+              <PlaceholderRows still={still} />
+            </>
           )}
         </>
       )}

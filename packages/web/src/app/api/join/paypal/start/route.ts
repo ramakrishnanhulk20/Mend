@@ -1,7 +1,8 @@
-import { randomUUID, timingSafeEqual } from "node:crypto";
+import { createHash, randomUUID, timingSafeEqual } from "node:crypto";
 import { joinLimits } from "@/server/address-limits";
 import { csrfBinding, csrfSecret, csrfTokenFor, csrfTokenForRequest, originProblem } from "@/server/csrf";
 import { EngineUnavailable, runAndWait, TOO_MANY_RUNNING } from "@/server/engine";
+import { toResultPage, wantsJson } from "@/server/join-result";
 import { writeLog } from "@/server/log";
 import { connectUrl, issueTicket, SANDBOX_WEB_HOST, type JoinIntent } from "@/server/paypal-login";
 import { failed, refuse } from "@/server/permissions";
@@ -13,11 +14,34 @@ export const runtime = "nodejs";
 const GET_ROUTE = "GET /api/join/paypal/start";
 const WAIT_MS = 15_000;
 
+// The page's one stylesheet, written with no url() or import, so it fetches nothing. The
+// CSP allows it by the hash of this exact text, so a style anyone injects, or one added
+// outside this string, is refused by the browser. Colours are the site's tokens.
+const STYLESHEET = [
+  "*{box-sizing:border-box}",
+  'body{margin:0;background:#0b0a0a;color:#ede6da;font-family:system-ui,-apple-system,"Segoe UI",sans-serif;line-height:1.5}',
+  "main{max-width:560px;margin:12vh auto;padding:32px 24px;border:1px solid rgba(237,230,218,0.12);border-radius:8px;background:#151312}",
+  ".tag{margin:0;font-family:ui-monospace,Menlo,Consolas,monospace;font-size:11px;letter-spacing:0.14em;color:rgba(237,230,218,0.38)}",
+  "svg{display:block;margin-top:16px}",
+  'h1{margin:24px 0 0;font-family:"Arial Narrow","Roboto Condensed",system-ui;font-size:40px;line-height:0.95;font-weight:800;letter-spacing:-0.01em;text-transform:uppercase}',
+  ".words{margin:16px 0 0;font-size:16px;line-height:1.55;color:rgba(237,230,218,0.64)}",
+  ".note{margin:16px 0 0;font-size:14px;color:rgba(237,230,218,0.38)}",
+  "form{margin:32px 0 0}",
+  "button{display:block;width:100%;height:48px;border:0;border-radius:8px;background:#ff4d2e;color:#0b0a0a;font-family:inherit;font-size:16px;font-weight:600;cursor:pointer}",
+  "button:hover{background:#ff6a4d}",
+  "button:focus-visible{outline:2px solid #ede6da;outline-offset:3px}",
+  ".foot{margin:0 16px 32px;text-align:center;font-size:12px;color:rgba(237,230,218,0.38)}",
+  ".foot a{color:#ede6da;text-decoration:underline;text-underline-offset:4px}",
+  "@media (max-width:599.98px){main{margin:24px 16px}}",
+].join("\n");
+
+const STYLE_HASH = createHash("sha256").update(STYLESHEET, "utf8").digest("base64");
+
 // form-action names PayPal's sign-in host because browsers also check it against the
 // redirect that follows the form POST.
 const PAGE_HEADERS: Readonly<Record<string, string>> = {
   "content-type": "text/html; charset=utf-8",
-  "content-security-policy": `default-src 'none'; form-action 'self' https://${SANDBOX_WEB_HOST}; frame-ancestors 'none'`,
+  "content-security-policy": `default-src 'none'; style-src 'sha256-${STYLE_HASH}'; form-action 'self' https://${SANDBOX_WEB_HOST}; frame-ancestors 'none'`,
   "x-frame-options": "DENY",
   // Not no-referrer: under that policy browsers send "Origin: null" on the form POST,
   // and the same-origin check then refuses the visitor's own click.
@@ -25,6 +49,13 @@ const PAGE_HEADERS: Readonly<Record<string, string>> = {
   "cache-control": "no-store",
 };
 
+/**
+ * True only for a script that asked for JSON: Accept names application/json and does not
+ * also name text/html. A browser's navigation, a wildcard, an empty or a missing Accept
+ * all mean a person, who is sent to the result page instead. Each media type is compared
+ * lowercased with its parameters dropped; q-values are not weighed. Used by this route
+ * and the callback, so both tell a person from a script the same way.
+ */
 const ESCAPES: Readonly<Record<string, string>> = { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" };
 
 /** value with the five characters that can end an HTML text run or a quoted attribute replaced by their entities. */
@@ -32,19 +63,30 @@ function escapeHtml(value: string): string {
   return value.replace(/[&<>"']/g, (character) => ESCAPES[character]);
 }
 
+// No xmlns: an SVG inside HTML needs none, and the page names no address it could fetch.
+const MARK = [
+  '<svg width="32" height="32" viewBox="0 0 32 32" fill="none" aria-hidden="true">',
+  '<path d="M4 16h8M20 16h8" stroke="#ede6da" stroke-width="2.5" stroke-linecap="round"/>',
+  '<path d="M13 12l6 8M19 12l-6 8" stroke="#ff4d2e" stroke-width="2.5" stroke-linecap="round"/>',
+  "</svg>",
+].join("\n");
+
+const JOIN_NOTE = "You sign in on PayPal's own page. Mend keeps only your verified email and your PayPal account id, and you can leave at any time.";
+
 /**
- * The confirmation a visitor clicks to join or leave: for a join, the shop name as a
- * heading and the exact consent words; for a leave, one sentence naming the shop. Each
- * has one button posting intent, csrf and, for a join, the consent hash back to this
- * route. Every value passed in goes through escapeHtml. No style and no script, which
- * the page's Content-Security-Policy forbids anyway.
+ * The confirmation a visitor clicks to join or leave, as a Mend card: for a join, the
+ * shop name as the title, the exact consent words and a note on what Mend keeps; for a
+ * leave, a fixed title and one sentence naming the shop. Each has one button posting
+ * intent, csrf and, for a join, the consent hash back to this route. Every value passed
+ * in goes through escapeHtml. Styled only by STYLESHEET, which the CSP allows by its
+ * hash; no script and no style attribute.
  */
 function confirmationPage(intent: JoinIntent, shopName: string, text: string, hash: string, csrf: string): string {
   const shop = escapeHtml(shopName);
   const words =
     intent === "join"
-      ? `<h1>${shop}</h1>\n<p>${escapeHtml(text)}</p>`
-      : `<p>Leave the thank-you list of ${shop}. Any reward not yet sent to you is cancelled.</p>`;
+      ? `<h1>${shop}</h1>\n<p class="words">${escapeHtml(text)}</p>\n<p class="note">${JOIN_NOTE}</p>`
+      : `<h1>Leave the thank-you list</h1>\n<p class="words">Leave the thank-you list of ${shop}. Any reward not yet sent to you is cancelled.</p>`;
   const fields = [
     `<input type="hidden" name="intent" value="${escapeHtml(intent)}">`,
     ...(intent === "join" ? [`<input type="hidden" name="consent" value="${escapeHtml(hash)}">`] : []),
@@ -53,17 +95,44 @@ function confirmationPage(intent: JoinIntent, shopName: string, text: string, ha
   return [
     "<!doctype html>",
     '<html lang="en">',
-    '<head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Mend</title></head>',
+    `<head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Mend</title><style>${STYLESHEET}</style></head>`,
     "<body>",
+    "<main>",
+    '<p class="tag">MEND · SANDBOX</p>',
+    MARK,
     words,
     '<form method="post" action="/api/join/paypal/start">',
     ...fields,
     `<button type="submit">${intent === "join" ? "Join with PayPal" : "Leave with PayPal"}</button>`,
     "</form>",
+    "</main>",
+    '<p class="foot">Sandbox only. No real money moves. <a href="/">What is Mend?</a></p>',
     "</body>",
     "</html>",
     "",
   ].join("\n");
+}
+
+type Detail = Readonly<Record<string, unknown>>;
+
+/**
+ * A refusal from this route: refuse()'s JSON for a script that asked for it, otherwise a
+ * 303 to the result page carrying the code and the headers given, such as Retry-After.
+ * refuse() writes the log line in both cases, so a person and a script leave the same trace.
+ */
+function refusal(request: Request, route: string, ref: string, status: number, error: string, detail: Detail = {}, headers: Readonly<Record<string, string>> = {}): Response {
+  const answer = refuse(route, ref, status, error, detail, headers);
+  if (wantsJson(request)) return answer;
+  const page = toResultPage(error);
+  for (const [name, value] of Object.entries(headers)) page.headers.set(name, value);
+  return page;
+}
+
+/** The answer to an error nobody planned for, logged by failed(): its JSON for a script, the result page for a person. */
+function failure(request: Request, route: string, ref: string, error: unknown): Response {
+  const unavailable = error instanceof EngineUnavailable;
+  const answer = failed(route, ref, error, unavailable ? 503 : 500);
+  return wantsJson(request) ? answer : toResultPage(unavailable ? "engine_unavailable" : "internal");
 }
 
 type Shown = { readonly shopName: string; readonly text: string; readonly hash: string };
@@ -72,18 +141,20 @@ type Shown = { readonly shopName: string; readonly text: string; readonly hash: 
 async function currentConsent(request: Request, route: string, ref: string): Promise<{ readonly shown: Shown } | { readonly refusal: Response }> {
   const waited = await runAndWait("consent_text", [], WAIT_MS, { address: clientAddress(request.headers) });
   if (waited.state === "pending") {
-    return { refusal: refuse(route, ref, 503, "engine_unavailable", { reason: "consent_still_running", run_id: waited.runId }) };
+    return { refusal: refusal(request, route, ref, 503, "engine_unavailable", { reason: "consent_still_running", run_id: waited.runId }) };
   }
   if (waited.status === "failed" || waited.result === undefined) {
-    return { refusal: refuse(route, ref, 503, "engine_unavailable", { reason: "run_failed", run_id: waited.runId }) };
+    return { refusal: refusal(request, route, ref, 503, "engine_unavailable", { reason: "run_failed", run_id: waited.runId }) };
   }
   if (!waited.result.ok && waited.result.error === TOO_MANY_RUNNING) {
-    return { refusal: refuse(route, waited.result.ref, 429, TOO_MANY_RUNNING, { run_id: waited.runId }) };
+    return { refusal: refusal(request, route, waited.result.ref, 429, TOO_MANY_RUNNING, { run_id: waited.runId }) };
   }
-  if (!waited.result.ok) return { refusal: refuse(route, waited.result.ref, 500, "internal", { engine_error: waited.result.error, run_id: waited.runId }) };
+  if (!waited.result.ok) {
+    return { refusal: refusal(request, route, waited.result.ref, 500, "internal", { engine_error: waited.result.error, run_id: waited.runId }) };
+  }
   const body = successBody("consent_text", waited.result);
   if (body === null || typeof body.shopName !== "string" || typeof body.text !== "string" || typeof body.hash !== "string") {
-    return { refusal: refuse(route, ref, 500, "internal", { reason: "malformed_answer", run_id: waited.runId }) };
+    return { refusal: refusal(request, route, ref, 500, "internal", { reason: "malformed_answer", run_id: waited.runId }) };
   }
   return { shown: { shopName: body.shopName, text: body.text, hash: body.hash } };
 }
@@ -94,7 +165,7 @@ async function overLimit(request: Request, route: string, ref: string): Promise<
   const hit = joinLimits.start.take(address);
   if (hit.allowed) return null;
   await recordMemoryRefusal(hit, address);
-  return refuse(route, ref, 429, "rate_limited", { bucket: hit.limit.bucket }, { "retry-after": String(hit.retryAfterSeconds) });
+  return refusal(request, route, ref, 429, "rate_limited", { bucket: hit.limit.bucket }, { "retry-after": String(hit.retryAfterSeconds) });
 }
 
 /**
@@ -105,6 +176,9 @@ async function overLimit(request: Request, route: string, ref: string): Promise<
  * nothing to bind a token to. 429 past 20 a minute per client address or 600 from
  * everyone, counted in memory with POST; 429 too_many_running while two engine calls
  * already run for this address; 503 when the engine has not answered within 15 seconds.
+ * Those status codes and JSON bodies go only to a script that asked for JSON (wantsJson);
+ * a person gets a 303 to /join/done?result= with the refusal's code instead
+ * (rate_limited, still with Retry-After, for both 429s), and the log line is the same.
  */
 export async function GET(request: Request): Promise<Response> {
   const ref = randomUUID();
@@ -116,7 +190,7 @@ export async function GET(request: Request): Promise<Response> {
     const names = [...params.keys()];
     const intent = params.get("intent");
     if (names.length !== 1 || names[0] !== "intent" || (intent !== "join" && intent !== "leave")) {
-      return refuse(GET_ROUTE, ref, 400, "bad_request", { reason: "bad_query" });
+      return refusal(request, GET_ROUTE, ref, 400, "bad_request", { reason: "bad_query" });
     }
     const consent = await currentConsent(request, GET_ROUTE, ref);
     if ("refusal" in consent) return consent.refusal;
@@ -124,11 +198,10 @@ export async function GET(request: Request): Promise<Response> {
     const headers = new Headers(PAGE_HEADERS);
     for (const cookie of cookies) headers.append("set-cookie", cookie);
     writeLog({ kind: "join", route: GET_ROUTE, ref, status: 200, outcome: "confirmation_shown", intent });
-    // Plain markup until the audit is closed; the designed join page replaces it then and posts to this same route.
     const page = confirmationPage(intent, consent.shown.shopName, consent.shown.text, consent.shown.hash, token);
     return new Response(page, { status: 200, headers });
   } catch (error) {
-    return failed(GET_ROUTE, ref, error, error instanceof EngineUnavailable ? 503 : 500);
+    return failure(request, GET_ROUTE, ref, error);
   }
 }
 
@@ -189,7 +262,8 @@ function csrfMatches(request: Request, presented: string): boolean {
  * is the hash of the words the engine shows now (C28). Then 303 to
  * https://www.sandbox.paypal.com/connect with the signed join cookie (paypal-login.ts).
  * 429 too_many_running while two engine calls already run for this address; 503 when
- * the engine has not answered within 15 seconds.
+ * the engine has not answered within 15 seconds. As on GET, each refusal reaches a
+ * person as a 303 to /join/done?result=<code>, and its JSON only a script that asked.
  */
 export async function POST(request: Request): Promise<Response> {
   const ref = randomUUID();
@@ -198,23 +272,23 @@ export async function POST(request: Request): Promise<Response> {
     const tooMany = await overLimit(request, POST_ROUTE, ref);
     if (tooMany !== null) return tooMany;
     const origin = originProblem(request);
-    if (origin !== null) return refuse(POST_ROUTE, ref, 403, "not_allowed", { reason: origin });
+    if (origin !== null) return refusal(request, POST_ROUTE, ref, 403, "not_allowed", { reason: origin });
     const form = await readForm(request);
-    if ("problem" in form) return refuse(POST_ROUTE, ref, 400, "bad_request", { reason: form.problem });
+    if ("problem" in form) return refusal(request, POST_ROUTE, ref, 400, "bad_request", { reason: form.problem });
     const names = [...form.fields.keys()];
-    if (new Set(names).size !== names.length) return refuse(POST_ROUTE, ref, 400, "bad_request", { reason: "repeated_field" });
+    if (new Set(names).size !== names.length) return refusal(request, POST_ROUTE, ref, 400, "bad_request", { reason: "repeated_field" });
     const intent = form.fields.get("intent");
-    if (intent !== "join" && intent !== "leave") return refuse(POST_ROUTE, ref, 400, "bad_request", { reason: "bad_intent" });
-    if (names.sort().join(",") !== FORM_FIELDS[intent]) return refuse(POST_ROUTE, ref, 400, "bad_request", { reason: "unknown_or_missing_field" });
-    if (!csrfMatches(request, form.fields.get("csrf") ?? "")) return refuse(POST_ROUTE, ref, 403, "not_allowed", { reason: "csrf_mismatch" });
+    if (intent !== "join" && intent !== "leave") return refusal(request, POST_ROUTE, ref, 400, "bad_request", { reason: "bad_intent" });
+    if (names.sort().join(",") !== FORM_FIELDS[intent]) return refusal(request, POST_ROUTE, ref, 400, "bad_request", { reason: "unknown_or_missing_field" });
+    if (!csrfMatches(request, form.fields.get("csrf") ?? "")) return refusal(request, POST_ROUTE, ref, 403, "not_allowed", { reason: "csrf_mismatch" });
 
     let consent: string | null = null;
     if (intent === "join") {
       const presented = form.fields.get("consent") ?? "";
-      if (!CONSENT_HASH.test(presented)) return refuse(POST_ROUTE, ref, 400, "bad_request", { reason: "bad_consent" });
+      if (!CONSENT_HASH.test(presented)) return refusal(request, POST_ROUTE, ref, 400, "bad_request", { reason: "bad_consent" });
       const current = await currentConsent(request, POST_ROUTE, ref);
       if ("refusal" in current) return current.refusal;
-      if (current.shown.hash !== presented) return refuse(POST_ROUTE, ref, 409, "consent_changed");
+      if (current.shown.hash !== presented) return refusal(request, POST_ROUTE, ref, 409, "consent_changed");
       consent = presented;
     }
     const { ticket, cookie } = issueTicket(intent, consent);
@@ -224,6 +298,6 @@ export async function POST(request: Request): Promise<Response> {
     headers.append("set-cookie", cookie);
     return new Response(null, { status: 303, headers });
   } catch (error) {
-    return failed(POST_ROUTE, ref, error, error instanceof EngineUnavailable ? 503 : 500);
+    return failure(request, POST_ROUTE, ref, error);
   }
 }

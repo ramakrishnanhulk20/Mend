@@ -7,18 +7,18 @@ Mend pays only customers who chose to join the shop's thank-you list. Joining an
 
 ## The words a customer agrees to
 
-The confirmation page shows the shop's name and this text, version `2026-10-27.1`:
+The confirmation page shows the shop's name and this text, version `2026-10-29.1`:
 
 ```text
 <shop name> may look at your past orders with them and send thank-you cashback to this PayPal account. To learn whether it works, a random share of customers is held back each time and gets no cashback that round, and later purchases are counted to measure the result. Thank-you notes are written with AI from the names of items you bought. Mend keeps your PayPal email, its verification status and your PayPal account ID for this. You can leave at any time.
 ```
 
-Mend stores the version and a SHA-256 hash of the exact text the customer saw with their membership. A member who agreed to an older wording is not drafted again until they join on the current one.
+Mend stores the version and a SHA-256 hash of the exact text the customer saw with their membership. A member whose wording Mend no longer accepts is not drafted again until they join on the current one.
 
 ## Joining, step by step
 
 1. The shop shares its join link: https://mend-web.onrender.com/api/join/paypal/start?intent=join
-2. Opening it shows a plain confirmation page with the shop's name, the words above and one button, **Join with PayPal**. Nothing has changed and nothing has been sent to PayPal yet. The page cannot be shown inside another site's frame.
+2. Opening it shows a Mend confirmation page with the shop's name, the words above and one button, **Join with PayPal**. Nothing has changed and nothing has been sent to PayPal yet. The page cannot be shown inside another site's frame.
 3. The button posts the form back to the same address. Mend checks that the request came from its own page, that the CSRF token belongs to this browser, and that the hash of the words shown still matches the current wording. A changed wording is refused, never recorded.
 4. Mend sends the browser to PayPal's sign-in page on `www.sandbox.paypal.com` and asks for three scopes: openid, email and paypalattributes. The sign-in state travels in a signed cookie that lasts 10 minutes.
 5. PayPal shows its own consent screen, listing the email, the account's verification status and the payer id.
@@ -26,7 +26,7 @@ Mend stores the version and a SHA-256 hash of the exact text the customer saw wi
 7. Mend swaps the code for a token, reads the customer's PayPal profile, and keeps only three things: the email, whether PayPal verified it, and the payer id. The token is used inside that one request and never stored or logged.
 8. The engine checks the consent hash again and records the member with the wording version, the time and the app that recorded it.
 
-Today the callback answers with a short JSON result, such as `{"outcome":"joined","linked":true}`. `linked` says whether the verified PayPal email matches one customer in the shop's order records. Only a linked member has an order history Mend can rank.
+The customer then lands on a short Mend page at `/join/done` that says "You're on the list." If anything stopped the join on the way, such as a changed wording or a sign-in that took longer than 10 minutes, the same page says what happened and what to do next. A script that sends `Accept: application/json` without `text/html` gets JSON instead, such as `{"outcome":"joined","linked":true}`. `linked` says whether the verified PayPal email matches one customer in the shop's order records. Only a linked member has an order history Mend can rank.
 
 ## What joining does not do
 
@@ -41,7 +41,7 @@ The leave link is https://mend-web.onrender.com/api/join/paypal/start?intent=lea
 - Leaving needs an email PayPal has verified, because an unverified email proves nothing about who owns it.
 - Mend finds the member by that email or by their PayPal payer id, so a customer who changed their PayPal email can still leave.
 - Leaving deletes the member and, in the same step, cancels every campaign not yet sent that includes them. A cancelled campaign can never be approved or sent.
-- The callback answers `{"outcome":"left"}`.
+- The customer lands on the same `/join/done` page, which says "You've left the list." A script that asked for JSON gets `{"outcome":"left"}`.
 
 The live join, leave and join again were tested on the sandbox on 26 Oct 2026. The audit log showed one member leaving and one open draft that held them cancelled.
 

@@ -56,14 +56,15 @@ let initialised = false;
 async function loadMermaid() {
   const { default: mermaid } = await import("mermaid");
   if (!initialised) {
-    // useMaxWidth off keeps the text at its real size. From md up a wide diagram scrolls inside
-    // its own box; below md the box scales it to fit and "Open full size" shows the real size.
+    // useMaxWidth off keeps each drawing's own size: the box scales it down to fit the column and
+    // "Open full size" shows it at that size. The tighter sequence spacing keeps the campaign
+    // diagram near 1,100 px wide, so the full-size view fits a laptop screen without sideways scrolling.
     mermaid.initialize({
       startOnLoad: false,
       theme: "base",
       themeVariables: THEME_VARIABLES,
       flowchart: { useMaxWidth: false },
-      sequence: { useMaxWidth: false },
+      sequence: { useMaxWidth: false, actorMargin: 16, width: 96, boxMargin: 6, noteMargin: 6, messageMargin: 28, diagramMarginX: 8 },
     });
     initialised = true;
   }
@@ -153,7 +154,7 @@ export function Mermaid({ chart }: { chart: string }) {
         aria-label="Diagram"
         tabIndex={0}
         data-mermaid="drawn"
-        className={`not-prose fd-scroll-container my-6 overflow-x-auto rounded-[8px] border border-rule bg-ink p-4 [&_svg]:h-auto [&_svg]:max-w-full md:[&_svg]:max-w-none ${FOCUS_RING}`}
+        className={`not-prose fd-scroll-container my-6 overflow-x-auto rounded-[8px] border border-rule bg-ink p-4 [&_svg]:h-auto [&_svg]:max-w-full ${FOCUS_RING}`}
         dangerouslySetInnerHTML={{ __html: state.svg }}
       />
       <div className="not-prose -mt-4 mb-6 flex justify-end">

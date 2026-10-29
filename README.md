@@ -93,53 +93,51 @@ Mend works from the shop's own order history. A forecast ranks the regulars who 
 ### System overview
 
 ```mermaid
-flowchart LR
+flowchart TB
   subgraph People
     Owner["Shop owner"]
-    Judge["Demo visitor"]
-    Customer["Shop customer"]
+    Visitor["Demo visitor"]
+    Customer["Customer"]
   end
 
   subgraph Render
-    Web["mend-web<br/>Next.js web service<br/>landing, demo console, API,<br/>webhook receiver, join"]
-    Engine["mend-engine<br/>Python private service<br/>score, draft, pay, cancel, attribute,<br/>join and leave"]
-    Jobs["mend-jobs<br/>cron job every 5 minutes<br/>purge, process events, reconcile,<br/>refresh items, cancel demo unclaimed"]
-    DB[("mend-db<br/>Postgres<br/>shop orders, members and consent,<br/>scores, campaigns, payouts, audit log")]
+    Web["mend-web<br/>pages, API, webhooks, join"]
+    Engine["mend-engine<br/>scores, drafts, pays"]
+    Jobs["mend-jobs<br/>every 5 minutes"]
+    DB[("mend-db<br/>Postgres")]
   end
 
-  Claude["Claude Haiku 5.5<br/>goal reading, notes, Q&A"]
+  Claude["Claude Haiku 5.5<br/>plans, notes, answers"]
 
   subgraph PayPal["PayPal sandbox"]
     Login["Log in with PayPal"]
-    MCP["MCP server<br/>four read-only tools"]
-    Reads["REST reads<br/>orders, disputes, products"]
+    Reads["Read-only tools<br/>MCP, REST fallback"]
     Payouts["Payouts"]
     Orders["Orders v2"]
-    Balances["Reporting balances"]
+    Balances["Balances"]
     Hooks["Webhooks"]
-    TxSearch["Transaction Search"]
   end
 
   Owner --> Web
-  Judge --> Web
-  Customer -- "joins or leaves the thank-you list" --> Web
-  Web -- "sign-in redirect, code swap, userinfo" --> Login
-  Web --> DB
+  Visitor --> Web
+  Customer -- "joins or leaves" --> Web
+  Web --> Login
   Web --> Claude
-  Web -- "read-only app token;<br/>identity stripped" --> MCP
-  Web -.->|"fallback when the MCP server fails"| Reads
-  Web -- "POST /tasks/name<br/>private network, token" --> Engine
-  Jobs --> DB
-  Jobs --> Payouts
-  Jobs --> Orders
-  Jobs --> Balances
+  Web -- "read-only app" --> Reads
+  Web -- "private network" --> Engine
+  Web --> DB
   Engine --> DB
-  Engine -- "floor checked before every send" --> Balances
+  Jobs --> DB
+  Engine -- "floor check" --> Balances
   Engine --> Payouts
   Engine --> Orders
-  Engine -.->|"M1 proof script only, no live task"| TxSearch
+  Jobs --> Payouts
+  Hooks -- "signed events" --> Web
   Payouts -- "cashback and note" --> Customer
-  Hooks -- "signed events, checked<br/>against the PayPal certificate" --> Web
+
+  Login ~~~ Payouts
+  Reads ~~~ Orders
+  Hooks ~~~ Balances
 ```
 
 ### One campaign, end to end
@@ -149,58 +147,43 @@ sequenceDiagram
   autonumber
   actor O as Owner
   participant W as Web app
-  participant C as Claude Haiku
-  participant E as Engine (private service)
-  participant D as Postgres
-  participant P as PayPal sandbox
-  actor M as Member customer
+  participant C as Claude
+  participant E as Engine
+  participant P as PayPal
+  actor M as Member
 
-  O->>W: Goal and budget ("bring back quiet regulars, 50 dollars")
+  O->>W: Goal and budget
   W->>C: Goal text only
-  C-->>W: Structured settings (budget, reward, holdout share, customers considered), schema checked
-  W->>W: Code clamps every value to the caps
-  W->>E: POST /tasks/draft_campaign (settings), with the engine token
-  E->>D: Members with scores (expected purchases, value)
-  E->>E: Eligible set, random holdout (CSPRNG), amounts under caps
-  E-->>W: Draft with opaque customer refs
-  loop one call per customer
-    W->>C: That customer's items and history only
-    C-->>W: Note text
-    W->>W: Note rules (C13), else template
+  C-->>W: Settings, schema checked
+  W->>W: Clamp to the caps
+  W->>E: draft_campaign
+  E->>E: Eligible, holdout, amounts
+  E-->>W: Draft with opaque refs
+  loop each customer
+    W->>C: That customer's history
+    C-->>W: Note, checked (C13)
   end
-  W-->>O: Exact recipients, amounts, notes, holdout size
-  O->>W: Approve (same origin, CSRF)
-  W->>E: approve_campaign(id, hash the owner saw)
-  E->>D: Approval recorded only if the hash matches the snapshot (C2)
-  W->>E: submit_campaign(id)
-  E->>P: GET /v1/reporting/balances (C20)
-  E->>E: Batch, fees and the floor fit, else nothing is sent
-  E->>D: approved to submitting, atomic (C3)
-  E->>P: POST /v1/payments/payouts (sender_batch_id from snapshot)
-  P-->>E: batch PENDING
-  P-->>M: Cashback and note in their PayPal
-  P->>W: PAYMENT.PAYOUTS-ITEM.SUCCEEDED (signed)
-  W->>W: Check the signature against the PayPal certificate chain (C9)
-  W->>D: Store the verified event once
-  W-)E: process_events, not waited on
-  Note over W,E: mend-jobs also runs process_events every 5 minutes, and refresh_items re-reads any item still unsettled after 15 minutes
-  E->>P: GET payout item (C10)
-  E->>D: Status forward only
-  O->>W: Simulate a return purchase by one member
-  W->>E: simulate_return(id, member ref)
-  E->>P: Order paid with the sandbox test card, captured at once, id stored (C8, C21)
-  Note over E,P: Purchases are simulated in the sandbox today. From here on, one is attributed the same way a real purchase would be.
-  P->>W: PAYMENT.CAPTURE.COMPLETED (signed)
-  W->>D: Store the verified event once
-  W-)E: process_events, not waited on
-  E->>P: GET order, only one simulate created (C8, C10)
-  E->>D: Purchase and attribution, rewarded or holdout, labelled simulated
+  W-->>O: Recipients, amounts, notes
+  O->>W: Approve this exact plan
+  W->>E: approve, then submit
+  E->>E: Hash matches (C2)
+  E->>P: Balance check (C20)
+  E->>P: One Payouts batch (C3)
+  P-->>M: Cashback and note
+  P->>W: Signed webhook
+  W->>W: Signature check (C9)
+  W-)E: process_events
+  E->>P: Re-read the item (C10)
+  O->>W: Simulate a return
+  W->>E: simulate_return
+  E->>P: Sandbox order (C8, C21)
+  P->>W: Signed webhook
+  E->>P: Re-read the order (C10)
   O->>W: Results
-  W-->>O: Spend, return rate rewarded vs holdout, PayPal ids
-  O->>W: Take back unclaimed cashback
-  W->>E: cancel_unclaimed(id)
-  E->>P: POST /v1/payments/payouts-item/id/cancel for each UNCLAIMED item
-  E->>D: Each returned item recorded, with counts of what came back and what is still unclaimed
+  W-->>O: Paid against held back
+  O->>W: Take back unclaimed
+  W->>E: cancel_unclaimed
+  E->>P: Cancel each unclaimed item
 ```
 
 ### Module dependencies
@@ -208,38 +191,38 @@ sequenceDiagram
 ```mermaid
 flowchart TB
   subgraph web["packages/web (TypeScript)"]
-    pages["pages: landing, demo console, docs"]
-    api["api routes: sessions, campaigns, agent, join and leave"]
+    pages["pages"]
+    api["API routes"]
     hook["webhook receiver"]
-    agent["agent: Claude client + read-only tools"]
-    perms["permissions table (C18)"]
+    agent["agent"]
+    perms["permissions (C18)"]
     notes["note rules (C13)"]
-    ppweb["paypal client: token, sandbox host check (C16)"]
-    sig["webhook signature: checked in the app against the PayPal certificate chain (C9)"]
-    mcp["paypal mcp client: four read-only tools, read-only app token, identity stripped (C1, C15)"]
-    pread["paypal read: direct REST fallback for the same four reads, same rules (C15, C16)"]
-    login["log in with paypal: signed join cookie, code swap, userinfo (C17)"]
-    enginecall["engine client: POST /tasks/name with token, run store"]
+    sig["signature check (C9)"]
+    mcp["PayPal MCP client (C1, C15)"]
+    pread["REST fallback (C15, C16)"]
+    login["Log in with PayPal (C17)"]
+    ppweb["PayPal client (C16)"]
+    enginecall["engine client"]
   end
 
   subgraph engine["packages/engine (Python)"]
-    server["task server: token checked first (mend-engine)"]
-    jobs["jobs: purge, process_events, reconcile, refresh_items, cancel_demo_unclaimed (mend-jobs)"]
-    tasks["tasks: one function per task"]
-    members["members: consent, join, leave (C28)"]
-    events["events: re-read from PayPal, status forward only (C10)"]
-    model["model: BG/NBD expected purchases"]
-    draft["draft: eligibility, holdout, amounts (C4 to C6)"]
-    money["money: decimal minor units"]
-    payout["payouts: submit, reconcile, refresh (C3, C10)"]
-    balances["balances: floor read before every send and resend (C20)"]
-    cancel["cancel: unclaimed items back to the shop (C3)"]
+    server["task server"]
+    jobs["jobs"]
+    tasks["tasks"]
+    members["members (C28)"]
+    events["events (C10)"]
+    draft["draft (C4 to C6)"]
+    model["model: BG/NBD"]
+    money["money"]
+    payout["payouts (C3, C10)"]
+    balances["balances (C20)"]
+    cancel["cancel (C3)"]
     attrib["attribution (C8)"]
-    purge["purge: PayPal data older than 48 hours (C27)"]
-    ppeng["paypal client: sandbox host check (C16)"]
+    purge["purge (C27)"]
+    ppeng["PayPal client (C16)"]
   end
 
-  db[("Postgres schema + migrations")]
+  db[("Postgres")]
 
   pages --> api
   api --> perms

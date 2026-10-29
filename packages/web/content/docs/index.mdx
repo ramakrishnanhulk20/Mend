@@ -3,9 +3,7 @@ title: Mend
 description: Mend finds a shop's quiet regulars, has Claude plan a small cashback thank-you, pays it through PayPal Payouts and measures whether it brought anyone back.
 ---
 
-Mend repairs the relationship with customers who drifted away.
-
-Mend finds a shop's regulars who have gone quiet, has Claude draft a small cashback plan, pays it through PayPal Payouts to customers who joined with Log in with PayPal, and holds a random group back to measure whether it worked.
+Mend repairs the relationship with customers who drifted away. It pays only customers who joined the shop's thank-you list with Log in with PayPal, and everything here runs in the PayPal sandbox.
 
 ## Who it is for
 
@@ -17,7 +15,7 @@ Mend works from the shop's own order history. It only pays customers who chose t
 
 The cashback lands in the PayPal wallet the customer already pays with. Customers opt in with Log in with PayPal, so Mend has a verified PayPal identity to pay and nobody is paid without saying yes. Each campaign is one PayPal Payouts batch, PayPal's signed webhooks say what happened to every payment, and cashback nobody claims goes back to the shop with one Payouts call. More in [Why PayPal](/docs/concepts/why-paypal).
 
-## The five steps
+## The owner's five steps in the console
 
 1. See who went quiet: Mend's forecast ranks the shop's regulars, most at risk first.
 2. Ask Claude for a plan: say what you want in a sentence. Claude sets the budget and reward within the caps, and code checks every number.

@@ -93,7 +93,10 @@ const ANSWERS: Record<string, unknown> = {
     per_recipient_minor: 100,
     holdout_share: "0.2",
     total_minor: 900,
-    rows: [],
+    rows: [
+      { ref: "R1", role: "holdout", rank: 1, amount_minor: null, note: null, stand_in: false },
+      { ref: "R2", role: "reward", rank: 2, amount_minor: 100, note: "Thank you for shopping with us.", stand_in: true },
+    ],
     review_hash: HASH,
     review_problem: null,
   },
@@ -114,8 +117,22 @@ const ANSWERS: Record<string, unknown> = {
     p_value: 0.5,
     verdict: "too early to tell",
     payouts: PAYOUTS,
+    rows: [
+      { ref: "R1", role: "holdout", rank: 1, stand_in: false, payout_status: null, simulated_return: false, real_return: false },
+      { ref: "R2", role: "reward", rank: 2, stand_in: true, payout_status: "UNCLAIMED", simulated_return: true, real_return: false },
+    ],
   },
-  cancel_unclaimed: { ok: true, campaign_id: CAMPAIGN, cancelled: 2, returned_minor: 20, still_unclaimed: 0, not_cancellable: 1 },
+  cancel_unclaimed: {
+    ok: true,
+    campaign_id: CAMPAIGN,
+    cancelled: 2,
+    returned_minor: 20,
+    still_unclaimed: 0,
+    not_cancellable: 1,
+    incomplete: false,
+    paypal_status: null,
+    paypal_name: null,
+  },
   shop_summary: {
     ok: true,
     as_of: "2026-10-16",
@@ -133,7 +150,7 @@ const ANSWERS: Record<string, unknown> = {
     ok: true,
     as_of: "2026-10-16",
     total: 1357,
-    rows: [{ position: 1, display_name: "Priya X.", purchase_days: 7, days_silent: 95, score: 0.08, paid_net_minor: 4821, member: true }],
+    rows: [{ position: 1, display_name: "Priya X.", purchase_days: 7, days_silent: 95, score: 0.08, paid_net_minor: 4821, member: true, stand_in: false }],
   },
   process_events: { ok: true, ran: true, outcomes: { "status recorded": 2 }, retrying: 0 },
   reconcile: { ok: true, ran: true, looked_at: 0, sent: 0, waiting: 0 },
@@ -426,7 +443,7 @@ describe("the shop routes", () => {
     expect(await json(response)).toEqual({
       asOf: "2026-10-16",
       total: 1357,
-      rows: [{ position: 1, displayName: "Priya X.", purchaseDays: 7, daysSilent: 95, score: 0.08, paidNetMinor: 4821, member: true }],
+      rows: [{ position: 1, displayName: "Priya X.", purchaseDays: 7, daysSilent: 95, score: 0.08, paidNetMinor: 4821, member: true, standIn: false }],
     });
     await GET(request("GET", "/api/shop/quiet-regulars", { session: demo }));
     expect(bridge.seen.map((call) => call.args)).toEqual([
@@ -439,7 +456,7 @@ describe("the shop routes", () => {
     const { GET } = await import("./shop/quiet-regulars/route");
     bridge.overrides.quiet_regulars = {
       ...(ANSWERS.quiet_regulars as object),
-      rows: [{ position: 1, display_name: "maya@shop.example", purchase_days: 7, days_silent: 95, score: 0.08, paid_net_minor: 4821, member: true }],
+      rows: [{ position: 1, display_name: "maya@shop.example", purchase_days: 7, days_silent: 95, score: 0.08, paid_net_minor: 4821, member: true, stand_in: false }],
     };
     const response = await GET(request("GET", "/api/shop/quiet-regulars", { session: await createSession("demo") }));
     expect(response.status).toBe(500);
@@ -486,7 +503,7 @@ describe("runs", () => {
 });
 
 describe("pulling back unclaimed rewards, and the payout states in results", () => {
-  const CANCELLED = { campaignId: CAMPAIGN, cancelled: 2, returnedMinor: 20, stillUnclaimed: 0, notCancellable: 1 };
+  const CANCELLED = { campaignId: CAMPAIGN, cancelled: 2, returnedMinor: 20, stillUnclaimed: 0, notCancellable: 1, incomplete: false, paypalStatus: null, paypalName: null };
 
   it("lets the owner pull back unclaimed rewards, sending only the id and the actor", async () => {
     const { POST } = await import("./campaigns/[id]/cancel-unclaimed/route");
@@ -552,12 +569,30 @@ describe("pulling back unclaimed rewards, and the payout states in results", () 
     expect(await json(polled)).toEqual({ error: "not_submitted", message: expect.any(String), ref: ENGINE_REF });
   });
 
-  it("answers 503 paypal_unavailable when PayPal is out of reach", async () => {
+  it("answers 200 with what came back, what is still out and PayPal's error code when PayPal fails one reward, not 503", async () => {
     const { POST } = await import("./campaigns/[id]/cancel-unclaimed/route");
-    bridge.overrides.cancel_unclaimed = { ok: false, error: "paypal_unavailable", ref: ENGINE_REF };
-    const response = await POST(request("POST", "/x", { session: await createSession("owner") }), params({ id: CAMPAIGN }));
-    expect(response.status).toBe(503);
-    expect(await json(response)).toEqual({ error: "paypal_unavailable", message: expect.any(String), ref: ENGINE_REF });
+    bridge.overrides.cancel_unclaimed = {
+      ...(ANSWERS.cancel_unclaimed as object),
+      cancelled: 3,
+      returned_minor: 600,
+      still_unclaimed: 1,
+      not_cancellable: 0,
+      incomplete: true,
+      paypal_status: 500,
+      paypal_name: "INTERNAL_SERVICE_ERROR",
+    };
+    const response = await POST(request("POST", "/x", { session: await createSession("demo") }), params({ id: CAMPAIGN }));
+    expect(response.status).toBe(200);
+    expect(await json(response)).toEqual({
+      campaignId: CAMPAIGN,
+      cancelled: 3,
+      returnedMinor: 600,
+      stillUnclaimed: 1,
+      notCancellable: 0,
+      incomplete: true,
+      paypalStatus: 500,
+      paypalName: "INTERNAL_SERVICE_ERROR",
+    });
   });
 
   it("results carry the payout states, with PayPal's status names exactly as the engine sent them", async () => {

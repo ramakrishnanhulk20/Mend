@@ -48,6 +48,9 @@ const displayName = z.string().min(1).max(80).regex(/^[^\p{Cc}\p{Cf}@]+$/u);
 const shopName = z.string().min(1).max(100).regex(/^\P{C}+$/u);
 const consentText = z.string().min(1).max(1000).regex(/^\P{C}+$/u);
 const sha256Hex = z.string().regex(/^[0-9a-f]{64}$/);
+const httpStatus = z.number().int().min(100).max(599);
+// The shape the engine keeps PayPal's error names to (campaigns/cancel.py _ERROR_NAME).
+const paypalErrorName = z.string().regex(/^[A-Z0-9_]{1,64}$/);
 // The engine's name for the members a demo script joined, whom no person agreed to be (tasks.py SEEDED_LABEL).
 // Kept apart from the people who joined, and never added to them.
 const seededLabel = z.literal("demo stand-ins");
@@ -86,7 +89,46 @@ const ROW_ANSWER = z.strictObject({
   rank: z.number().int().min(1),
   amount_minor: cents.nullable(),
   note: z.string().max(400).nullable(),
+  stand_in: z.boolean(),
 });
+
+// A reward's payout item status as Mend's ledger stores it; the engine shows any other
+// stored text as UNKNOWN (campaigns/results.py _SHOWN_STATUS), so this matches its rule.
+const payoutStatus = z.string().regex(/^[A-Z_]{1,32}$/);
+// One customer's thread in a campaign, by ref only (C15). A held-back row never carries a
+// payout status: if one ever did, a held-back customer was paid, so the answer is refused.
+const RESULT_ROW_ANSWER = z
+  .strictObject({
+    ref: memberRef,
+    role: z.enum(["reward", "holdout"]),
+    rank: z.number().int().min(1),
+    stand_in: z.boolean(),
+    payout_status: payoutStatus.nullable(),
+    simulated_return: z.boolean(),
+    real_return: z.boolean(),
+  })
+  .refine((row) => row.role === "reward" || row.payout_status === null, "a held-back row has no payout");
+const RESULT_ROW = z.strictObject({
+  ref: memberRef,
+  role: z.enum(["reward", "holdout"]),
+  rank: z.number().int().min(1),
+  standIn: z.boolean(),
+  payoutStatus: payoutStatus.nullable(),
+  simulatedReturn: z.boolean(),
+  realReturn: z.boolean(),
+});
+
+function resultRow(answer: z.output<typeof RESULT_ROW_ANSWER>): z.input<typeof RESULT_ROW> {
+  return {
+    ref: answer.ref,
+    role: answer.role,
+    rank: answer.rank,
+    standIn: answer.stand_in,
+    payoutStatus: answer.payout_status,
+    simulatedReturn: answer.simulated_return,
+    realReturn: answer.real_return,
+  };
+}
 
 const ARM_ANSWER = z.strictObject({ members: count, real_returns: count, real_rate: share.nullable(), simulated_returns: count });
 const ARM = z.strictObject({ members: count, realReturns: count, realRate: share.nullable(), simulatedReturns: count });
@@ -285,6 +327,8 @@ const QUIET_ROW_ANSWER = z.strictObject({
   score: z.number().min(0),
   paid_net_minor: cents,
   member: z.boolean(),
+  // The member is a demo stand-in the seed script joined, never a person who joined (C23).
+  stand_in: z.boolean(),
 });
 const QUIET_ROW = z.strictObject({
   position: z.number().int().min(1).max(50),
@@ -294,6 +338,7 @@ const QUIET_ROW = z.strictObject({
   score: z.number().min(0),
   paidNetMinor: cents,
   member: z.boolean(),
+  standIn: z.boolean(),
 });
 
 const SPECS: Readonly<Record<TaskName, Spec>> = {
@@ -328,7 +373,7 @@ const SPECS: Readonly<Record<TaskName, Spec>> = {
       perRecipientMinor: a.per_recipient_minor,
       holdoutShare: a.holdout_share,
       totalMinor: a.total_minor,
-      rows: a.rows.map((row) => ({ ref: row.ref, role: row.role, rank: row.rank, amountMinor: row.amount_minor, note: row.note })),
+      rows: a.rows.map((row) => ({ ref: row.ref, role: row.role, rank: row.rank, amountMinor: row.amount_minor, note: row.note, standIn: row.stand_in })),
       reviewHash: a.review_hash,
       reviewProblem: a.review_problem,
     }),
@@ -342,7 +387,16 @@ const SPECS: Readonly<Record<TaskName, Spec>> = {
       holdoutShare: z.string().regex(/^0\.\d{1,2}$/),
       totalMinor: cents,
       rows: z
-        .array(z.strictObject({ ref: memberRef, role: z.enum(["reward", "holdout"]), rank: z.number().int().min(1), amountMinor: cents.nullable(), note: z.string().max(400).nullable() }))
+        .array(
+          z.strictObject({
+            ref: memberRef,
+            role: z.enum(["reward", "holdout"]),
+            rank: z.number().int().min(1),
+            amountMinor: cents.nullable(),
+            note: z.string().max(400).nullable(),
+            standIn: z.boolean(),
+          }),
+        )
         .max(250),
       reviewHash: z.string().regex(/^[0-9a-f]{64}$/).nullable(),
       reviewProblem: z.string().regex(/^[a-z][a-z_]{0,63}$/).nullable(),
@@ -388,6 +442,7 @@ const SPECS: Readonly<Record<TaskName, Spec>> = {
       p_value: share.nullable(),
       verdict: z.string().min(1).max(200),
       payouts: PAYOUTS_ANSWER,
+      rows: z.array(RESULT_ROW_ANSWER).max(250),
     }),
     (a) => ({
       campaignId: a.campaign_id,
@@ -402,6 +457,7 @@ const SPECS: Readonly<Record<TaskName, Spec>> = {
       pValue: a.p_value,
       verdict: a.verdict,
       payouts: payouts(a.payouts),
+      rows: a.rows.map(resultRow),
     }),
     z.strictObject({
       campaignId,
@@ -416,6 +472,7 @@ const SPECS: Readonly<Record<TaskName, Spec>> = {
       pValue: share.nullable(),
       verdict: z.string().min(1).max(200),
       payouts: PAYOUTS,
+      rows: z.array(RESULT_ROW).max(250),
     }),
   ),
   shop_summary: spec(
@@ -500,6 +557,7 @@ const SPECS: Readonly<Record<TaskName, Spec>> = {
         score: row.score,
         paidNetMinor: row.paid_net_minor,
         member: row.member,
+        standIn: row.stand_in,
       })),
     }),
     z
@@ -590,11 +648,44 @@ const SPECS: Readonly<Record<TaskName, Spec>> = {
     () => ({ outcome: "left" as const }),
     z.strictObject({ outcome: z.literal("left") }),
   ),
+  // A cancel PayPal cut short still answers its counts; a reward PayPal gave no clear
+  // answer for stays in stillUnclaimed until PayPal settles it (C3). Of PayPal's error,
+  // only its HTTP status and short code come through, never its message or debug id (C17).
   cancel_unclaimed: spec(
     200,
-    z.strictObject({ ok: z.literal(true), campaign_id: campaignId, cancelled: count, returned_minor: cents, still_unclaimed: count, not_cancellable: count }),
-    (a) => ({ campaignId: a.campaign_id, cancelled: a.cancelled, returnedMinor: a.returned_minor, stillUnclaimed: a.still_unclaimed, notCancellable: a.not_cancellable }),
-    z.strictObject({ campaignId, cancelled: count, returnedMinor: cents, stillUnclaimed: count, notCancellable: count }),
+    z
+      .strictObject({
+        ok: z.literal(true),
+        campaign_id: campaignId,
+        cancelled: count,
+        returned_minor: cents,
+        still_unclaimed: count,
+        not_cancellable: count,
+        incomplete: z.boolean(),
+        paypal_status: httpStatus.nullable(),
+        paypal_name: paypalErrorName.nullable(),
+      })
+      .refine((a) => a.incomplete || (a.paypal_status === null && a.paypal_name === null), "a whole run carries no PayPal error"),
+    (a) => ({
+      campaignId: a.campaign_id,
+      cancelled: a.cancelled,
+      returnedMinor: a.returned_minor,
+      stillUnclaimed: a.still_unclaimed,
+      notCancellable: a.not_cancellable,
+      incomplete: a.incomplete,
+      paypalStatus: a.paypal_status,
+      paypalName: a.paypal_name,
+    }),
+    z.strictObject({
+      campaignId,
+      cancelled: count,
+      returnedMinor: cents,
+      stillUnclaimed: count,
+      notCancellable: count,
+      incomplete: z.boolean(),
+      paypalStatus: httpStatus.nullable(),
+      paypalName: paypalErrorName.nullable(),
+    }),
   ),
 };
 

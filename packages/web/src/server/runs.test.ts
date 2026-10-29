@@ -1,11 +1,12 @@
 // Covers run ownership against a real Postgres schema, how each task's engine answer
 // becomes its route's response (success bodies, refusals, malformed answers, results
-// with no p-value yet, and the no-email, no-UUID rule on summary and quiet-regular
-// output), and the orders a session bought through simulate being remembered for that
-// session alone, from the direct and the polled answer, at most 50 for 24 hours. Does
-// NOT cover: the route handlers themselves (npm run prove:m7b polls a run from a second
-// session), Render's own run store (engine.test.ts fakes it), or the agent reading those
-// orders (agent.test.ts).
+// with no p-value yet, each campaign row's payout status, returns and stand-in flag in
+// results and the view and on each quiet regular, a cancel PayPal cut short, and the
+// no-email, no-UUID rule on summary and quiet-regular output), and the orders a session bought through simulate
+// being remembered for that session alone, from the direct and the polled answer, at
+// most 50 for 24 hours. Does NOT cover: the route handlers themselves (npm run
+// prove:m7b polls a run from a second session), Render's own run store (engine.test.ts
+// fakes it), or the agent reading those orders (agent.test.ts).
 import { execFileSync, spawn } from "node:child_process";
 import { once } from "node:events";
 import { readFileSync } from "node:fs";
@@ -58,7 +59,7 @@ let admin: pg.Client;
 let logLines: string[] = [];
 const schema = `web_runs_${process.pid}_${Date.now()}`;
 
-const QUIET_ROW = { position: 1, display_name: "Priya X.", purchase_days: 7, days_silent: 95, score: 0.0812, paid_net_minor: 48210, member: true };
+const QUIET_ROW = { position: 1, display_name: "Priya X.", purchase_days: 7, days_silent: 95, score: 0.0812, paid_net_minor: 48210, member: true, stand_in: false };
 const BENCHMARK = {
   source: "CDNOW sample, Fader, Hardie and Lee (2005)",
   customers: 2357,
@@ -122,6 +123,47 @@ const SUMMARY = {
   benchmark: BENCHMARK,
   backtest: BACKTEST,
 } as const;
+// Three rows exactly as the engine's results task answered them in its own test: a held-back
+// customer with a real return, a demo stand-in's reward still unclaimed, and a claimed reward
+// with a simulated return.
+const RESULT_ROWS = [
+  { ref: "R1", role: "holdout", rank: 1, stand_in: false, payout_status: null, simulated_return: false, real_return: true },
+  { ref: "R2", role: "reward", rank: 2, stand_in: true, payout_status: "UNCLAIMED", simulated_return: false, real_return: false },
+  { ref: "R5", role: "reward", rank: 5, stand_in: false, payout_status: "SUCCESS", simulated_return: true, real_return: false },
+];
+const RESULTS = {
+  ok: true as const,
+  campaign_id: CAMPAIGN,
+  status: "submitted",
+  rewarded: { members: 5, real_returns: 0, real_rate: 0, simulated_returns: 1 },
+  holdout: { members: 5, real_returns: 1, real_rate: 0.2, simulated_returns: 0 },
+  spend_minor: 200,
+  fees_minor: 25,
+  window_starts_at: "2026-10-24T05:00:00+00:00",
+  window_ends_at: "2026-11-23T05:00:00+00:00",
+  window_open: true,
+  p_value: null,
+  verdict: "too early to tell",
+  payouts: { items: 2, by_status: { SUCCESS: 1, UNCLAIMED: 1 }, claimed_minor: 200, unclaimed_minor: 200, returned_minor: 0, failed_minor: 0, pending_minor: 0, unclaimed_return_by: "2026-11-23T05:00:00+00:00" },
+  rows: RESULT_ROWS,
+};
+const VIEW = {
+  ok: true as const,
+  campaign_id: CAMPAIGN,
+  status: "draft",
+  goal_text: "Win back quiet regulars",
+  as_of: "2026-10-16",
+  budget_minor: 1000,
+  per_recipient_minor: 200,
+  holdout_share: "0.50",
+  total_minor: 200,
+  rows: [
+    { ref: "R1", role: "holdout", rank: 1, amount_minor: null, note: null, stand_in: false },
+    { ref: "R2", role: "reward", rank: 2, amount_minor: 200, note: "Thank you for shopping with us.", stand_in: true },
+  ],
+  review_hash: "e".repeat(64),
+  review_problem: null,
+};
 
 function finished(task: TaskName, result: EngineAnswer | undefined, status: "succeeded" | "failed" = "succeeded"): Response {
   return finishedResponse(ROUTE, REF, task, RUN, { status, result });
@@ -268,6 +310,7 @@ describe("finished runs become each route's own response", () => {
         pending_minor: 0,
         unclaimed_return_by: "2026-11-23T05:00:00+00:00",
       },
+      rows: RESULT_ROWS,
     });
     expect(await results.json()).toMatchObject({ rewarded: { members: 10, realReturns: 0, realRate: 0, simulatedReturns: 1 }, holdout: { simulatedReturns: 0 }, verdict: "too early to tell" });
   });
@@ -348,15 +391,29 @@ describe("finished runs become each route's own response", () => {
     expect(await response.json()).toEqual({ error: "internal", message: "Something went wrong.", ref: REF });
   });
 
-  it("quiet regulars carry position, name, numbers and the member flag, and nothing else", async () => {
+  it("quiet regulars carry position, name, numbers, the member flag and the stand-in flag, and nothing else", async () => {
     const response = finished("quiet_regulars", { ok: true, as_of: "2026-10-16", total: 1357, rows: [QUIET_ROW] });
     const body = await response.json();
     expect(body).toEqual({
       asOf: "2026-10-16",
       total: 1357,
-      rows: [{ position: 1, displayName: "Priya X.", purchaseDays: 7, daysSilent: 95, score: 0.0812, paidNetMinor: 48210, member: true }],
+      rows: [{ position: 1, displayName: "Priya X.", purchaseDays: 7, daysSilent: 95, score: 0.0812, paidNetMinor: 48210, member: true, standIn: false }],
     });
     expect(JSON.stringify(body)).not.toMatch(/@|[0-9a-f]{8}-[0-9a-f]{4}-/i);
+  });
+
+  it("a quiet regular whose member the seed script joined comes out as standIn, apart from a person who joined and a non-member", async () => {
+    const rows = [
+      { ...QUIET_ROW, stand_in: true },
+      { ...QUIET_ROW, position: 2, display_name: "Arjun K." },
+      { ...QUIET_ROW, position: 3, display_name: "Lena P.", member: false },
+    ];
+    const body = await finished("quiet_regulars", { ok: true, as_of: "2026-10-16", total: 3, rows }).json();
+    expect(body.rows.map((row: { member: boolean; standIn: boolean }) => [row.member, row.standIn])).toEqual([
+      [true, true],
+      [true, false],
+      [false, false],
+    ]);
   });
 
   it.each([
@@ -365,6 +422,9 @@ describe("finished runs become each route's own response", () => {
     ["a customer ref", { ...QUIET_ROW, customer_ref: "C1042" }],
     ["a member id", { ...QUIET_ROW, member_id: CAMPAIGN }],
     ["a control character in a name", { ...QUIET_ROW, display_name: "Maya‮R." }],
+    ["the stand-in flag as text", { ...QUIET_ROW, stand_in: "true" }],
+    ["the stand-in flag as a number", { ...QUIET_ROW, stand_in: 1 }],
+    ["no stand-in flag", { ...QUIET_ROW, stand_in: undefined }],
   ])("quiet regulars are refused with 500 for %s", async (_label, row) => {
     const response = finished("quiet_regulars", { ok: true, as_of: "2026-10-16", total: 1, rows: [row] });
     expect(response.status).toBe(500);
@@ -443,6 +503,7 @@ describe("finished runs become each route's own response", () => {
       p_value: null,
       verdict: "too early to tell",
       payouts: { items: 1, by_status: { UNCLAIMED: 1 }, claimed_minor: 0, unclaimed_minor: 10, returned_minor: 0, failed_minor: 0, pending_minor: 0, unclaimed_return_by: null },
+      rows: [],
     };
     const answered = finished("results", results);
     expect(answered.status).toBe(200);
@@ -450,6 +511,94 @@ describe("finished runs become each route's own response", () => {
     for (const change of [{ p_value: 1.5 }, { p_value: -0.1 }, { p_value: "0.5" }, { owner_email: "x" }, { verdict: "" }]) {
       expect(finished("results", { ...results, ...change }).status, JSON.stringify(change)).toBe(500);
     }
+  });
+
+  it("results carry every row in camelCase: its payout status, its returns and whether it is a demo stand-in", async () => {
+    const answered = finished("results", RESULTS);
+    expect(answered.status).toBe(200);
+    expect((await answered.json()).rows).toEqual([
+      { ref: "R1", role: "holdout", rank: 1, standIn: false, payoutStatus: null, simulatedReturn: false, realReturn: true },
+      { ref: "R2", role: "reward", rank: 2, standIn: true, payoutStatus: "UNCLAIMED", simulatedReturn: false, realReturn: false },
+      { ref: "R5", role: "reward", rank: 5, standIn: false, payoutStatus: "SUCCESS", simulatedReturn: true, realReturn: false },
+    ]);
+  });
+
+  const reward = RESULT_ROWS[1];
+  it.each([
+    ["the old answer with no rows", { rows: undefined }],
+    ["a member id", { rows: [{ ...reward, member_id: CAMPAIGN }] }],
+    ["a payout item id", { rows: [{ ...reward, payout_item_id: "ITEM1" }] }],
+    ["a receiver", { rows: [{ ...reward, receiver: "maya@shop.example" }] }],
+    ["a lowercase status", { rows: [{ ...reward, payout_status: "unclaimed" }] }],
+    ["a status longer than 32 characters", { rows: [{ ...reward, payout_status: "SETTLING_".repeat(4) }] }],
+    ["a status carrying markup", { rows: [{ ...reward, payout_status: "SUCCESS<script>" }] }],
+    ["the stand-in flag as text", { rows: [{ ...reward, stand_in: "true" }] }],
+    ["no stand-in flag", { rows: [{ ...reward, stand_in: undefined }] }],
+    ["a held-back row with a payout status", { rows: [{ ...RESULT_ROWS[0], payout_status: "SUCCESS" }] }],
+    ["more than 250 rows", { rows: Array.from({ length: 251 }, () => reward) }],
+  ])("results with %s are refused with a generic 500", async (_label, change) => {
+    const response = finished("results", { ...RESULTS, ...change });
+    expect(response.status).toBe(500);
+    expect(await response.text()).not.toMatch(/maya|ITEM1|0b6c2f8e|script/i);
+  });
+
+  it("a campaign view's rows carry the stand-in flag, and a row without it or with an extra key is refused", async () => {
+    expect((await finished("view_campaign", VIEW).json()).rows).toEqual([
+      { ref: "R1", role: "holdout", rank: 1, amountMinor: null, note: null, standIn: false },
+      { ref: "R2", role: "reward", rank: 2, amountMinor: 200, note: "Thank you for shopping with us.", standIn: true },
+    ]);
+    const row = VIEW.rows[1];
+    for (const changed of [{ ...row, stand_in: undefined }, { ...row, stand_in: 1 }, { ...row, member_id: CAMPAIGN }]) {
+      expect(finished("view_campaign", { ...VIEW, rows: [changed] }).status, JSON.stringify(changed)).toBe(500);
+    }
+  });
+
+  // The live run of 28 Oct: three rewards returned, PayPal failing the fourth with a 500.
+  const PARTIAL_CANCEL = {
+    ok: true,
+    campaign_id: CAMPAIGN,
+    cancelled: 3,
+    returned_minor: 600,
+    still_unclaimed: 1,
+    not_cancellable: 0,
+    incomplete: true,
+    paypal_status: 500,
+    paypal_name: "INTERNAL_SERVICE_ERROR",
+  } as const;
+
+  it("a cancel PayPal cut short answers 200 with what came back, what is still out and PayPal's error code", async () => {
+    const partial = finished("cancel_unclaimed", PARTIAL_CANCEL);
+    expect(partial.status).toBe(200);
+    expect(await partial.json()).toEqual({
+      campaignId: CAMPAIGN,
+      cancelled: 3,
+      returnedMinor: 600,
+      stillUnclaimed: 1,
+      notCancellable: 0,
+      incomplete: true,
+      paypalStatus: 500,
+      paypalName: "INTERNAL_SERVICE_ERROR",
+    });
+    const unreachable = await finished("cancel_unclaimed", { ...PARTIAL_CANCEL, paypal_status: null, paypal_name: "CONNECTION_ERROR" }).json();
+    expect([unreachable.paypalStatus, unreachable.paypalName]).toEqual([null, "CONNECTION_ERROR"]);
+    const whole = finished("cancel_unclaimed", { ...PARTIAL_CANCEL, cancelled: 4, returned_minor: 800, still_unclaimed: 0, incomplete: false, paypal_status: null, paypal_name: null });
+    expect(await whole.json()).toMatchObject({ cancelled: 4, incomplete: false, paypalStatus: null, paypalName: null });
+  });
+
+  it.each([
+    ["the old answer with no incomplete flag", { incomplete: undefined, paypal_status: undefined, paypal_name: undefined }],
+    ["incomplete as text", { incomplete: "true" }],
+    ["a status as text", { paypal_status: "500" }],
+    ["a status that is no HTTP status", { paypal_status: 5000 }],
+    ["PayPal's message for a name", { paypal_name: "An internal service error has occurred." }],
+    ["PayPal's debug id", { debug_id: "7b2f0c4e91a3d" }],
+    ["PayPal's message", { message: "An internal service error has occurred." }],
+    ["a whole run carrying PayPal's error", { incomplete: false }],
+    ["a negative count", { still_unclaimed: -1 }],
+  ])("a cancel answer with %s is refused with a generic 500", async (_label, change) => {
+    const response = finished("cancel_unclaimed", { ...PARTIAL_CANCEL, ...change });
+    expect(response.status).toBe(500);
+    expect(await response.text()).not.toMatch(/internal service error|7b2f0c4e91a3d/i);
   });
 });
 

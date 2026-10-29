@@ -15,10 +15,13 @@ Spend is the amount of every item PayPal says is SUCCESS or still PENDING (an
 unknown status counts as PENDING), priced from the frozen approved snapshot by sender_item_id.
 The payouts block prices every item of the batch the same way and says where each
 one stands, so a reward that failed, waits unclaimed or came back is shown plainly.
+The rows say the same for each customer on their own, by ref only, read from Mend's
+ledger and records and never from PayPal, so a results read costs no PayPal call.
 """
 
 from __future__ import annotations
 
+import re
 import uuid
 from collections import Counter
 from dataclasses import dataclass
@@ -30,7 +33,8 @@ from scipy.stats import fisher_exact
 from mend_engine.campaigns.approval import frozen_snapshot
 from mend_engine.campaigns.attribution import attribution_window
 from mend_engine.campaigns.spend import database_now
-from mend_engine.events.payout_status import effective
+from mend_engine.events.payout_status import UNREADABLE, effective
+from mend_engine.members.membership import SOURCE_SEED
 from mend_engine.paypal.payouts import BatchSnapshot
 
 MIN_PER_ARM = 30
@@ -45,6 +49,10 @@ RETURNED_STATUSES = ("RETURNED", "REFUNDED", "REVERSED")
 FAILED_STATUSES = ("FAILED", "BLOCKED")
 # PayPal returns an unclaimed payout to the shop by itself this long after sending it.
 UNCLAIMED_RETURN_AFTER = timedelta(days=30)
+# The shape the console accepts for a row's payout status (packages/web/src/server/runs.ts).
+# The ledger can store PayPal's word at up to 36 characters, so a longer one is shown as
+# UNKNOWN rather than failing the whole results answer at the console.
+_SHOWN_STATUS = re.compile(r"[A-Z_]{1,32}", re.ASCII)
 
 
 @dataclass(frozen=True)
@@ -86,6 +94,28 @@ class ArmResults:
 
 
 @dataclass(frozen=True)
+class RowStanding:
+    """One campaign row, rewarded or held back, by ref only: never a member, customer or PayPal identifier (C12, C15).
+
+    payout_status is the reward's payout item status exactly as Mend's ledger stores
+    it; None for a held-back row, whatever the ledger holds under its ref, and for a
+    reward with no item in the ledger yet; UNKNOWN, the ledger's word for a status it
+    cannot read, for an item stored twice or under a status that is not 1 to 32
+    capital letters and underscores. stand_in is stand_in_refs' rule. simulated_return
+    and real_return say whether a simulated or a real purchase is attributed to the
+    row, kept apart as in ArmResults.
+    """
+
+    ref: str
+    role: str
+    rank: int
+    stand_in: bool
+    payout_status: str | None
+    simulated_return: bool
+    real_return: bool
+
+
+@dataclass(frozen=True)
 class CampaignResults:
     """Money in USD cents. p_value is None until the verdict gate passes (see campaign_results); window times are UTC."""
 
@@ -101,6 +131,7 @@ class CampaignResults:
     p_value: float | None
     verdict: str
     payouts: PayoutStanding
+    rows: tuple[RowStanding, ...]
 
 
 def lift_p_value(rewarded_returns: int, rewarded: int, holdout_returns: int, holdout: int) -> float:
@@ -182,7 +213,62 @@ def campaign_results(conn: psycopg.Connection, campaign_id: uuid.UUID) -> Campai
         p_value=p_value,
         verdict=verdict,
         payouts=_payout_standing(conn, campaign_id, snap),
+        rows=_row_standings(conn, campaign_id),
     )
+
+
+def stand_in_refs(conn: psycopg.Connection, campaign_id: uuid.UUID) -> frozenset[str]:
+    """Refs of the campaign's rows whose member the demo seed script joined (members.source 'seed'), whom no person agreed to be.
+
+    A row whose member left has no member and is not one of them: only people who
+    joined can leave, never a stand-in (tasks.leave).
+    """
+    return frozenset(
+        ref
+        for (ref,) in conn.execute(
+            "select cm.ref from campaign_members cm join members m on m.member_id = cm.member_id "
+            "where cm.campaign_id = %s and m.source = %s",
+            (campaign_id, SOURCE_SEED),
+        )
+    )
+
+
+def _row_standings(conn: psycopg.Connection, campaign_id: uuid.UUID) -> tuple[RowStanding, ...]:
+    """Every row of the campaign in rank order, as RowStanding says."""
+    stand_ins = stand_in_refs(conn, campaign_id)
+    # A payout item's sender_item_id is its row's ref (approval.current_snapshot).
+    ledger: dict[str, list[str]] = {}
+    for sender_item_id, status in conn.execute(
+        "select i.sender_item_id, i.status from payout_items i "
+        "join payout_batches b on b.sender_batch_id = i.sender_batch_id where b.campaign_id = %s",
+        (str(campaign_id),),
+    ):
+        ledger.setdefault(sender_item_id, []).append(status)
+    returned = set(conn.execute("select distinct ref, simulated from attributions where campaign_id = %s", (campaign_id,)).fetchall())
+    rows = conn.execute(
+        "select ref, role, rank from campaign_members where campaign_id = %s order by rank", (campaign_id,)
+    ).fetchall()
+    return tuple(
+        RowStanding(
+            ref=ref,
+            role=role,
+            rank=rank,
+            stand_in=ref in stand_ins,
+            payout_status=_shown_status(ledger.get(ref, [])) if role == "reward" else None,
+            simulated_return=(ref, True) in returned,
+            real_return=(ref, False) in returned,
+        )
+        for ref, role, rank in rows
+    )
+
+
+def _shown_status(stored: list[str]) -> str | None:
+    if not stored:
+        return None
+    # The ledger holds one row per item; if it ever held two, neither is believed, as in _payout_standing.
+    if len(stored) == 1 and _SHOWN_STATUS.fullmatch(stored[0]):
+        return stored[0]
+    return UNREADABLE
 
 
 def _arm(members: int, real: int, simulated: int) -> ArmResults:

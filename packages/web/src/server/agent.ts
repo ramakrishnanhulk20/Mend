@@ -223,7 +223,7 @@ function liveSegmentLabel(group: z.infer<typeof BACKTEST_GROUP>): string {
 const QUIET = z.object({
   asOf: z.string().nullable(),
   total: z.number(),
-  rows: z.array(z.object({ position: z.number(), purchaseDays: z.number(), daysSilent: z.number(), score: z.number(), paidNetMinor: z.number(), member: z.boolean() })),
+  rows: z.array(z.object({ position: z.number(), purchaseDays: z.number(), daysSilent: z.number(), score: z.number(), paidNetMinor: z.number(), member: z.boolean(), standIn: z.boolean() })),
 });
 const VIEW = z.object({
   campaignId: z.string(),
@@ -232,7 +232,7 @@ const VIEW = z.object({
   perRecipientMinor: z.number(),
   holdoutShare: z.string(),
   totalMinor: z.number(),
-  rows: z.array(z.object({ ref: z.string(), role: z.enum(["reward", "holdout"]), amountMinor: z.number().nullable(), note: z.string().nullable() })),
+  rows: z.array(z.object({ ref: z.string(), role: z.enum(["reward", "holdout"]), amountMinor: z.number().nullable(), note: z.string().nullable(), standIn: z.boolean() })),
   reviewHash: z.string().nullable(),
   reviewProblem: z.string().nullable(),
 });
@@ -379,7 +379,7 @@ export function agentTools(turn: Turn): AgentTool[] {
       name: "quiet_regulars",
       action: "shop.quiet_regulars",
       description:
-        "Call when the owner asks which regulars have gone quiet, who is most at risk of not coming back, or who could be won back. Returns the 20 most at risk by position only, never names, with how often they bought, days since they last bought, expected purchases in the next 13 weeks, what they paid in US cents, and whether they are members who can be thanked.",
+        "Call when the owner asks which regulars have gone quiet, who is most at risk of not coming back, or who could be won back. Returns the 20 most at risk by position only, never names, with how often they bought, days since they last bought, expected purchases in the next 13 weeks, what they paid in US cents, and whether they are members who can be thanked. standIn true means a demo stand-in a script joined, never a person who signed up: always call those demo stand-ins.",
       input: z.strictObject({}),
       run: async () => {
         const quiet = QUIET.parse(await answered(turn, "quiet_regulars", [actor, QUIET_REGULARS_SHOWN]));

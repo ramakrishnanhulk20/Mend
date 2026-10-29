@@ -25,6 +25,7 @@ from psycopg import sql
 from psycopg.types.json import Jsonb
 
 from mend_engine import store_facts, tasks
+from mend_engine.campaigns.attribution import attribute_purchase
 from mend_engine.campaigns.drafts import NOTE_TEMPLATE
 from mend_engine.config import SANDBOX_API_HOST, Config, ConfigError
 from mend_engine.db.connect import PGDATA, connect
@@ -32,8 +33,8 @@ from mend_engine.db.migrate import apply_schema
 from mend_engine.members.consent import DEMO_SHOP_NAME
 from mend_engine.members.membership import join_member
 from mend_engine.paypal import payouts
-from mend_engine.paypal.http import PayPalHttp
-from mend_engine.paypal.payouts import BatchSnapshot, PayoutItemSpec, canonical_json, sender_batch_id_for, snapshot_hash
+from mend_engine.paypal.http import PayPalError, PayPalHttp
+from mend_engine.paypal.payouts import BatchSnapshot, PayoutItemSpec, SnapshotRefused, canonical_json, sender_batch_id_for, snapshot_hash
 
 AS_OF = date(2026, 10, 16)
 FIRST_DAY = date(2024, 10, 17)
@@ -47,6 +48,8 @@ DEMO_SETTINGS = {
     "holdout_share": "0.50",
     "max_candidates": 10,
 }
+# PayPal's documented answer to a request it failed on its side.
+PAYPAL_500 = {"name": "INTERNAL_SERVICE_ERROR", "message": "An internal service error has occurred.", "debug_id": "7b2f0c4e91a3d"}
 
 
 class FakePayPal:
@@ -54,13 +57,14 @@ class FakePayPal:
 
     Each batch created gets the next id, BATCH1 first, unless create_status is not
     201, when PayPal refuses the batch with that status. A cancel is answered RETURNED,
-    or with cancel_status when that is not 200. balance is the USD available balance
-    as PayPal writes it, or an HTTP status to fail the balance read with.
+    except for an item named in cancel_failing: that one gets PayPal's error answer
+    with the status given, or no answer at all for None. balance is the USD available
+    balance as PayPal writes it, or an HTTP status to fail the balance read with.
     """
 
     def __init__(self) -> None:
         self.requests: list[httpx.Request] = []
-        self.cancel_status = 200
+        self.cancel_failing: dict[str, int | None] = {}
         self.create_status = 201
         self.batches = 0
         self.balance: str | int = "5033.32"
@@ -87,9 +91,13 @@ class FakePayPal:
         if request.method == "POST" and request.url.path == "/v2/checkout/orders":
             return httpx.Response(201, json={"id": "5O190127TN364715T", "status": "COMPLETED"})
         if request.method == "POST" and request.url.path.startswith(payouts.PAYOUT_ITEM_PATH) and request.url.path.endswith("/cancel"):
-            if self.cancel_status != 200:
-                return httpx.Response(self.cancel_status, json={"name": "INTERNAL_SERVER_ERROR"})
-            return httpx.Response(200, json={"payout_item_id": request.url.path.split("/")[-2], "transaction_status": "RETURNED"})
+            item = request.url.path.split("/")[-2]
+            if item in self.cancel_failing:
+                failing = self.cancel_failing[item]
+                if failing is None:
+                    raise httpx.ConnectError("down", request=request)
+                return httpx.Response(failing, json=PAYPAL_500, headers={"paypal-debug-id": PAYPAL_500["debug_id"]})
+            return httpx.Response(200, json={"payout_item_id": item, "transaction_status": "RETURNED"})
         return httpx.Response(404, json={"name": "RESOURCE_NOT_FOUND"})
 
     def money_requests(self) -> list[httpx.Request]:
@@ -438,7 +446,7 @@ def test_a_demo_actor_approves_and_submits_under_demo_caps(conn: psycopg.Connect
     campaign_id = tasks.draft_campaign(DEMO_SETTINGS, demo)["campaign_id"]
     view = tasks.view_campaign(campaign_id, demo)
     assert view["ok"] and view["status"] == "draft" and len(view["rows"]) == 10
-    assert all(set(row) == {"ref", "role", "rank", "amount_minor", "note"} for row in view["rows"])
+    assert all(set(row) == {"ref", "role", "rank", "amount_minor", "note", "stand_in"} for row in view["rows"])
     assert "@" not in json.dumps(view["rows"])
 
     approval = tasks.approve_campaign(campaign_id, demo, view["review_hash"])
@@ -645,10 +653,63 @@ def test_simulate_and_results_return_json_safe_answers(conn: psycopg.Connection,
     json.dumps(found, allow_nan=False)
 
 
-def sent_with_items(conn: psycopg.Connection, sender: dict) -> tuple[str, int]:
-    """A campaign sender drafted, approved and sent: its first item waits unclaimed, its second was claimed.
+def test_each_row_shows_its_payout_its_returns_and_whether_it_is_a_stand_in_and_never_who_it_is(
+    conn: psycopg.Connection, paypal: FakePayPal
+) -> None:
+    seed_shop(conn)
+    demo = actor(conn, "demo")
+    campaign_id = tasks.draft_campaign(DEMO_SETTINGS, demo)["campaign_id"]
+    cid = uuid.UUID(campaign_id)
+    roles = dict(conn.execute("select ref, role from campaign_members where campaign_id = %s", (cid,)))
+    ordered = sorted(roles, key=lambda ref: int(ref[1:]))
+    rewards = [ref for ref in ordered if roles[ref] == "reward"]
+    holdouts = [ref for ref in ordered if roles[ref] == "holdout"]
+    stand_in, joined = rewards[0], rewards[1]
+    member_of = "(select member_id from campaign_members where campaign_id = %s and ref = %s)"
+    conn.execute(f"update members set source = 'seed' where member_id = {member_of}", (cid, stand_in))
+    conn.execute(f"update members set paypal_payer_id = 'PAYERX7K2M9QZ' where member_id = {member_of}", (cid, joined))
 
-    Returns the campaign id and the first item's approved amount.
+    view = tasks.view_campaign(campaign_id, demo)
+    assert [(row["ref"], row["stand_in"]) for row in view["rows"]] == [(ref, ref == stand_in) for ref in ordered]
+    assert tasks.approve_campaign(campaign_id, demo, view["review_hash"])["ok"] is True
+    # Approved and not yet sent: no reward has a payout item.
+    assert [row["payout_status"] for row in tasks.results(campaign_id, demo)["rows"]] == [None] * 10
+
+    assert tasks.submit_campaign(campaign_id, demo)["sent"] is True
+    sender_batch_id = conn.execute("select sender_batch_id from payout_batches where campaign_id = %s", (campaign_id,)).fetchone()[0]
+    # PROCESSING_LATER is a word PayPal might add, stored as seen; the long one is past what the console accepts.
+    stored = {stand_in: "UNCLAIMED", joined: "SUCCESS", rewards[2]: "PROCESSING_LATER", rewards[3]: "SETTLING_" * 4, holdouts[1]: "SUCCESS"}
+    for n, (ref, status) in enumerate(stored.items(), start=1):
+        conn.execute("insert into payout_items values (%s, %s, %s, %s, 25, now())", (f"ITEM{n}", sender_batch_id, ref, status))
+    for ref, simulated in ((joined, True), (holdouts[0], False)):
+        attribute_purchase(
+            conn, campaign_id=cid, ref=ref, purchased_at=datetime.now(timezone.utc), amount_minor=1250, simulated=simulated,
+            source_order=f"O{uuid.uuid4().hex[:16].upper()}",
+        )
+
+    found = tasks.results(campaign_id, demo)
+
+    # A held-back row reads as held back even with a ledger row under its ref, which no batch can make.
+    shown = {stand_in: "UNCLAIMED", joined: "SUCCESS", rewards[2]: "PROCESSING_LATER", rewards[3]: "UNKNOWN"}
+    assert found["ok"] is True and found["rows"] == [
+        {
+            "ref": ref, "role": roles[ref], "rank": int(ref[1:]), "stand_in": ref == stand_in, "payout_status": shown.get(ref),
+            "simulated_return": ref == joined, "real_return": ref == holdouts[0],
+        }
+        for ref in ordered
+    ]
+    text = json.dumps(found) + json.dumps(tasks.view_campaign(campaign_id, demo))
+    member_ids = [str(r[0]) for r in conn.execute("select member_id from campaign_members where campaign_id = %s", (cid,))]
+    item_ids = [r[0] for r in conn.execute("select payout_item_id from payout_items")]
+    assert "@" not in text and "PAYERX7K2M9QZ" not in text and not re.search(r"C1[0-9]{3}", text)
+    assert not any(member_id in text for member_id in member_ids) and not any(item_id in text for item_id in item_ids)
+
+
+def sent_with_items(conn: psycopg.Connection, sender: dict, statuses: tuple[str, ...] = ("UNCLAIMED", "SUCCESS")) -> tuple[str, int]:
+    """A campaign sender drafted, approved and sent, its items ITEM1, ITEM2... recorded with statuses in turn.
+
+    By default its first item waits unclaimed and its second was claimed. Returns the
+    campaign id and the first item's approved amount.
     """
     campaign_id = tasks.draft_campaign(DEMO_SETTINGS, sender)["campaign_id"]
     assert tasks.approve_campaign(campaign_id, sender, tasks.view_campaign(campaign_id, sender)["review_hash"])["ok"]
@@ -656,7 +717,8 @@ def sent_with_items(conn: psycopg.Connection, sender: dict) -> tuple[str, int]:
     sender_batch_id = conn.execute("select sender_batch_id from payout_batches where campaign_id = %s", (campaign_id,)).fetchone()[0]
     snapshot = conn.execute("select canonical_json from approved_snapshots where campaign_id = %s", (uuid.UUID(campaign_id),)).fetchone()[0]
     items = json.loads(snapshot)["items"]
-    for n, (item, status) in enumerate(zip(items, ("UNCLAIMED", "SUCCESS")), start=1):
+    assert len(statuses) <= len(items)
+    for n, (item, status) in enumerate(zip(items, statuses), start=1):
         conn.execute(
             "insert into payout_items (payout_item_id, sender_batch_id, sender_item_id, status) values (%s, %s, %s, %s)",
             (f"ITEM{n}", sender_batch_id, item["sender_item_id"], status),
@@ -687,22 +749,62 @@ def test_cancel_unclaimed_works_for_its_creator_and_the_owner_and_is_not_found_f
     assert refused(tasks.cancel_unclaimed(str(uuid.uuid4()), creator), "not_found")
     assert cancels(paypal) == []
 
+    whole = {"incomplete": False, "paypal_status": None, "paypal_name": None}
     assert tasks.cancel_unclaimed(campaign_id, creator) == {
-        "ok": True, "campaign_id": campaign_id, "cancelled": 1, "returned_minor": first_amount, "still_unclaimed": 0, "not_cancellable": 0,
+        "ok": True, "campaign_id": campaign_id, "cancelled": 1, "returned_minor": first_amount, "still_unclaimed": 0, "not_cancellable": 0, **whole,
     }
     assert cancels(paypal) == ["/v1/payments/payouts-item/ITEM1/cancel"]
     assert tasks.cancel_unclaimed(campaign_id, actor(conn, "owner")) == {
-        "ok": True, "campaign_id": campaign_id, "cancelled": 0, "returned_minor": 0, "still_unclaimed": 0, "not_cancellable": 0,
+        "ok": True, "campaign_id": campaign_id, "cancelled": 0, "returned_minor": 0, "still_unclaimed": 0, "not_cancellable": 0, **whole,
     }
     assert len(cancels(paypal)) == 1 and "cancel_unclaimed" in tasks.TASK_NAMES
 
 
-def test_cancel_unclaimed_fails_as_paypal_unavailable_when_paypal_errors(conn: psycopg.Connection, paypal: FakePayPal) -> None:
+@pytest.mark.parametrize(("failing", "status", "name"), [(500, 500, "INTERNAL_SERVICE_ERROR"), (None, None, "CONNECTION_ERROR")], ids=["500", "unreachable"])
+def test_cancel_unclaimed_answers_what_came_back_and_what_is_still_out_when_paypal_fails_one_item(
+    conn: psycopg.Connection, paypal: FakePayPal, failing: int | None, status: int | None, name: str
+) -> None:
+    # The live run of 28 Oct (batch U27CC78V7J3KE): one reward claimed, three returned, PayPal failing the fourth.
+    seed_shop(conn)
+    demo = actor(conn, "demo")
+    campaign_id, amount = sent_with_items(conn, demo, ("UNCLAIMED",) * 4 + ("SUCCESS",))
+    paypal.cancel_failing = {"ITEM4": failing}
+
+    answer = tasks.cancel_unclaimed(campaign_id, demo)
+
+    assert amount == 200 and answer == {
+        "ok": True, "campaign_id": campaign_id, "cancelled": 3, "returned_minor": 600, "still_unclaimed": 1, "not_cancellable": 0,
+        "incomplete": True, "paypal_status": status, "paypal_name": name,
+    }
+    assert len(cancels(paypal)) == 4
+    # An unclear cancel is not a refusal (C3): the item stays UNCLAIMED until PayPal itself settles it.
+    statuses = dict(conn.execute("select payout_item_id, status from payout_items"))
+    assert statuses == {"ITEM1": "RETURNED", "ITEM2": "RETURNED", "ITEM3": "RETURNED", "ITEM4": "UNCLAIMED", "ITEM5": "SUCCESS"}
+    text = json.dumps(answer).lower()
+    assert PAYPAL_500["debug_id"] not in text and PAYPAL_500["message"].lower() not in text and "down" not in text
+    # The audit row each failed item already gets is unchanged, and it alone keeps the debug id (C23, C26).
+    [detail] = [row[0] for row in conn.execute("select detail from audit_log where action = 'payout_item_cancel_failed'")]
+    assert detail == {"payout_item_id": "ITEM4", "http_status": status, "name": name, "debug_id": PAYPAL_500["debug_id"] if failing else None}
+
+
+# A regression guard: only a run that ends with an item PayPal could not answer for is answered with its counts.
+@pytest.mark.parametrize(
+    ("raised", "code"),
+    [(SnapshotRefused("the snapshot no longer matches its hash"), "snapshot_refused"), (RuntimeError("boom"), "internal"), (PayPalError(503, "SERVICE_UNAVAILABLE", "d1"), "paypal_unavailable")],
+    ids=["snapshot", "unexpected", "paypal"],
+)
+def test_cancel_unclaimed_fails_as_before_for_every_other_failure(
+    conn: psycopg.Connection, paypal: FakePayPal, monkeypatch: pytest.MonkeyPatch, raised: Exception, code: str
+) -> None:
     seed_shop(conn)
     owner = actor(conn, "owner")
     campaign_id, _ = sent_with_items(conn, owner)
-    paypal.cancel_status = 503
-    assert refused(tasks.cancel_unclaimed(campaign_id, owner), "paypal_unavailable")
+
+    def broken(*_args: object, **_kwargs: object) -> None:
+        raise raised
+
+    monkeypatch.setattr(tasks, "cancel_unclaimed_items", broken)
+    assert refused(tasks.cancel_unclaimed(campaign_id, owner), code)
     assert conn.execute("select status from payout_items where payout_item_id = 'ITEM1'").fetchone() == ("UNCLAIMED",)
 
 
@@ -898,7 +1000,7 @@ def test_quiet_regulars_lists_the_most_at_risk_first_and_never_an_identifier(con
     assert found["ok"] and found["total"] == len(quiet) and len(quiet) > 50 and len(found["rows"]) == 50
     rows = found["rows"]
     assert [row["position"] for row in rows] == list(range(1, 51))
-    assert all(set(row) == {"position", "display_name", "purchase_days", "days_silent", "score", "paid_net_minor", "member"} for row in rows)
+    assert all(set(row) == {"position", "display_name", "purchase_days", "days_silent", "score", "paid_net_minor", "member", "stand_in"} for row in rows)
     assert all(row["purchase_days"] >= 3 and row["days_silent"] >= 60 and row["paid_net_minor"] > 0 for row in rows)
     assert [row["score"] for row in rows] == sorted(row["score"] for row in rows)
     assert tasks.quiet_regulars(demo, 3)["rows"] == rows[:3]
@@ -918,6 +1020,38 @@ def test_quiet_regulars_counts_as_a_member_only_someone_on_an_accepted_consent_w
     conn.execute("update members set consent_version = '2026-10-20.1'")
 
     assert not any(row["member"] for row in tasks.quiet_regulars(demo, 50)["rows"])
+
+
+def test_quiet_regulars_label_a_demo_stand_in_apart_from_a_person_who_joined_and_never_say_who_either_is(
+    conn: psycopg.Connection, paypal: FakePayPal
+) -> None:
+    seed_shop(conn)
+    # Every row looks alike in the seed, so each customer gets its own name to find its row by.
+    refs = [ref for (ref,) in conn.execute("select customer_ref from shop_customers order by customer_ref")]
+    named = {f"Shopper {n}": ref for n, ref in enumerate(refs)}
+    with conn.cursor() as cur:
+        cur.executemany("update shop_customers set display_name = %s where customer_ref = %s", list(named.items()))
+    demo = actor(conn, "demo")
+    shown = [named[row["display_name"]] for row in tasks.quiet_regulars(demo, 50)["rows"]]
+    seeded, joined, gone, seeded_old_wording = shown[:4]
+    set_member = "update members set {} where paypal_email = %s"
+    conn.execute(set_member.format("source = 'seed'"), (seeded.lower() + "@shop.example",))
+    conn.execute(set_member.format("source = 'seed', consent_version = '2026-10-20.1'"), (seeded_old_wording.lower() + "@shop.example",))
+    conn.execute("delete from members where paypal_email = %s", (gone.lower() + "@shop.example",))
+
+    found = tasks.quiet_regulars(demo, 50)
+
+    flags = {named[row["display_name"]]: (row["member"], row["stand_in"]) for row in found["rows"]}
+    assert flags[seeded] == (True, True)
+    assert flags[joined] == (True, False)
+    assert flags[gone] == (False, False)
+    # A stand-in on a wording no longer accepted is no member, so it is not flagged either.
+    assert flags[seeded_old_wording] == (False, False)
+    assert [ref for ref, (_member, stand_in) in flags.items() if stand_in] == [seeded]
+    assert all(type(row["stand_in"]) is bool for row in found["rows"])
+    text = json.dumps(found)
+    member_ids = [str(r[0]) for r in conn.execute("select member_id from members")]
+    assert "@" not in text and not re.search(r"C1[0-9]{3}", text) and not any(m in text for m in member_ids)
 
 
 @pytest.mark.parametrize("limit", [0, 51, True, "5", 5.0, None])

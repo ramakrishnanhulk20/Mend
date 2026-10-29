@@ -77,11 +77,11 @@ const BASE = "http://127.0.0.1:3000";
 const CAMPAIGN = "0b6c2f8e-6a4e-4c1b-9d2a-7e5f1a3b9c4d";
 const ITEMS: Record<string, string[]> = { R1: ["red teapot", "tea towel"], R3: ["blue mug"], R4: ["jam jar", "old candle"] };
 const ROWS = [
-  { ref: "R1", role: "reward", rank: 1, amount_minor: 10, note: "template" },
-  { ref: "R2", role: "holdout", rank: 2, amount_minor: null, note: null },
-  { ref: "R3", role: "reward", rank: 3, amount_minor: 10, note: "template" },
-  { ref: "R4", role: "reward", rank: 4, amount_minor: 10, note: "template" },
-  { ref: "R5", role: "holdout", rank: 5, amount_minor: null, note: null },
+  { ref: "R1", role: "reward", rank: 1, amount_minor: 10, note: "template", stand_in: false },
+  { ref: "R2", role: "holdout", rank: 2, amount_minor: null, note: null, stand_in: true },
+  { ref: "R3", role: "reward", rank: 3, amount_minor: 10, note: "template", stand_in: true },
+  { ref: "R4", role: "reward", rank: 4, amount_minor: 10, note: "template", stand_in: true },
+  { ref: "R5", role: "holdout", rank: 5, amount_minor: null, note: null, stand_in: true },
 ];
 const OWNER = { role: "owner" as const, sessionId: "e".repeat(64), expiresAt: new Date(Date.now() + 60_000) };
 const ADDRESS = "198.51.100.1";

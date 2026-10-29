@@ -193,9 +193,9 @@ const VIEW = {
   holdout_share: "0.50",
   total_minor: 20,
   rows: [
-    { ref: "R1", role: "reward", rank: 1, amount_minor: 10, note: "Thank you for the teapot." },
-    { ref: "R2", role: "holdout", rank: 2, amount_minor: null, note: null },
-    { ref: "R3", role: "reward", rank: 3, amount_minor: 10, note: "Thank you for the mug." },
+    { ref: "R1", role: "reward", rank: 1, amount_minor: 10, note: "Thank you for the teapot.", stand_in: false },
+    { ref: "R2", role: "holdout", rank: 2, amount_minor: null, note: null, stand_in: false },
+    { ref: "R3", role: "reward", rank: 3, amount_minor: 10, note: "Thank you for the mug.", stand_in: true },
   ],
   review_hash: "a".repeat(64),
   review_problem: null,
@@ -598,6 +598,12 @@ describe("the agent's tools", () => {
         pending_minor: 0,
         unclaimed_return_by: "2026-11-23T05:00:00+00:00",
       },
+      rows: [
+        { ref: "R1", role: "reward", rank: 1, stand_in: false, payout_status: "SUCCESS", simulated_return: true, real_return: false },
+        { ref: "R2", role: "holdout", rank: 2, stand_in: false, payout_status: null, simulated_return: true, real_return: false },
+        { ref: "R3", role: "reward", rank: 3, stand_in: true, payout_status: "UNCLAIMED", simulated_return: false, real_return: false },
+        { ref: "R4", role: "reward", rank: 4, stand_in: true, payout_status: "RETURNED", simulated_return: false, real_return: false },
+      ],
     });
     const current = turn("demo");
     const shown = JSON.parse(String(await tool(agentTools(current), "campaign_results")({ campaignId: CAMPAIGN }))) as Record<string, unknown>;

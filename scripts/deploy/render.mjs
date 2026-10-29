@@ -2061,7 +2061,7 @@ async function proveChecks({ receiver, startedAt, workspace, services, db, origi
         after.returnedMinor === othersMinor &&
         after.unclaimedMinor === 0 &&
         after.claimedMinor === DEMO_PLAN.perRecipientMinor,
-      `cancel: results showed ${shown.items} items, ${shown.claimedMinor} cents claimed by the test receiver and ${othersMinor} unclaimed or pending; once PayPal held ${waiting.byStatus.UNCLAIMED} UNCLAIMED, the demo visitor's cancel-unclaimed answered cancelled ${String(cancelled.body.cancelled)}, returnedMinor ${String(cancelled.body.returnedMinor)}, stillUnclaimed ${String(cancelled.body.stillUnclaimed)}, notCancellable ${String(cancelled.body.notCancellable)}; results now show returnedMinor ${String(after.returnedMinor)}, unclaimedMinor ${String(after.unclaimedMinor)}, claimedMinor ${String(after.claimedMinor)}`,
+      `cancel: results showed ${shown.items} items, ${shown.claimedMinor} cents claimed by the test receiver and ${othersMinor} unclaimed or pending; once PayPal held ${waiting.byStatus.UNCLAIMED} UNCLAIMED, the demo visitor's cancel-unclaimed answered cancelled ${String(cancelled.body.cancelled)}, returnedMinor ${String(cancelled.body.returnedMinor)}, stillUnclaimed ${String(cancelled.body.stillUnclaimed)}, notCancellable ${String(cancelled.body.notCancellable)}, incomplete ${String(cancelled.body.incomplete)} (PayPal ${String(cancelled.body.paypalStatus)} ${String(cancelled.body.paypalName)}); results now show returnedMinor ${String(after.returnedMinor)}, unclaimedMinor ${String(after.unclaimedMinor)}, claimedMinor ${String(after.claimedMinor)}`,
     );
   });
 

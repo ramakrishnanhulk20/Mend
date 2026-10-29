@@ -48,11 +48,14 @@ from mend_engine.campaigns.approval import (
     review_hash,
 )
 from mend_engine.campaigns.approval import set_note as set_campaign_note
+from mend_engine.campaigns.cancel import CancelIncomplete
 from mend_engine.campaigns.cancel import cancel_unclaimed as cancel_unclaimed_items
+# The filter the cancel's own audit rows use, so an answer never carries PayPal text the audit log would refuse.
+from mend_engine.campaigns.cancel import _error_detail as paypal_error_detail
 from mend_engine.campaigns.drafts import NOTE_TEMPLATE, DraftRefused, DraftSettings, build_draft, draft_view
 from mend_engine.campaigns.eligibility import OWNER_SCOPE, REGULAR_MIN_DAYS, SILENT_MIN_DAYS, DraftScope, drafting_for
 from mend_engine.campaigns.reconcile import reconcile as reconcile_campaigns
-from mend_engine.campaigns.results import ArmResults, PayoutStanding, campaign_results
+from mend_engine.campaigns.results import ArmResults, PayoutStanding, RowStanding, campaign_results, stand_in_refs
 from mend_engine.campaigns.scoring import SHOP_ZONE, ScoreSet, score_customers
 from mend_engine.campaigns import spend
 from mend_engine.campaigns.spend import (
@@ -289,10 +292,11 @@ def draft_campaign(settings: object, actor: object) -> dict:
 def view_campaign(campaign_id: object, actor: object) -> dict:
     """The campaign as its creator (or the owner) may see it: settings, rows and the hash to approve.
 
-    Rows carry ref, role, rank, amount_minor and note only: no email, member id or
-    customer ref (C12). review_hash is the hash approve_campaign needs back, or None
-    when the campaign is not open or cannot be approved as it stands (review_problem
-    then names the fixed reason).
+    Rows carry ref, role, rank, amount_minor, note and stand_in only: no email,
+    member id or customer ref (C12, C15). stand_in is True for a row whose member the
+    demo seed script joined (results.stand_in_refs). review_hash is the hash
+    approve_campaign needs back, or None when the campaign is not open or cannot be
+    approved as it stands (review_problem then names the fixed reason).
     """
 
     def work(config: Config, conn: psycopg.Connection) -> dict:
@@ -302,7 +306,8 @@ def view_campaign(campaign_id: object, actor: object) -> dict:
             "select status, goal_text, as_of, budget_minor, per_recipient_minor, holdout_share from campaigns where campaign_id = %s",
             (cid,),
         ).fetchone()
-        rows = draft_view(conn, cid)
+        stand_ins = stand_in_refs(conn, cid)
+        rows = [{**row, "stand_in": row["ref"] in stand_ins} for row in draft_view(conn, cid)]
         hash_shown: str | None = None
         problem: str | None = None
         if status in OPEN_STATUSES:
@@ -437,7 +442,11 @@ def results(campaign_id: object, actor: object) -> dict:
 
     payouts says where each item of the batch stands (campaigns.results.PayoutStanding):
     items, by_status, claimed_minor, unclaimed_minor, returned_minor, failed_minor,
-    pending_minor and unclaimed_return_by (UTC ISO 8601 text, or None).
+    pending_minor and unclaimed_return_by (UTC ISO 8601 text, or None). rows holds
+    every rewarded and held-back row in rank order (campaigns.results.RowStanding):
+    ref, role, rank, stand_in, payout_status, simulated_return and real_return, read
+    from Mend's ledger and records with no PayPal call, and never a name, email,
+    member id, customer ref, payer id, payout item id or receiver (C12, C15).
     """
 
     def work(config: Config, conn: psycopg.Connection) -> dict:
@@ -458,6 +467,7 @@ def results(campaign_id: object, actor: object) -> dict:
             "p_value": _finite(found.p_value),
             "verdict": found.verdict,
             "payouts": _payouts(found.payouts),
+            "rows": [_row(row) for row in found.rows],
         }
 
     return _run("results", work)
@@ -470,10 +480,15 @@ def cancel_unclaimed(campaign_id: object, actor: object) -> dict:
     actor only on its own. Only items the ledger holds as UNCLAIMED are asked about,
     one cancel call each (campaigns.cancel). cancelled counts the items PayPal
     accepted the cancel for, returned_minor the approved cents of those it answered
-    RETURNED, still_unclaimed the items still waiting afterwards, not_cancellable
-    the items PayPal refused. Refuses "not_submitted" when the campaign has no
-    payout batch, and fails "paypal_unavailable" when PayPal errors or cannot be
-    reached part way; items cancelled before that stay cancelled.
+    RETURNED, still_unclaimed the items still UNCLAIMED in the ledger afterwards,
+    not_cancellable the items PayPal refused. An item PayPal gave a 5xx or no answer
+    for stays in still_unclaimed, never in returned_minor, until a later PayPal read
+    settles it (C3). incomplete is True when the run ended with such an item, and
+    paypal_status and paypal_name then hold the last one's HTTP status (None when
+    PayPal could not be reached) and PayPal's error name (None unless it is a short
+    code of capital letters, digits and underscores); both are None when incomplete
+    is False. PayPal's message and debug_id are never in the answer (C17, C26).
+    Refuses "not_submitted" when the campaign has no payout batch.
     """
 
     def work(config: Config, conn: psycopg.Connection) -> dict:
@@ -481,8 +496,13 @@ def cancel_unclaimed(campaign_id: object, actor: object) -> dict:
         cid = _checked_campaign(conn, campaign_id, role, session)
         if conn.execute("select 1 from payout_batches where campaign_id = %s", (str(cid),)).fetchone() is None:
             raise _Refused("not_submitted", "the campaign has no payout batch, so nothing is waiting to be claimed")
+        failure: CancelIncomplete | None = None
         with _paypal_client(config) as http:
-            report = cancel_unclaimed_items(conn, http, cid)
+            try:
+                report = cancel_unclaimed_items(conn, http, cid)
+            except CancelIncomplete as incomplete:
+                report, failure = incomplete.report, incomplete
+        status = failure.status if failure is not None else None
         return {
             "ok": True,
             "campaign_id": str(cid),
@@ -490,6 +510,9 @@ def cancel_unclaimed(campaign_id: object, actor: object) -> dict:
             "returned_minor": report.returned_minor,
             "still_unclaimed": report.still_unclaimed,
             "not_cancellable": report.not_cancellable,
+            "incomplete": failure is not None,
+            "paypal_status": status if type(status) is int and 100 <= status <= 599 else None,
+            "paypal_name": paypal_error_detail(failure)["name"] if failure is not None else None,
         }
 
     return _run("cancel_unclaimed", work)
@@ -549,9 +572,12 @@ def quiet_regulars(actor: object, limit: object) -> dict:
     Each row is position (1 = most at risk, an index into this answer and nothing
     else), the customer's synthetic display_name, purchase_days, days_silent, score
     (expected purchases over the next 13 weeks, rounded to 4 places), paid_net_minor
-    (paid to as_of net of refunds, USD cents) and member (a verified member's email
-    matches, so they could be thanked). Never an email, member id or customer ref
-    (C12, C15). total counts every quiet regular, shown or not. Refuses with
+    (paid to as_of net of refunds, USD cents), member (a verified member's email
+    matches, so they could be thanked) and stand_in (that member is a demo stand-in
+    the seed script joined, members.source 'seed', the rule results.stand_in_refs
+    uses; always False when member is False), so a stand-in is never shown as a
+    person who joined (C23). Never an email, member id or customer ref (C12, C15).
+    total counts every quiet regular, shown or not. Refuses with
     "invalid_input" for a limit that is not a whole number from 1 to 50 and
     "model_not_converged" when the model cannot rank anyone.
     """
@@ -579,6 +605,7 @@ def quiet_regulars(actor: object, limit: object) -> dict:
                 "score": round(scores.scores[ref], 4),
                 "paid_net_minor": scores.paid_minor[ref],
                 "member": ref in members,
+                "stand_in": members.get(ref, False),
             }
             for position, ref in enumerate(shown, start=1)
         ]
@@ -1211,16 +1238,22 @@ def _paid_in_last_year(conn: psycopg.Connection, as_of: date, refs: list[str]) -
     return sum(max(int(total) - int(refunded.get(ref, 0)), 0) for ref, total in paid.items())
 
 
-def _member_refs(conn: psycopg.Connection) -> set[str]:
-    """Customer refs a verified member on an accepted consent wording is matched to, by the one email normaliser, as eligibility matches them."""
+def _member_refs(conn: psycopg.Connection) -> dict[str, bool]:
+    """Customer refs a verified member on an accepted consent wording is matched to, by the one email normaliser, as eligibility matches them.
+
+    Each ref maps to whether its member is a demo stand-in (members.source 'seed',
+    results.stand_in_refs' rule).
+    """
     refs = customer_refs_by_email(conn)
-    matched = set()
-    for (email,) in conn.execute(
-        "select paypal_email from members where email_verified and consent_version = any(%s)", (sorted(ACCEPTED_CONSENT_VERSIONS),)
+    matched: dict[str, bool] = {}
+    for email, stand_in in conn.execute(
+        "select paypal_email, source = %s from members where email_verified and consent_version = any(%s)",
+        (SOURCE_SEED, sorted(ACCEPTED_CONSENT_VERSIONS)),
     ):
         ref = refs.get(normalise_email(email))
         if ref is not None:
-            matched.add(ref)
+            # Two members can never match one ref today; if they ever did, a stand-in among them still shows (C23).
+            matched[ref] = matched.get(ref, False) or stand_in
     return matched
 
 
@@ -1243,6 +1276,19 @@ def _payouts(standing: PayoutStanding) -> dict:
         "failed_minor": standing.failed_minor,
         "pending_minor": standing.pending_minor,
         "unclaimed_return_by": _utc_text(standing.unclaimed_return_by),
+    }
+
+
+def _row(row: RowStanding) -> dict:
+    """Exactly these keys, named here so no other field of a row can reach the answer (C15)."""
+    return {
+        "ref": row.ref,
+        "role": row.role,
+        "rank": row.rank,
+        "stand_in": row.stand_in,
+        "payout_status": row.payout_status,
+        "simulated_return": row.simulated_return,
+        "real_return": row.real_return,
     }
 
 

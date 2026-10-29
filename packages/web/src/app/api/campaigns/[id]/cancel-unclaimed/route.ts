@@ -16,9 +16,12 @@ const CAMPAIGN_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{1
  * through PayPal's cancel call, so the money returns to the shop. No body: only the
  * campaign id and the caller reach the engine. Answers the engine's counts: rewards
  * cancelled, money returned, rewards still unclaimed and rewards PayPal would not
- * cancel. A campaign never sent answers 409 not_submitted; PayPal out of reach answers
- * 503. Same origin and CSRF token required; 10 per session per hour. A cancel slower
- * than 30 seconds answers 202 with a run id this session alone can poll.
+ * cancel. When PayPal fails on some rewards it still answers 200 with those counts,
+ * incomplete true, and PayPal's HTTP status and error code; a reward PayPal gave no
+ * clear answer for counts as still unclaimed. A campaign never sent answers 409
+ * not_submitted; the engine out of reach answers 503. Same origin and CSRF token
+ * required; 10 per session per hour. A cancel slower than 30 seconds answers 202 with
+ * a run id this session alone can poll.
  */
 export async function POST(request: Request, context: { params: Promise<{ id: string }> }): Promise<Response> {
   const ref = randomUUID();

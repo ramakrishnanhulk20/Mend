@@ -87,4 +87,4 @@ The same day, a cancel that PayPal failed on one item answered with a bare error
 
 ## Proof after the fixes
 
-The live proof on 29 Oct 2026, against commit `bdb4139`, passed 19 of 19. It includes the forgery check (an altered copy of a real delivery refused), the database role check (both service roles refused schema and audit log changes), the read-only keys check (PayPal answers 403 to the assistant's token on Payouts) and a secrets sweep across 225 answers and 612 log lines. On the same day the engine's tests gave 935 passed and 1 skipped, and the web app's 1135 passed.
+The live proof on 29 Oct 2026, against commit `bdb4139`, passed 19 of 19. It includes the forgery check (an altered copy of a real delivery refused), the database role check (both service roles refused schema and audit log changes), the read-only keys check (PayPal answers 403 to the assistant's token on Payouts) and a secrets sweep across 225 answers and 612 log lines. Later the same day, after the names on rows and the join pages, the engine's tests gave 937 passed and 1 skipped, and the web app's 1166 passed.

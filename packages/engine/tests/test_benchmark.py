@@ -17,9 +17,15 @@ from mend_engine.model.benchmark import (
 from mend_engine.model.bgnbd import Params, log_likelihood
 from mend_engine.model.rfm import summarise
 
-CACHED = Path(__file__).resolve().parents[3] / "reference" / "meendum-data" / "raw" / "cdnow" / "CDNOW_sample.zip"
+# The project's own reference copy, or the one `python -m mend_engine.prove_model` downloads.
+_COPIES = (
+    Path(__file__).resolve().parents[3] / "reference" / "meendum-data" / "raw" / "cdnow" / "CDNOW_sample.zip",
+    Path(__file__).resolve().parents[1] / ".data" / "CDNOW_sample.zip",
+)
+CACHED = next((copy for copy in _COPIES if copy.is_file()), _COPIES[-1])
 needs_sample = pytest.mark.skipif(
-    not CACHED.is_file(), reason=f"CDNOW sample not cached at {CACHED}; tests never download it"
+    not CACHED.is_file(),
+    reason=f"CDNOW sample not cached at {CACHED}; tests never download it (python -m mend_engine.prove_model does)",
 )
 
 

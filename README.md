@@ -340,7 +340,8 @@ Mend runs on one machine with `npm run dev:console`: a local Postgres, the engin
   - A US business account and an app linked to it, with Payouts and Log in with PayPal ticked. This app sends the cashback.
   - Optional: a second app on the same business account with Payouts not ticked. The assistant's PayPal reads use it. Without it they use the first app.
   - A personal account. Its email is the test receiver: the one demo customer whose cashback can really be claimed.
-- An Anthropic API key (https://platform.claude.com, Settings, API Keys).
+- An Anthropic API key with prepaid credit (https://platform.claude.com, Settings, API Keys; credit under Billing). The local console will not start without it.
+- On Windows, Git Bash (it comes with Git for Windows): the commands below are Bash.
 
 ### Steps
 
@@ -348,14 +349,14 @@ Mend runs on one machine with `npm run dev:console`: a local Postgres, the engin
 git clone https://github.com/ramakrishnanhulk20/Mend.git
 cd Mend
 cp .env.example .env
-
-cd packages/engine
-python -m venv .venv
 ```
 
-Activate the environment with `.venv\Scripts\activate` on Windows or `source .venv/bin/activate` on macOS and Linux, then:
+Fill in `.env` at the repo root now, using the table below. Then:
 
 ```bash
+cd packages/engine
+python -m venv .venv
+source .venv/Scripts/activate    # macOS and Linux: source .venv/bin/activate
 pip install -e ".[test]"
 
 cd ../web
@@ -363,7 +364,7 @@ npm ci
 npm run dev:console
 ```
 
-Fill in `.env` at the repo root before the last command:
+The settings in `.env`:
 
 | Setting | What it is | Where to get it |
 |---|---|---|
@@ -371,8 +372,8 @@ Fill in `.env` at the repo root before the last command:
 | `PAYPAL_ENV` | Must be `sandbox`; Mend refuses anything else | Already set in `.env.example` |
 | `PAYPAL_READ_CLIENT_ID`, `PAYPAL_READ_CLIENT_SECRET` | Optional: the second app, without Payouts | The same page, your second app |
 | `MEND_TEST_RECEIVER` | The sandbox personal account's email | developer.paypal.com, Sandbox, Accounts |
-| `ANTHROPIC_API_KEY` | Claude, for plans, notes and the assistant | platform.claude.com, Settings, API Keys |
-| `MEND_PAYOUT_ITEM_CAP_MINOR`, `MEND_CAMPAIGN_CAP_MINOR`, `MEND_DAILY_CAP_MINOR` | The owner's caps in US cents; the engine will not start without them | Keep the values in `.env.example` |
+| `ANTHROPIC_API_KEY` | Claude, for plans, notes and the assistant. Required: the console will not start without it | platform.claude.com, Settings, API Keys |
+| `MEND_PAYOUT_ITEM_CAP_MINOR`, `MEND_CAMPAIGN_CAP_MINOR`, `MEND_DAILY_CAP_MINOR` | The owner's hard caps in US cents (USD 10 a customer, 100 a campaign, 200 a day); the engine will not start without them. Demo visitors get tighter limits on top: USD 2 a customer, 10 a campaign, 50 a day across all visitors | Keep the values in `.env.example` |
 | `MEND_BALANCE_FLOOR_MINOR` | US cents every payout must leave in the shop's balance | Leave empty for 25000 (USD 250) |
 | `MEND_DEV` | Local development | Keep `1` |
 | `DATABASE_URL` | Leave empty: the local run uses its own Postgres | |
@@ -415,14 +416,14 @@ Run on 29 Oct 2026:
 
 ```text
 packages/engine$ .venv/Scripts/python.exe -m pytest -q -p no:cacheprovider
-935 passed, 1 skipped in 235.76s (0:03:55)
+937 passed, 1 skipped
 
 packages/web$ npx vitest run
  Test Files  32 passed (32)
-      Tests  1135 passed (1135)
+      Tests  1166 passed (1166)
 ```
 
-The engine tests need no network; they start a local Postgres. The live proof, `node scripts/deploy/render.mjs prove`, passed 19 of 19 on the same day (above).
+The engine tests need no network; they start a local Postgres. In a fresh clone 3 benchmark tests skip (934 passed, 4 skipped) until `python -m mend_engine.prove_model` has downloaded the CDNOW sample once. The live proof, `node scripts/deploy/render.mjs prove`, passed 19 of 19 on the same day (above).
 
 ## What it costs
 

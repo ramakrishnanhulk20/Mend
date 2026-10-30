@@ -10,8 +10,8 @@ The measure is AUC: the chance that a customer who did not come back was ranked 
 more at risk than one who did. 0.5 is a coin toss and 1.0 is a perfect ranking.
 
 Each cutoff is measured in three groups, because a ranking that sorts every
-customer well can still tie the plain rule among the few a campaign actually ranks:
-the live segment (eligibility's own rule, the customers campaigns rank), the
+customer well can still tie the plain rule among the few a campaign picks from:
+the live segment (eligibility's own rule, the quiet regulars campaigns pick from), the
 backtest's target group, and all customers. Every model-minus-recency difference
 carries a 95 percent bootstrap interval, so a gap smaller than the noise reads as
 one.
@@ -24,11 +24,13 @@ from bisect import bisect_right
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
+from fractions import Fraction
 from pathlib import Path
 
 import numpy as np
 
 from mend_engine.campaigns import eligibility
+from mend_engine.campaigns.scoring import HORIZON_WEEKS
 from mend_engine.data.uci import iter_clean_lines_by_sheet
 from mend_engine.model.bgnbd import Params, expected_purchases, fit
 from mend_engine.model.rfm import summarise
@@ -44,6 +46,9 @@ BOOTSTRAP_SEED = 0
 CONFIDENCE = 0.95
 # Attribute names of the three groups on CutoffResult and Backtest, live segment first.
 GROUPS = ("live_segment", "target_group", "all_customers")
+# eligibility's names for the forecast groups, least likely to come back first. They are
+# also the attribute names on ForecastGroups, so a rename there fails loudly here.
+FORECAST_GROUPS = (eligibility.LIKELY_GONE, eligibility.WORTH_A_NUDGE, eligibility.LIKELY_BACK)
 
 
 @dataclass(frozen=True)
@@ -68,6 +73,31 @@ class GroupResult:
 
 
 @dataclass(frozen=True)
+class GroupCount:
+    """How many customers one forecast group held, and how many of them bought again within the holdout."""
+
+    customers: int
+    returned: int
+
+
+@dataclass(frozen=True)
+class ForecastGroups:
+    """The quiet regulars at one cutoff, split by what the model expected of them.
+
+    Quiet regulars are the live_segment mask. Each one goes to the group that
+    eligibility.forecast_group gives their expected purchases over
+    scoring.HORIZON_WEEKS weeks, the horizon campaigns score on, whatever the
+    backtest's holdout_days. The three counts are None when the fit did not converge.
+    """
+
+    cutoff: date
+    converged: bool
+    likely_gone: GroupCount | None
+    worth_a_nudge: GroupCount | None
+    likely_back: GroupCount | None
+
+
+@dataclass(frozen=True)
 class CutoffResult:
     """What one cutoff showed.
 
@@ -78,6 +108,7 @@ class CutoffResult:
     of it who came back within the holdout with no campaign at all, NaN when the
     group is empty. Purchase-day counts cover the holdout only. live_segment,
     target_group and all_customers measure the two rankings inside each group.
+    groups splits the quiet regulars by forecast (forecast_groups), from the same fit.
     """
 
     cutoff: date
@@ -92,6 +123,7 @@ class CutoffResult:
     live_segment: GroupResult
     target_group: GroupResult
     all_customers: GroupResult
+    groups: ForecastGroups
 
 
 @dataclass(frozen=True)
@@ -114,12 +146,18 @@ class GroupSummary:
 
 @dataclass(frozen=True)
 class Backtest:
-    """run_cutoff at each cutoff, in the order given, with each group's summary over them."""
+    """run_cutoff at each cutoff, in the order given, with each group's summary over them.
+
+    groups_pooled sums the forecast groups over the converged cutoffs (pooled_groups)
+    and groups_rise says whether their return rates rise (groups_rise).
+    """
 
     results: tuple[CutoffResult, ...]
     live_segment: GroupSummary
     target_group: GroupSummary
     all_customers: GroupSummary
+    groups_pooled: dict[str, GroupCount]
+    groups_rise: bool
 
 
 @dataclass(frozen=True, eq=False)
@@ -284,10 +322,12 @@ def difference_interval(
 
 
 def live_segment(scores: CutoffScores) -> np.ndarray:
-    """Which customers the campaign rule would rank at the cutoff, by eligibility's own constants.
+    """Which customers are quiet regulars at the cutoff, by eligibility's own constants: the pool the campaign rule picks from.
 
-    Only the purchase-day rules: the UCI history carries no membership or verified
-    email, and refunds are not part of a customer's purchase days.
+    This is the pool before the forecast groups: campaigns then keep only those
+    worth a nudge (forecast_groups). Only the purchase-day rules: the UCI history
+    carries no membership or verified email, and refunds are not part of a
+    customer's purchase days.
     """
     return (scores.days_before >= eligibility.REGULAR_MIN_DAYS) & (scores.days_silent >= eligibility.SILENT_MIN_DAYS)
 
@@ -295,6 +335,31 @@ def live_segment(scores: CutoffScores) -> np.ndarray:
 def target_group(scores: CutoffScores) -> np.ndarray:
     """Which customers are in the backtest's target group: REGULAR_MIN_DAYS and SILENT_MIN_DAYS."""
     return (scores.days_before >= REGULAR_MIN_DAYS) & (scores.days_silent >= SILENT_MIN_DAYS)
+
+
+def forecast_groups(scores: CutoffScores) -> ForecastGroups:
+    """Split the quiet regulars at the cutoff into eligibility's forecast groups and count who came back.
+
+    Each quiet regular (live_segment) is scored by expected purchases over
+    HORIZON_WEEKS weeks from the fitted parameters, the number campaigns score on,
+    and placed by eligibility.forecast_group. A customer returned if they bought on
+    any day in the holdout. The counts are None when the fit did not converge.
+    Raises ValueError if a score is one forecast_group refuses.
+    """
+    if scores.params is None:
+        return ForecastGroups(scores.cutoff, False, None, None, None)
+    quiet = live_segment(scores)
+    # The weeks are converted to the model's time unit so the horizon stays 13 weeks
+    # whatever holdout_days the backtest measures over.
+    horizon = expected_purchases(
+        scores.params, HORIZON_WEEKS * 7 / UNIT_DAYS, scores.x[quiet], scores.t_x[quiet], scores.T[quiet]
+    )
+    tally = {name: [0, 0] for name in FORECAST_GROUPS}
+    for score, came_back in zip(horizon, scores.days_after[quiet] > 0):
+        counts = tally[eligibility.forecast_group(float(score))]
+        counts[0] += 1
+        counts[1] += int(came_back)
+    return ForecastGroups(scores.cutoff, True, **{name: GroupCount(*tally[name]) for name in FORECAST_GROUPS})
 
 
 def run_cutoff(purchase_days: Mapping[str, Sequence[date]], cutoff: date, holdout_days: int = 91) -> CutoffResult:
@@ -337,7 +402,40 @@ def run_backtest(
             if pair is not None:
                 pairs[name].append(pair)
     summaries = {name: _summary([getattr(r, name) for r in results], pairs[name]) for name in GROUPS}
-    return Backtest(results=tuple(results), **summaries)
+    pooled = pooled_groups([r.groups for r in results])
+    return Backtest(results=tuple(results), **summaries, groups_pooled=pooled, groups_rise=groups_rise(pooled))
+
+
+def pooled_groups(results: Sequence[ForecastGroups]) -> dict[str, GroupCount]:
+    """Each forecast group's customers and returners summed over the converged cutoffs only.
+
+    Keys are FORECAST_GROUPS (eligibility's LIKELY_GONE, WORTH_A_NUDGE, LIKELY_BACK).
+    A customer quiet at several cutoffs counts once at each. With no converged cutoff
+    every count is 0.
+    """
+    totals = {name: [0, 0] for name in FORECAST_GROUPS}
+    for result in results:
+        if not result.converged:
+            continue
+        for name in FORECAST_GROUPS:
+            count = getattr(result, name)
+            totals[name][0] += count.customers
+            totals[name][1] += count.returned
+    return {name: GroupCount(*totals[name]) for name in FORECAST_GROUPS}
+
+
+def groups_rise(pooled: Mapping[str, GroupCount]) -> bool:
+    """True only when every forecast group has customers and the share who came back rises strictly from likely gone to worth a nudge to likely back.
+
+    A tie is not a rise. The shares are compared as exact fractions, so two groups
+    with the same share never read as different through rounding. Raises KeyError
+    if pooled lacks one of FORECAST_GROUPS.
+    """
+    counts = [pooled[name] for name in FORECAST_GROUPS]
+    if any(count.customers == 0 for count in counts):
+        return False
+    gone, nudge, back = (Fraction(count.returned, count.customers) for count in counts)
+    return gone < nudge < back
 
 
 def _measured(scores: CutoffScores) -> tuple[CutoffResult, dict[str, Paired | None]]:
@@ -362,6 +460,7 @@ def _measured(scores: CutoffScores) -> tuple[CutoffResult, dict[str, Paired | No
         predicted_purchase_days=float(scores.expected.sum()) if converged else None,
         actual_purchase_days=int(scores.days_after.sum()),
         **{name: group for name, (group, _) in groups.items()},
+        groups=forecast_groups(scores),
     )
     return result, {name: pair for name, (_, pair) in groups.items()}
 

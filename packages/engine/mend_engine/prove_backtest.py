@@ -4,16 +4,19 @@ Reads the UCI Online Retail II file (Chen 2012, CC BY 4.0) on its own dates. At 
 cutoffs from June 2010 to September 2011 it fits the model on everything up to the
 cutoff, then checks who actually came back in the next 91 days, and compares the
 model's ranking with the plain "days since last order" rule in three groups, live
-segment first: the live segment (the customers campaigns rank, by eligibility's
+segment first: the live segment (the quiet regulars campaigns pick from, by eligibility's
 rule), the backtest's target group, and all customers. Each model-minus-recency
 difference is printed with its 95 percent bootstrap interval, and each group's
 summary with one pooled interval over its valid cutoffs. A cutoff whose fit did not
 converge is printed as such and left out of every summary.
 
 Ends with BACKTEST RESULT: PASS only if, over all customers, the model beats the
-plain rule at every converged cutoff and at least four cutoffs converged. That bar
-is about all customers only; the live segment's numbers are printed first so they
-are read first, and are not part of it. It touches no database and calls no PayPal API.
+plain rule at every converged cutoff and at least four cutoffs converged. It also
+needs the forecast groups to rise: pooled over the converged cutoffs, quiet regulars
+called likely gone came back on their own less often than those worth a nudge, and
+those less often than the ones called likely back. The AUC bar is about all
+customers only; the live segment's AUC numbers are printed first so they are read
+first, and are not part of it. It touches no database and calls no PayPal API.
 """
 
 from __future__ import annotations
@@ -21,13 +24,18 @@ from __future__ import annotations
 import math
 import sys
 import time
+from collections.abc import Mapping
 from datetime import date, timedelta
 
 from mend_engine.campaigns import eligibility
+from mend_engine.campaigns.scoring import HORIZON_WEEKS
 from mend_engine.data.uci import CACHE_DIR, SourceError, ensure_source
 from mend_engine.model.backtest import (
+    FORECAST_GROUPS,
     GROUPS,
     CutoffResult,
+    ForecastGroups,
+    GroupCount,
     GroupResult,
     GroupSummary,
     decile_table,
@@ -49,9 +57,14 @@ HOLDOUT_DAYS = 91
 MIN_CONVERGED = 4
 _RULE = f"{eligibility.REGULAR_MIN_DAYS}+ purchase days, {eligibility.SILENT_MIN_DAYS}+ days silent"
 LABELS = {
-    "live_segment": f"live segment ({_RULE}, the rule campaigns use)",
+    "live_segment": f"quiet regulars ({_RULE}, the pool campaigns pick from)",
     "target_group": f"target group ({_RULE})",
     "all_customers": "all customers",
+}
+FORECAST_LABELS = {
+    eligibility.LIKELY_GONE: "likely gone",
+    eligibility.WORTH_A_NUDGE: "worth a nudge",
+    eligibility.LIKELY_BACK: "likely back",
 }
 
 
@@ -100,6 +113,21 @@ def summary_line(name: str, summary: GroupSummary) -> str:
     )
 
 
+def forecast_counts(counts: Mapping[str, GroupCount]) -> str:
+    parts = []
+    for name in FORECAST_GROUPS:
+        count = counts[name]
+        share = count.returned / count.customers if count.customers else math.nan
+        parts.append(f"{FORECAST_LABELS[name]} {count.returned:,} of {count.customers:,} ({percent(share)})")
+    return ", ".join(parts)
+
+
+def forecast_line(groups: ForecastGroups) -> str:
+    if not groups.converged:
+        return f"{groups.cutoff}: fit did not converge"
+    return f"{groups.cutoff}: {forecast_counts({name: getattr(groups, name) for name in FORECAST_GROUPS})}"
+
+
 def run() -> bool:
     started = time.perf_counter()
     path = ensure_source(CACHE_DIR)
@@ -130,6 +158,15 @@ def run() -> bool:
     print("each group over its valid cutoffs (fit converged, and some came back and some did not):")
     for name in GROUPS:
         print(summary_line(name, getattr(run_result, name)), flush=True)
+    print(
+        f"forecast groups among quiet regulars (orders expected over {HORIZON_WEEKS} weeks; "
+        f"came back within {HOLDOUT_DAYS} days with no campaign):"
+    )
+    for result in results:
+        print(forecast_line(result.groups), flush=True)
+    pooled_cutoffs = sum(1 for r in results if r.groups.converged)
+    print(f"pooled over {pooled_cutoffs} cutoffs: {forecast_counts(run_result.groups_pooled)}")
+    print(f"forecast groups rise from likely gone to worth a nudge to likely back: {'PASS' if run_result.groups_rise else 'FAIL'}", flush=True)
 
     converged = [r for r in results if r.converged]
     if converged:
@@ -147,7 +184,7 @@ def run() -> bool:
     if excluded:
         print(f"left out of every summary because the fit did not converge: {', '.join(excluded)}")
     print(f"timing: reading the file {read_seconds:.1f} seconds, fitting and scoring {scoring_seconds:.1f} seconds")
-    return len(converged) >= MIN_CONVERGED and wins == len(converged)
+    return len(converged) >= MIN_CONVERGED and wins == len(converged) and run_result.groups_rise
 
 
 def main() -> int:

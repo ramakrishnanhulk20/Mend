@@ -9,10 +9,12 @@ number nobody measured (6j). A proof that could not run at all stores nothing.
 
 The backtest row's headline is "headline": the model against recency inside the
 live segment, the customers campaigns actually rank, with 95 percent intervals.
-"all_customers" is the same measure over every customer, labelled as such. The
-older keys keep their meaning: cutoffs, converged, model_wins and mean_auc_gain
-are the all-customer numbers, deciles the all-customer decile table, and passed
-prove_backtest's own bar, which is about all customers.
+"all_customers" is the same measure over every customer, labelled as such.
+"bands" splits the quiet regulars into the forecast groups and counts who came
+back in each. The older keys keep their meaning: cutoffs, converged, model_wins and
+mean_auc_gain are the all-customer numbers and deciles the all-customer decile
+table. passed is prove_backtest's own bar: the model ahead over all customers, and
+the forecast groups rising.
 
 shop_summary reads the rows back through read_facts(), which checks each one against
 the exact shape written here, so a row of any other shape is treated as missing.
@@ -39,12 +41,18 @@ from mend_engine.data.uci import CACHE_DIR, SourceError, ensure_source
 from mend_engine.db.connect import connect
 from mend_engine.db.migrate import migrate
 from mend_engine.campaigns import eligibility
+from mend_engine.campaigns.scoring import HORIZON_WEEKS
 from mend_engine.model.backtest import (
     CONFIDENCE,
+    FORECAST_GROUPS,
     RESAMPLES,
     Backtest,
+    ForecastGroups,
+    GroupCount,
     GroupResult,
     decile_table,
+    groups_rise,
+    pooled_groups,
     purchase_days_from_uci,
     run_backtest,
 )
@@ -68,6 +76,13 @@ _GROUP_KEYS = frozenset({
 _GROUP_CUTOFF_KEYS = frozenset({
     "cutoff", "customers", "returned", "auc_model", "auc_recency", "difference", "interval_low", "interval_high",
 })
+# Read only beside UCI_GROUP_KEYS, so rows stored before it existed still read.
+UCI_BANDS_KEY = "bands"
+_BANDS_KEYS = frozenset({
+    "likely_gone_below", "likely_back_from", "regular_min_days", "silent_min_days", "horizon_weeks", "cutoffs", "pooled", "rising",
+})
+_BANDS_CUTOFF_KEYS = frozenset({"cutoff", "converged", *FORECAST_GROUPS})
+_COUNT_KEYS = frozenset({"customers", "returned"})
 
 _UPSERT = (
     "insert into model_facts (key, value) values (%s, %s) "
@@ -106,8 +121,9 @@ def uci_fact() -> dict:
 
     headline is the live segment's result and all_customers the all-customer one,
     each per cutoff and pooled, with 95 percent bootstrap intervals (see
-    _group_fact). Raises SourceError or ValueError when the UCI file cannot be read
-    or scored.
+    _group_fact). bands is the forecast groups among quiet regulars, per cutoff and
+    pooled (see _bands_fact), and passed needs them to rise as well. Raises
+    SourceError or ValueError when the UCI file cannot be read or scored.
     """
     days = purchase_days_from_uci(ensure_source(CACHE_DIR))
     run = run_backtest(days, prove_backtest.CUTOFFS, prove_backtest.HOLDOUT_DAYS)
@@ -137,10 +153,41 @@ def uci_fact() -> dict:
         "mean_auc_gain": float(sum(gains) / len(gains)) if gains else None,
         "decile_cutoff": latest.isoformat() if latest else None,
         "deciles": [{"decile": n, "customers": int(size), "returned_share": float(rate)} for n, size, rate in deciles],
-        "passed": len(converged) >= prove_backtest.MIN_CONVERGED and wins == len(converged),
+        "passed": len(converged) >= prove_backtest.MIN_CONVERGED and wins == len(converged) and run.groups_rise,
         "headline": _group_fact(run, "live_segment"),
         "all_customers": _group_fact(run, "all_customers"),
+        UCI_BANDS_KEY: _bands_fact(run),
     }
+
+
+def _bands_fact(run: Backtest) -> dict:
+    """The forecast groups among quiet regulars at each cutoff and pooled, with the rules they were split by.
+
+    The thresholds and day rules are eligibility's constants and the horizon is
+    scoring's. Counts are None at a cutoff whose fit did not converge, pooled sums
+    the converged cutoffs only (pooled_groups), and rising is groups_rise of pooled.
+    """
+    return {
+        "likely_gone_below": eligibility.LIKELY_GONE_BELOW,
+        "likely_back_from": eligibility.LIKELY_BACK_FROM,
+        "regular_min_days": eligibility.REGULAR_MIN_DAYS,
+        "silent_min_days": eligibility.SILENT_MIN_DAYS,
+        "horizon_weeks": HORIZON_WEEKS,
+        "cutoffs": [
+            {
+                "cutoff": result.groups.cutoff.isoformat(),
+                "converged": result.groups.converged,
+                **{name: _count_fact(getattr(result.groups, name)) for name in FORECAST_GROUPS},
+            }
+            for result in run.results
+        ],
+        "pooled": {name: _count_fact(run.groups_pooled[name]) for name in FORECAST_GROUPS},
+        "rising": run.groups_rise,
+    }
+
+
+def _count_fact(count: GroupCount | None) -> dict | None:
+    return None if count is None else {"customers": count.customers, "returned": count.returned}
 
 
 def _group_fact(run: Backtest, name: str) -> dict:
@@ -275,18 +322,75 @@ def _group_ok(value: object, label: str, rule: tuple[int | None, int | None], da
     )
 
 
+def _count_ok(entry: object) -> bool:
+    return (
+        type(entry) is dict
+        and set(entry) == _COUNT_KEYS
+        and _whole(entry["customers"])
+        and _whole(entry["returned"])
+        and entry["returned"] <= entry["customers"]
+    )
+
+
+def _bands_cutoff_ok(entry: object) -> bool:
+    if type(entry) is not dict or set(entry) != _BANDS_CUTOFF_KEYS or type(entry["converged"]) is not bool:
+        return False
+    counts = [entry[name] for name in FORECAST_GROUPS]
+    return _day(entry["cutoff"]) and (
+        all(_count_ok(count) for count in counts) if entry["converged"] else all(count is None for count in counts)
+    )
+
+
+def _counted(entry: dict | None) -> GroupCount | None:
+    return None if entry is None else GroupCount(entry["customers"], entry["returned"])
+
+
+def _bands_ok(value: object, days: list | None) -> bool:
+    if type(value) is not dict or set(value) != _BANDS_KEYS:
+        return False
+    today = (
+        ("likely_gone_below", eligibility.LIKELY_GONE_BELOW),
+        ("likely_back_from", eligibility.LIKELY_BACK_FROM),
+        ("regular_min_days", eligibility.REGULAR_MIN_DAYS),
+        ("silent_min_days", eligibility.SILENT_MIN_DAYS),
+        ("horizon_weeks", HORIZON_WEEKS),
+    )
+    if not all(type(value[key]) is type(wanted) and value[key] == wanted for key, wanted in today):
+        return False
+    entries, pooled = value["cutoffs"], value["pooled"]
+    if type(entries) is not list or not all(_bands_cutoff_ok(entry) for entry in entries):
+        return False
+    if type(pooled) is not dict or set(pooled) != set(FORECAST_GROUPS) or not all(_count_ok(pooled[name]) for name in FORECAST_GROUPS):
+        return False
+    # The sums and the rise are worked out again by the functions that produced them,
+    # so this check and the writer cannot disagree about what pooled or rising means.
+    stored = {name: _counted(pooled[name]) for name in FORECAST_GROUPS}
+    groups = [
+        ForecastGroups(date.fromisoformat(entry["cutoff"]), entry["converged"], **{name: _counted(entry[name]) for name in FORECAST_GROUPS})
+        for entry in entries
+    ]
+    return (
+        [entry["cutoff"] for entry in entries] == days
+        and pooled_groups(groups) == stored
+        and type(value["rising"]) is bool
+        and value["rising"] == groups_rise(stored)
+    )
+
+
 def _uci_ok(value: dict) -> bool:
     keys = set(value)
-    if keys not in (UCI_KEYS, UCI_KEYS | UCI_GROUP_KEYS):
+    if keys not in (UCI_KEYS, UCI_KEYS | UCI_GROUP_KEYS, UCI_KEYS | UCI_GROUP_KEYS | {UCI_BANDS_KEY}):
         return False
-    if keys == UCI_KEYS | UCI_GROUP_KEYS:
-        # The headline must describe the rule campaigns use today, so a row stored
-        # under an older rule reads as missing rather than as today's number.
+    if keys != UCI_KEYS:
+        # The headline must be measured on the quiet regulars rule campaigns pick from
+        # today, and the bands split by today's forecast cut-offs, so a row stored under
+        # an older rule reads as missing rather than as today's number.
         days = [entry["cutoff"] for entry in value["cutoffs"]] if type(value["cutoffs"]) is list else None
         live_rule = (eligibility.REGULAR_MIN_DAYS, eligibility.SILENT_MIN_DAYS)
         if not (
             _group_ok(value["headline"], LIVE_SEGMENT, live_rule, days)
             and _group_ok(value["all_customers"], ALL_CUSTOMERS, (None, None), days)
+            and (UCI_BANDS_KEY not in keys or _bands_ok(value[UCI_BANDS_KEY], days))
         ):
             return False
     return (

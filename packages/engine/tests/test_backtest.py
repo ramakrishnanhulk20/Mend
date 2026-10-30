@@ -19,10 +19,17 @@ from mend_engine.campaigns import eligibility
 from mend_engine.data.uci import COLUMNS, SHEETS, XLSX_NAME
 from mend_engine.model import backtest
 from mend_engine.model.backtest import (
+    FORECAST_GROUPS,
+    CutoffScores,
+    ForecastGroups,
+    GroupCount,
     Paired,
     auc,
     decile_table,
     difference_interval,
+    forecast_groups,
+    groups_rise,
+    pooled_groups,
     purchase_days_from_uci,
     run_backtest,
     run_cutoff,
@@ -219,6 +226,11 @@ def test_run_backtest_pools_only_the_cutoffs_where_the_difference_is_defined(mon
     run = run_backtest(shop, cutoffs)
 
     assert [r.cutoff for r in run.results] == list(cutoffs)
+    # The forecast groups reuse each cutoff's fit, so there is one fit per cutoff and no more.
+    assert len(calls) == len(cutoffs)
+    assert run.results[0].groups == ForecastGroups(cutoffs[0], False, None, None, None)
+    assert run.groups_pooled == pooled_groups([r.groups for r in run.results[1:]])
+    assert run.groups_rise == groups_rise(run.groups_pooled)
     assert run.results[0].live_segment.difference is None and run.results[0].all_customers.difference is None
     for name in ("live_segment", "target_group", "all_customers"):
         summary = getattr(run, name)
@@ -243,6 +255,96 @@ def test_a_fit_that_does_not_converge_is_reported_not_scored() -> None:
     assert result.actual_purchase_days == 10
     assert 0.0 <= result.auc_recency <= 1.0
     assert result.lapsed_regulars == 0 and math.isnan(result.lapsed_returned_share)
+
+
+def test_forecast_groups_count_each_quiet_regular_by_hand(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Per customer: purchase days before the cutoff, days silent, purchase days in the holdout, 13-week score.
+    rows = {
+        "gone-quiet": (3, 60, 0, 0.0999),
+        "gone-back": (4, 90, 1, 0.0),
+        "nudge-edge": (3, 61, 2, 0.1),
+        "nudge-high": (5, 120, 0, 0.9999),
+        "back-edge": (3, 75, 1, 1.0),
+        "back-high": (6, 200, 3, 2.5),
+        # Not quiet regulars: two purchase days only, and silent one day short of 60.
+        "two-days": (2, 100, 0, 0.5),
+        "recent": (8, 59, 0, 0.01),
+    }
+    before, silent, after, score = (np.array(column) for column in zip(*rows.values()))
+    T = np.arange(len(rows), dtype=float) + 30.0
+    params = Params(r=0.5, alpha=5.0, a=0.5, b=3.0)
+    scores = CutoffScores(CUT, 91, tuple(rows), params, score, before - 1.0, T - silent / 7, T, silent, before, after)
+    # Each row's T is distinct, so the stand-in can hand every customer the score chosen above.
+    by_T, calls = dict(zip(T, score)), []
+
+    def thirteen_weeks(used: Params, t: float, x: np.ndarray, t_x: np.ndarray, ages: np.ndarray) -> np.ndarray:
+        calls.append((used, t, list(ages)))
+        return np.array([by_T[age] for age in ages])
+
+    monkeypatch.setattr(backtest, "expected_purchases", thirteen_weeks)
+    groups = forecast_groups(scores)
+
+    # Below 0.1 is likely gone, 0.1 up to 1.0 worth a nudge, 1.0 and up likely back.
+    assert groups == ForecastGroups(CUT, True, GroupCount(2, 1), GroupCount(2, 1), GroupCount(2, 2))
+    assert calls == [(params, 13.0, list(T[:6]))]
+
+
+def test_a_cutoff_that_did_not_converge_has_no_forecast_groups() -> None:
+    assert run_cutoff(ONE_TIMERS, CUT).groups == ForecastGroups(CUT, False, None, None, None)
+
+
+def test_forecast_groups_split_on_13_weeks_whatever_the_holdout() -> None:
+    shop = simulated_shop()
+    # 91 days is exactly 13 weeks, so that holdout's own expectation is the 13-week score.
+    thirteen = backtest.score_cutoff(shop, SIM_CUT, 91)
+    short = backtest.score_cutoff(shop, SIM_CUT, 30)
+    quiet = backtest.live_segment(short)
+
+    def split(expected: np.ndarray) -> np.ndarray:
+        return np.array([eligibility.forecast_group(float(value)) for value in expected[quiet]])
+
+    names = split(thirteen.expected)
+    # The 30-day expectation would place customers differently, so the check below can fail.
+    assert not np.array_equal(split(short.expected), names)
+    back = short.days_after[quiet] > 0
+    by_hand = {name: GroupCount(int((names == name).sum()), int(back[names == name].sum())) for name in FORECAST_GROUPS}
+    assert run_cutoff(shop, SIM_CUT, 30).groups == ForecastGroups(SIM_CUT, True, **by_hand)
+
+
+def test_pooled_groups_sum_only_the_converged_cutoffs() -> None:
+    results = [
+        ForecastGroups(D(2024, 1, 1), True, GroupCount(2, 0), GroupCount(5, 2), GroupCount(3, 2)),
+        ForecastGroups(D(2024, 2, 1), False, None, None, None),
+        ForecastGroups(D(2024, 3, 1), True, GroupCount(1, 1), GroupCount(4, 1), GroupCount(2, 1)),
+        # Counts beside a fit that did not converge mean nothing, so the flag alone decides.
+        ForecastGroups(D(2024, 4, 1), False, GroupCount(50, 50), GroupCount(50, 0), GroupCount(50, 0)),
+    ]
+
+    assert pooled_groups(results) == {
+        eligibility.LIKELY_GONE: GroupCount(3, 1),
+        eligibility.WORTH_A_NUDGE: GroupCount(9, 3),
+        eligibility.LIKELY_BACK: GroupCount(5, 3),
+    }
+    assert pooled_groups(results[1:2]) == {name: GroupCount(0, 0) for name in FORECAST_GROUPS}
+
+
+@pytest.mark.parametrize(
+    ("gone", "nudge", "back", "rises"),
+    [
+        ((10, 1), (10, 4), (10, 7), True),
+        # 2 in 10 and 4 in 20 are the same share: a tie is not a rise.
+        ((10, 2), (20, 4), (10, 7), False),
+        ((10, 1), (3, 1), (9, 3), False),
+        ((10, 5), (10, 3), (10, 7), False),
+        ((10, 1), (10, 7), (10, 4), False),
+        ((0, 0), (10, 4), (10, 7), False),
+        ((10, 1), (0, 0), (10, 7), False),
+        ((10, 1), (10, 4), (0, 0), False),
+    ],
+)
+def test_groups_rise_only_on_a_strict_rise_with_every_group_filled(gone: tuple, nudge: tuple, back: tuple, rises: bool) -> None:
+    pooled = dict(zip(FORECAST_GROUPS, (GroupCount(*gone), GroupCount(*nudge), GroupCount(*back))))
+    assert groups_rise(pooled) is rises
 
 
 def test_model_ranks_a_shop_drawn_from_its_own_story() -> None:

@@ -6,6 +6,7 @@ import { useStill } from "@/components/motion/useStill";
 import type { ShopSummary } from "@/components/live/summary";
 import { BenchmarkTable } from "./BenchmarkTable";
 import { DecileChart, EASE, FOCUS_RING } from "./DecileChart";
+import { GroupsChart } from "./GroupsChart";
 import { IntervalChart } from "./IntervalChart";
 
 function enter(still: boolean, delayMs: number) {
@@ -90,10 +91,13 @@ export function ProofSection({
         </div>
       ) : (
         <div className="mt-20 flex flex-col gap-y-20 lg:grid lg:grid-cols-12 lg:gap-x-16 lg:gap-y-0">
-          <div className="min-w-0 lg:col-span-7">
+          <div className="min-w-0 lg:col-span-12">
+            <GroupsChart state={blockState} summary={summary} />
+          </div>
+          <div className="min-w-0 lg:col-span-7 lg:mt-24">
             <DecileChart state={blockState} summary={summary} />
           </div>
-          <div className="min-w-0 lg:col-span-5">
+          <div className="min-w-0 lg:col-span-5 lg:mt-24">
             <IntervalChart state={blockState} summary={summary} />
           </div>
           <div className="min-w-0 lg:col-span-12 lg:mt-24">

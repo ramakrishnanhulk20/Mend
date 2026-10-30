@@ -318,7 +318,7 @@ export function IntervalChart({ state, summary }: BlockProps) {
 
   const backtest = summary.backtest;
   const rows = [
-    toRow("headline", "Quiet regulars, the customers campaigns target", backtest?.headline ?? null),
+    toRow("headline", "Quiet regulars, the pool campaigns pick from", backtest?.headline ?? null),
     toRow("all", "All customers", backtest?.allCustomers ?? null),
   ];
 

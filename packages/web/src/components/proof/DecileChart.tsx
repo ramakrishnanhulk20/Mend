@@ -136,12 +136,9 @@ const TOP = 28;
 const BOTTOM = 52;
 const BANDS = 10;
 const MAX_COLUMN = 24;
-const TARGETS_TEXT_WIDTH = 108;
 
 const BONE = "#ede6da";
 const INK = "#0b0a0a";
-const ACCENT = "#ff4d2e";
-const ACCENT_HI = "#ff6a4d";
 const COLUMN_FILL = "rgb(237 230 218 / 0.78)";
 const GRID = "rgb(237 230 218 / 0.10)";
 
@@ -191,7 +188,8 @@ function DecilePlot({
   let plot: ReactNode = null;
   let tooltip: ReactNode = null;
 
-  if (box !== null) {
+  // A box narrower than the gutter (0 while the page is not laid out) would give every column a negative width.
+  if (box !== null && box.w > GUTTER) {
     const plotH = box.h - TOP - BOTTOM;
     const band = (box.w - GUTTER) / BANDS;
     const width = Math.min(MAX_COLUMN, band - 2);
@@ -204,20 +202,9 @@ function DecilePlot({
     const first = columns.find((c) => c.decile === 1);
     const last = columns.find((c) => c.decile === 10);
 
-    // The second line under group 10's number is wide. It rises just far enough to clear any
-    // taller column it would otherwise sit on, so it never covers a bar.
-    let targetsY = 0;
-    if (last !== undefined) {
-      const right = last.left + width;
-      const clearTop = Math.min(
-        ...columns.filter((c) => c.decile !== 10 && c.left + width > right - TARGETS_TEXT_WIDTH).map((c) => c.top),
-      );
-      targetsY = Math.min(last.top - 6 - 17, clearTop - 8);
-    }
-
     const hovered = columns.find((c) => c.decile === active);
     if (hovered !== undefined) {
-      const bottom = hovered.decile === 10 ? targetsY - 16 : hovered.decile === 1 ? hovered.top - 6 - 14 - 12 : hovered.top - 10;
+      const bottom = hovered.decile === 1 ? hovered.top - 6 - 14 - 12 : hovered.top - 10;
       tooltip = (
         <ChartTooltip x={hovered.center} bottom={bottom} boxWidth={box.w}>
           <p className="font-sans text-[15px] font-semibold text-bone">{formatShare(hovered.returnedShare)}</p>
@@ -260,9 +247,8 @@ function DecilePlot({
         })}
 
         {columns.map((c) => {
-          const isTargeted = c.decile === 10;
           const lit = active === c.decile;
-          const fill = isTargeted ? (lit ? ACCENT_HI : ACCENT) : lit ? BONE : COLUMN_FILL;
+          const fill = lit ? BONE : COLUMN_FILL;
           return (
             <motion.path
               key={c.decile}
@@ -300,30 +286,17 @@ function DecilePlot({
           </motion.text>
         )}
         {last !== undefined && (
-          <>
-            <motion.text
-              x={last.left + width}
-              y={last.top - 6}
-              textAnchor="end"
-              custom={last.index}
-              variants={LABEL_FADE}
-              className="fill-bone font-sans text-[14px] font-semibold"
-              style={HALO}
-            >
-              {formatShare(last.returnedShare)}
-            </motion.text>
-            <motion.text
-              x={last.left + width}
-              y={targetsY}
-              textAnchor="end"
-              custom={last.index}
-              variants={LABEL_FADE}
-              className="fill-bone-dim font-mono text-[11px]"
-              style={HALO}
-            >
-              who Mend targets
-            </motion.text>
-          </>
+          <motion.text
+            x={last.left + width}
+            y={last.top - 6}
+            textAnchor="end"
+            custom={last.index}
+            variants={LABEL_FADE}
+            className="fill-bone font-sans text-[14px] font-semibold"
+            style={HALO}
+          >
+            {formatShare(last.returnedShare)}
+          </motion.text>
         )}
 
         {columns.map((c) => {

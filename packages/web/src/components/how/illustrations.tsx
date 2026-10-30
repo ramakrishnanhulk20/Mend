@@ -134,7 +134,7 @@ export function ForecastDrawing({ still }: DrawingProps) {
     <Drawing still={still}>
       <Label y={64}>steady</Label>
       <Label y={114}>slipping</Label>
-      <Label y={164}>gone quiet</Label>
+      <Label y={164}>long gone</Label>
       <Thread d="M120 60H640" variants={FORECAST_STEADY} />
       <Thread d="M120 110H370M384 110H490M504 110H640" variants={FORECAST_SLIPPING} />
       <Thread d="M120 160H300" variants={FORECAST_GONE} />

@@ -32,6 +32,8 @@ export function groupsCaption(bands: ForecastBands, holdoutDays: number): string
   const first = converged[0];
   const last = converged[converged.length - 1];
   if (first === undefined || last === undefined) return "Not measured yet.";
-  const base = `Quiet regulars at ${converged.length} past dates in the shop's history, ${formatDay(first.cutoff)} to ${formatDay(last.cutoff)}, split by how many orders Mend's forecast expected of each over the next ${bands.horizonWeeks} weeks. Each bar is the share who bought again within ${holdoutDays} days with no cashback at all. Mend nudges only the middle group.`;
-  return bands.rising ? base : `${base} On this history the shares do not rise from group to group, so the split is not supported.`;
+  const base = `Quiet regulars, customers who bought on ${bands.regularMinDays} or more days and then went silent for ${bands.silentMinDays} or more, at ${converged.length} past dates in the shop's history, ${formatDay(first.cutoff)} to ${formatDay(last.cutoff)}. Each was put in a group by how many orders Mend's forecast expected over the next ${bands.horizonWeeks} weeks, and each bar is the share who bought again within ${holdoutDays} days with no cashback at all.`;
+  return bands.rising
+    ? `${base} Mend nudges only the middle group: the likely gone rarely answer a nudge, and the likely back mostly return without one.`
+    : `${base} Mend nudges only the middle group. On this history the shares do not rise from group to group, so the split is not supported.`;
 }

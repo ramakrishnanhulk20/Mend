@@ -132,9 +132,12 @@ function SilenceThread({ daysSilent, longest }: { daysSilent: number; longest: n
 const ROW_GRID =
   "grid grid-cols-[32px_minmax(0,1fr)_auto] items-center gap-x-3 gap-y-2 md:grid-cols-[56px_minmax(0,1fr)_220px_140px] md:gap-x-6 md:gap-y-0";
 
-// A score under half a cent of an order would round to 0.00, which reads as "never", so it says so in words.
+// A score under 0.01 of an order would show as 0.00, which reads as "never", so it says so in words.
 function forecast(score: number): string {
-  return score < 0.005 ? "under 0.01 orders" : `${score.toFixed(2)} orders`;
+  if (score < 0.01) return "under 0.01 orders";
+  // Rounded down, so a score just under 1, which Mend nudges, never reads 1.00, the line where it stops. The
+  // tiny nudge up keeps a float such as 0.29 * 100 = 28.999... from reading one hundredth low.
+  return `${(Math.floor(score * 100 + 1e-9) / 100).toFixed(2)} orders`;
 }
 
 function RegularRow({ row, longest, index, still }: { row: QuietRegular; longest: number; index: number; still: boolean }) {
@@ -224,7 +227,8 @@ const PAYABLE = "Only customers who joined the shop's thank-you list with Log in
 // The middle group can be empty while the other two are not, and a shop with no quiet regulars has no groups at all, so each case reads on its own.
 function forecastLine(data: QuietRegulars): string {
   if (data.worthANudge > 0) {
-    return `Mend lists the ${formatCount(data.worthANudge)} worth a nudge, biggest spenders first. It skips the ${formatCount(data.likelyGone)} the forecast calls likely gone and the ${formatCount(data.likelyBack)} likely to come back anyway. ${PAYABLE}`;
+    const shownNote = data.rows.length < data.worthANudge ? `, and shows the first ${data.rows.length} here` : "";
+    return `Mend ranks the ${formatCount(data.worthANudge)} worth a nudge, biggest spenders first${shownNote}. It skips the ${formatCount(data.likelyGone)} the forecast calls likely gone and the ${formatCount(data.likelyBack)} likely to come back anyway. ${PAYABLE}`;
   }
   if (data.total > 0) {
     return `None of them is worth a nudge right now: the forecast calls ${formatCount(data.likelyGone)} likely gone and ${formatCount(data.likelyBack)} likely to come back anyway. ${PAYABLE}`;
@@ -327,8 +331,9 @@ export function RegularsStep({ api, onPlan }: RegularsStepProps) {
             <p className="mt-2 font-mono text-[12px] text-bone-faint">Records run to {formatDay(data.asOf)}</p>
           )}
           <p className="mt-2 max-w-[60ch] text-[13px] text-bone-faint">
-            The demo shop replays a UK giftware wholesaler&apos;s real orders, so its totals are large and many
-            regulars have been quiet for a long time.
+            {data.asOf !== null
+              ? `The demo shop replays a UK giftware wholesaler's real orders from 2009 to 2011, moved forward to end on ${formatDay(data.asOf)}, in US dollars at 1.60 to the pound and with made-up names, so its totals are large and many regulars have been quiet for a long time.`
+              : "The demo shop replays a UK giftware wholesaler's real orders, so its totals are large and many regulars have been quiet for a long time."}
           </p>
 
           {rows.length === 0 ? (

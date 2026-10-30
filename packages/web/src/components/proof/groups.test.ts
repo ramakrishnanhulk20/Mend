@@ -9,6 +9,8 @@ const CONVERGED_DATES = ["2010-09-09", "2010-12-09", "2011-03-09", "2011-06-09",
 const BANDS: ForecastBands = {
   likelyGoneBelow: 0.1,
   likelyBackFrom: 1,
+  regularMinDays: 3,
+  silentMinDays: 60,
   horizonWeeks: 13,
   pooled: {
     likelyGone: { customers: 92, returned: 9 },
@@ -68,16 +70,24 @@ describe("groupShare", () => {
 });
 
 describe("groupsCaption", () => {
-  it("counts only the dates the model fitted, and names the first and last", () => {
+  const BASE =
+    "Quiet regulars, customers who bought on 3 or more days and then went silent for 60 or more, at 5 past dates in the shop's history, 9 Sep 2010 to 9 Sep 2011. Each was put in a group by how many orders Mend's forecast expected over the next 13 weeks, and each bar is the share who bought again within 91 days with no cashback at all.";
+
+  it("defines a quiet regular, counts only the converged dates, and says why only the middle group is nudged", () => {
     expect(groupsCaption(BANDS, 91)).toBe(
-      "Quiet regulars at 5 past dates in the shop's history, 9 Sep 2010 to 9 Sep 2011, split by how many orders Mend's forecast expected of each over the next 13 weeks. Each bar is the share who bought again within 91 days with no cashback at all. Mend nudges only the middle group.",
+      `${BASE} Mend nudges only the middle group: the likely gone rarely answer a nudge, and the likely back mostly return without one.`,
     );
   });
 
   it("says the split is not supported when the shares do not rise", () => {
-    const caption = groupsCaption({ ...BANDS, rising: false }, 91);
-    expect(caption.endsWith(" On this history the shares do not rise from group to group, so the split is not supported.")).toBe(true);
-    expect(caption).toContain("Mend nudges only the middle group.");
+    expect(groupsCaption({ ...BANDS, rising: false }, 91)).toBe(
+      `${BASE} Mend nudges only the middle group. On this history the shares do not rise from group to group, so the split is not supported.`,
+    );
+  });
+
+  it("follows other quiet regular rules", () => {
+    const caption = groupsCaption({ ...BANDS, regularMinDays: 5, silentMinDays: 90 }, 91);
+    expect(caption).toContain("bought on 5 or more days and then went silent for 90 or more");
   });
 
   it("says not measured when no date was fitted", () => {

@@ -41,9 +41,9 @@ const DOT_PULSE: Variants = {
 
 type Count = { customers: number; returned: number };
 
-// A date the model did not fit has no counts, so it reads "not fitted" and never a made-up share.
+// A date the model did not fit has no counts, so it reads "did not converge" and never a made-up share.
 function cellText(count: Count | null): string {
-  if (count === null) return "not fitted";
+  if (count === null) return "did not converge";
   const share = groupShare(count);
   if (share === null) return "none";
   return `${formatShare(share)} (${formatCount(count.returned)} of ${formatCount(count.customers)})`;
@@ -160,39 +160,39 @@ function GroupsPlot({ bands }: { bands: ForecastBands }) {
             </caption>
             <thead>
               <tr className="border-b border-bone/10">
-                <th scope="col" className={HEAD_CELL}>
+                <th scope="col" className={`${HEAD_CELL} whitespace-nowrap`}>
                   Date
                 </th>
-                <th scope="col" className={`${HEAD_CELL} text-right`}>
+                <th scope="col" className={`${HEAD_CELL} whitespace-nowrap text-right`}>
                   Likely gone
                 </th>
-                <th scope="col" className={`${HEAD_CELL} text-right`}>
+                <th scope="col" className={`${HEAD_CELL} whitespace-nowrap text-right`}>
                   Worth a nudge
                 </th>
-                <th scope="col" className={`${HEAD_CELL} pr-0 text-right`}>
-                  Likely back
+                <th scope="col" className={`${HEAD_CELL} whitespace-nowrap pr-0 text-right`}>
+                  Likely back anyway
                 </th>
               </tr>
             </thead>
             <tbody>
               {bands.cutoffs.map((row) => (
                 <tr key={row.cutoff} className="border-b border-bone/10">
-                  <th scope="row" className="py-2 pr-4 text-left font-normal text-bone-dim">
+                  <th scope="row" className="whitespace-nowrap py-2 pr-4 text-left font-normal text-bone-dim">
                     {formatDay(row.cutoff)}
                   </th>
                   {GROUPS.map((key, column) => (
-                    <td key={key} className={`py-2 text-right text-bone ${column < 2 ? "pr-4" : ""}`}>
+                    <td key={key} className={`whitespace-nowrap py-2 text-right text-bone ${column < 2 ? "pr-4" : ""}`}>
                       {cellText(row.converged ? row[key] : null)}
                     </td>
                   ))}
                 </tr>
               ))}
               <tr className="border-b border-bone/10">
-                <th scope="row" className="py-2 pr-4 text-left font-normal text-bone-dim">
+                <th scope="row" className="whitespace-nowrap py-2 pr-4 text-left font-normal text-bone-dim">
                   All dates
                 </th>
                 {GROUPS.map((key, column) => (
-                  <td key={key} className={`py-2 text-right font-semibold text-bone ${column < 2 ? "pr-4" : ""}`}>
+                  <td key={key} className={`whitespace-nowrap py-2 text-right font-semibold text-bone ${column < 2 ? "pr-4" : ""}`}>
                     {cellText(bands.pooled[key])}
                   </td>
                 ))}

@@ -27,6 +27,8 @@ const bandCount = z.looseObject({ customers: count, returned: count });
 const forecastBands = z.looseObject({
   likelyGoneBelow: z.number(),
   likelyBackFrom: z.number(),
+  regularMinDays: z.number(),
+  silentMinDays: z.number(),
   horizonWeeks: z.number(),
   pooled: z.looseObject({ likelyGone: bandCount, worthANudge: bandCount, likelyBack: bandCount }),
   rising: z.boolean(),

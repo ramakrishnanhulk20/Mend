@@ -33,9 +33,9 @@ const DIST_DIR = ".next-verify";
 const PYTHON = path.join(ENGINE_DIR, ".venv", process.platform === "win32" ? "Scripts/python.exe" : "bin/python");
 // The web config needs a webhook id to load; this proof registers no webhook.
 const UNUSED_WEBHOOK_ID = "M7BPROOFNOWEBHOOK";
-// A demo visitor's default plan: the 10 most at-risk members, half held back, 200 cents to
-// each of the 5 rewarded. The test receiver is moved to rank 1 in this proof's schema, so it
-// is always a candidate and can be drawn into the rewarded half.
+// A demo visitor's default plan: the first 10 members worth a nudge, biggest spenders first,
+// half held back, 200 cents to each of the 5 rewarded. The test receiver holds rank 1 of that
+// group in this proof's schema, so it is always a candidate and can be drawn into the rewarded half.
 const DEMO_DRAFT = {
   goalText: "Bring back our quiet regulars with a small thank-you",
   asOf: "2026-10-16",
@@ -61,7 +61,7 @@ const RECEIVER_FIRST = [
   "with connect(config) as conn:",
   "    print(seed_demo.seed_receiver_first(conn, config, seed_demo.shop_scores(conn)), flush=True)",
 ].join("\n");
-const RECEIVER_FIRST_LINE = /^receiver: (already first|moved to rank 1 \(was rank \d+\))$/;
+const RECEIVER_FIRST_LINE = /^receiver: (already first|moved to rank 1 \(was rank \d+\)|moved to rank 1 \(was outside the worth-a-nudge group\))$/;
 // The UK clock as a POSIX rule: the local pgserver has no time zone database, and a
 // rule worked out in SQL is a check independent of the engine's zoneinfo.
 const LONDON_RULE = "GMT0BST,M3.5.0/1,M10.5.0";
@@ -508,20 +508,32 @@ async function main(): Promise<void> {
   const memberIds = (await db.query<{ member_id: string }>("select member_id::text from members")).rows.map((row) => row.member_id);
   const rowKeys = ["daysSilent", "displayName", "member", "paidNetMinor", "position", "purchaseDays", "score", "standIn"].join(",");
   const anonymousList = await visitor.send("GET", "/api/shop/quiet-regulars?limit=50");
+  const groups = [quiet.body.worthANudge, quiet.body.likelyGone, quiet.body.likelyBack];
+  const groupsCounted = groups.every((count) => Number.isSafeInteger(count) && Number(count) >= 0);
+  const worthANudge = Number(quiet.body.worthANudge);
+  const receiverName = (await db.query<{ display_name: string }>("select display_name from shop_customers where lower(trim(email)) = $1", [receiver])).rows;
   line(
     quiet.status === 200 &&
-      rows.length === Math.min(50, direct.quiet) &&
       rows.length <= 50 &&
       quiet.body.total === direct.quiet &&
+      groupsCounted &&
+      groups.reduce((sum: number, count) => sum + Number(count), 0) === quiet.body.total &&
+      rows.length === Math.min(50, worthANudge) &&
+      rows.every((row, at) => typeof row.paidNetMinor === "number" && (at === 0 || row.paidNetMinor <= Number(rows[at - 1].paidNetMinor))) &&
+      rows.every((row) => typeof row.score === "number" && row.score >= 0.1 && row.score < 1.0) &&
+      receiverName.length === 1 &&
+      rows[0]?.displayName === receiverName[0].display_name &&
       rows.every((row) => Object.keys(row).sort().join(",") === rowKeys) &&
       !quiet.text.includes("@") &&
       !UUID_ANYWHERE.test(quiet.text) &&
       !CUSTOMER_REF.test(quiet.text) &&
       !memberIds.some((id) => quiet.text.includes(id)) &&
       anonymousList.status === 401,
-    "quiet regulars: demo session sees up to 50 rows, no email, member id or customer ref",
+    "quiet regulars: demo session sees the worth-a-nudge group, biggest spenders first, the sandbox receiver first, no email, member id or customer ref",
   );
-  note(`${rows.length} of ${String(quiet.body.total)} rows, ${rows.filter((row) => row.standIn === true).length} of them demo stand-ins; most at risk: ${String(rows[0]?.displayName)}, ${String(rows[0]?.purchaseDays)} purchase days, ${String(rows[0]?.daysSilent)} days silent`);
+  note(
+    `${rows.length} rows of ${String(quiet.body.total)} quiet regulars (worth a nudge ${String(quiet.body.worthANudge)}, likely gone ${String(quiet.body.likelyGone)}, likely back ${String(quiet.body.likelyBack)}), ${rows.filter((row) => row.standIn === true).length} of them demo stand-ins; first in the list: ${String(rows[0]?.displayName)}, ${String(rows[0]?.purchaseDays)} purchase days, ${String(rows[0]?.daysSilent)} days silent`,
+  );
 
   // 4 and 5. The journey: drafts until the test receiver is rewarded, view, a wrong hash, approve, submit.
   const receiverMember = (await db.query<{ member_id: string }>("select member_id::text from members where paypal_email = $1", [receiver])).rows[0].member_id;

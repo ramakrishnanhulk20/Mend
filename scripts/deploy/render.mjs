@@ -745,7 +745,10 @@ async function migrateAndSeed(connection, roleConnections, passwords, changes) {
   const seeded = await runEngineCommand("mend_engine.seed_demo", roleConnections.mend_engine.external, SEED_TIMEOUT_MS);
   if (seeded.code !== 0 || !seeded.lines.includes("SEED RESULT: PASS")) throw new DeployError(`python -m mend_engine.seed_demo exited ${seeded.code}`);
   const wrote = seeded.lines.filter(
-    (text) => /^(orders: imported|refunds: imported|facts: stored|receiver: .*linked to one quiet regular|receiver: moved to rank 1)/.test(text) || /^members: .*\(([1-9][0-9]*) new\)/.test(text),
+    (text) =>
+      /^(orders: imported|refunds: imported|facts: stored|receiver: .*linked to one quiet regular|receiver: moved to rank 1)/.test(text) ||
+      /^members: .*\(([1-9][0-9]*) new\)/.test(text) ||
+      /stand-ins outside the group left/.test(text),
   );
   if (wrote.length > 0) changes.push(`seeded mend-db (${wrote.map((text) => text.split(":")[0]).join(", ")})`);
   return sha;
@@ -1920,7 +1923,7 @@ async function proveChecks({ receiver, startedAt, workspace, services, db, origi
       const campaignId = String(done.body.campaignId ?? "");
       const role = rows("select role, ref from campaign_members where campaign_id::text = %s and member_id::text = %s", [campaignId, memberRow.id])[0];
       // The ranking is the same on every draw, so a receiver left out once is left out every time.
-      if (role === undefined) throw new ProofFailed(`the test receiver is not among the ${DEMO_PLAN.maxCandidates} candidates of a demo draft; run \`up --migrate\` so seed_demo moves it to rank 1`);
+      if (role === undefined) throw new ProofFailed(`the test receiver is not among the ${DEMO_PLAN.maxCandidates} candidates of a demo draft; run \`up --migrate\` so seed_demo links it to rank 1 of the worth-a-nudge group`);
       if (role.role === "reward") {
         planned = { campaignId, plan: first.body.plan, aiCalls: Number(first.body.aiCalls ?? 0), ref: role.ref, rewarded: done.body.rewarded, heldBack: done.body.heldBack };
         break;

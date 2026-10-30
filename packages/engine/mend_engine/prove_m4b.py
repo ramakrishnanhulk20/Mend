@@ -45,7 +45,7 @@ from mend_engine.campaigns.approval import (
     set_amount,
 )
 from mend_engine.campaigns.drafts import DraftRefused, DraftSettings, build_draft
-from mend_engine.campaigns.eligibility import REGULAR_MIN_DAYS, SILENT_MIN_DAYS, quiet_regular_members
+from mend_engine.campaigns.eligibility import quiet_regular_members, worth_a_nudge_refs
 from mend_engine.campaigns.scoring import SHOP_ZONE, ScoreSet, score_customers
 from mend_engine.campaigns.spend import CapExceeded, database_now, spent_last_24h_minor
 from mend_engine.campaigns.submission import SubmissionResult, submit
@@ -213,14 +213,7 @@ def check_refunds(proof: Proof, conn: psycopg.Connection) -> ScoreSet:
 
 
 def quiet_regulars(scores: ScoreSet) -> list[str]:
-    quiet = [
-        ref
-        for ref in scores.scores
-        if scores.purchase_days[ref] >= REGULAR_MIN_DAYS
-        and scores.days_silent[ref] >= SILENT_MIN_DAYS
-        and scores.paid_minor[ref] >= PER_RECIPIENT_MINOR
-    ]
-    return sorted(quiet, key=lambda ref: (scores.scores[ref], ref))
+    return [ref for ref in worth_a_nudge_refs(scores) if scores.paid_minor[ref] >= PER_RECIPIENT_MINOR]
 
 
 def unlinked_quiet_regular(conn: psycopg.Connection, scores: ScoreSet) -> str:

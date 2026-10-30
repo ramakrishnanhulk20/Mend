@@ -1,7 +1,7 @@
 """Proves M4a on the demo shop's real records: python -m mend_engine.prove_m4a
 
-Joins the 40 demo stand-ins (the 40 quiet regulars most at risk on 2026-10-16, by the
-synthetic address each was given) and one stand-in who is no shop customer, all under
+Joins the 40 demo stand-ins (the quiet regulars worth a nudge at ranks 2 to 41 on
+2026-10-16, by the synthetic address each was given) and one stand-in who is no shop customer, all under
 this script's own name, scores the shop, and shows who is eligible and who a running
 measurement still holds. It drafts twice over the same members (a draft holds nobody),
 approves the first and shows that approving the second is refused member_held, voids
@@ -33,9 +33,12 @@ from mend_engine.campaigns.drafts import DraftRefused, DraftSettings, build_draf
 from mend_engine.campaigns.eligibility import (
     REGULAR_MIN_DAYS,
     SILENT_MIN_DAYS,
+    WORTH_A_NUDGE,
     Candidate,
+    forecast_group,
     quiet_regular_members,
     sent_by_receiver,
+    worth_a_nudge_refs,
 )
 from mend_engine.campaigns.holdout import DEFAULT_HOLDOUT_SHARE, holdout_size
 from mend_engine.campaigns.scoring import ScoreSet, net_of_later_refunds, score_customers
@@ -107,13 +110,12 @@ def describe(exc: BaseException) -> str:
 
 
 def demo_customers(scores: ScoreSet) -> list[str]:
-    """The 40 quiet regulars most at risk, the same 40 on every run over the same records."""
-    quiet = [
-        ref
-        for ref in scores.scores
-        if scores.purchase_days[ref] >= REGULAR_MIN_DAYS and scores.days_silent[ref] >= SILENT_MIN_DAYS
-    ]
-    return sorted(quiet, key=lambda ref: (scores.scores[ref], ref))[:DEMO_MEMBERS]
+    """The 40 quiet regulars worth a nudge at ranks 2 to 41, biggest spenders first, the same 40 on every run over the same records.
+
+    Rank 1 of worth_a_nudge_refs is kept for the sandbox receiver, which seed_demo
+    links to it, so no stand-in ever holds the one row that can really claim a payout.
+    """
+    return worth_a_nudge_refs(scores)[1 : 1 + DEMO_MEMBERS]
 
 
 def join_demo_members(conn: psycopg.Connection, config: Config, refs: list[str]) -> dict[uuid.UUID, str | None]:
@@ -203,10 +205,11 @@ def check_eligible(
         and not ids & held
         and outsider not in ids
         and match_member_to_customer(conn, outsider) is None
-        and all(a.score <= b.score for a, b in zip(candidates, candidates[1:]))
+        and all(scores.paid_minor[a.customer_ref] >= scores.paid_minor[b.customer_ref] for a, b in zip(candidates, candidates[1:]))
         and all(
             scores.purchase_days[c.customer_ref] >= REGULAR_MIN_DAYS
             and scores.days_silent[c.customer_ref] >= SILENT_MIN_DAYS
+            and forecast_group(scores.scores[c.customer_ref]) == WORTH_A_NUDGE
             and c.paid_minor >= 1
             for c in candidates
         )
@@ -214,7 +217,7 @@ def check_eligible(
     with_receiver = " (the verified test receiver among them)" if receiver in ids else ""
     proof.line(
         ok,
-        f"eligible: {len(candidates)} quiet regular members{with_receiver}, most at risk first; "
+        f"eligible: {len(candidates)} quiet regular members{with_receiver}, worth a nudge, biggest spenders first; "
         f"{len(held & set(demo))} demo stand-ins held by a running measurement and {len(no_room)} with nothing "
         "left to be paid are left out; the non-customer is not eligible",
     )
@@ -340,7 +343,7 @@ def check_view(proof: Proof, conn: psycopg.Connection, campaign_id: uuid.UUID) -
 
 
 def check_leave(proof: Proof, conn: psycopg.Connection, config: Config, campaign_id: uuid.UUID, demo: dict) -> dict:
-    # The most at-risk stand-in in the draft, never the test receiver, whose row may be a person's own.
+    # The first stand-in in the draft, never the test receiver, whose row may be a person's own.
     leaver = conn.execute(
         "select member_id from campaign_members where campaign_id = %s and member_id = any(%s) order by rank limit 1",
         (campaign_id, list(demo)),

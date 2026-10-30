@@ -16,7 +16,7 @@ Mend uses Claude Haiku 5.5 (`claude-haiku-5-5`) through the Anthropic API, from 
 The rule is structural: whatever Claude outputs, these hold.
 
 - It never sets an amount. Code computes every amount in whole cents and checks it against the caps when the draft is built and again at approval. Numbers Claude reads from a goal are clamped, and the engine checks them again.
-- It never chooses who is paid. The engine builds the eligible list from the ranking and the members' consent, and draws the held-back group at random before Claude sees anyone. Claude sees customers only as opaque references for that campaign, and an unknown or repeated reference rejects the whole draft.
+- It never chooses who is paid. The engine builds the eligible list from the forecast's worth-a-nudge group and the members' consent, and draws the held-back group at random before Claude sees anyone. Claude sees customers only as opaque references for that campaign, and an unknown or repeated reference rejects the whole draft.
 - It never approves or sends. Approval is a person's click on the campaign page, bound to the plan's fingerprint.
 - It never touches PayPal. Mend's server makes every PayPal call, with four read tools named in code, keys that cannot send payouts, and answers rebuilt without the buyer's identity.
 - It never sees a customer's email, phone, PayPal id or a secret. Prompts carry references, item names, counts and recency.
@@ -26,7 +26,7 @@ The rule is structural: whatever Claude outputs, these hold.
 | Tool | What it does | Who |
 |---|---|---|
 | `shop_summary` | The shop's live counts and the honest backtest result | Demo and owner |
-| `quiet_regulars` | Quiet regulars in forecast order, with demo stand-ins marked | Demo and owner |
+| `quiet_regulars` | The three forecast groups and the worth-a-nudge list, with demo stand-ins marked | Demo and owner |
 | `draft_campaign` | Drafts a campaign through the same capped path as the plan screen, and writes its notes | Demo and owner |
 | `view_campaign` | One campaign's rewards and notes | The campaign's own session |
 | `campaign_results` | One campaign's results, including where its payouts stand | The campaign's own session |

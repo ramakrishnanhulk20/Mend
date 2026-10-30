@@ -40,7 +40,7 @@ Anyone. The demo shop's live counts (customers, quiet regulars, members joined a
 
 ### `GET /api/shop/quiet-regulars?limit=1..50`
 
-Demo or owner. Answers `{"asOf", "total", "rows"}`, where each row has `position` (1 is most at risk), `displayName`, `purchaseDays`, `daysSilent`, `score` (expected purchases over the next 13 weeks), `paidNetMinor`, `member` (a member who could be paid) and `standIn` (a demo stand-in the seed script joined, never a person). Limit: 60 per session an hour. Waits up to 15 seconds. `422 model_not_converged` if the forecast could not be fitted.
+Demo or owner. Answers `{"asOf", "total", "worthANudge", "likelyGone", "likelyBack", "rows"}`. `total` counts every quiet regular and the three groups add up to it. `rows` are the worth-a-nudge group only, biggest spenders first, and each row has `position` (1 is the biggest spender), `displayName`, `purchaseDays`, `daysSilent`, `score` (expected purchases over the next 13 weeks), `paidNetMinor`, `member` (a member who could be paid) and `standIn` (a demo stand-in the seed script joined, never a person). Limit: 60 per session an hour. Waits up to 15 seconds. `422 model_not_converged` if the forecast could not be fitted.
 
 ## Campaigns
 

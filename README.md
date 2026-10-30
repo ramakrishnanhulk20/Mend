@@ -32,12 +32,12 @@ Everything is PayPal sandbox. No real money moves.
 
 Regular customers rarely leave with a complaint. They stop ordering, and a small shop notices months later, if at all. The usual fixes are a discount code sent to everyone or a points scheme, and neither tells the owner whether the money changed anything.
 
-Mend works from the shop's own order history. A forecast ranks the regulars who have gone quiet. The owner writes a goal in one sentence, Claude turns it into a capped plan and writes a short note for each customer, and the owner approves that exact plan. PayPal pays it as cashback. A random part of the list is held back and gets nothing, so Mend can compare the two groups and say whether the cashback brought people back, or say plainly that it is too early to tell.
+Mend works from the shop's own order history. A forecast picks the regulars who have gone quiet but are still worth a nudge. The owner writes a goal in one sentence, Claude turns it into a capped plan and writes a short note for each customer, and the owner approves that exact plan. PayPal pays it as cashback. A random part of the list is held back and gets nothing, so Mend can compare the two groups and say whether the cashback brought people back, or say plainly that it is too early to tell.
 
 | | Blanket discount email | Loyalty points app | Mend |
 |---|---|---|---|
 | Who gets the money | Everyone who uses the code, including people who would have paid full price | Customers who are already buying | Quiet regulars who joined the shop's list with PayPal, a few dollars each, in their PayPal |
-| How they are chosen | Nobody is chosen | By how much they spend | Ranked by a forecast from the shop's own orders; code builds the list and the owner approves it |
+| How they are chosen | Nobody is chosen | By how much they spend | A forecast from the shop's own orders skips the likely gone and the likely back; code builds the list, biggest spenders first, and the owner approves it |
 | How you know it worked | Sales after the email, with nothing to compare against | Hard to separate loyalty from habit | A random held-back group, compared with Fisher's exact test |
 | What it costs when nobody returns | Little, but every full-price buyer who uses the code costs margin | The app's fee keeps running | The cashback sent, under hard caps, and unclaimed cashback can be taken back |
 
@@ -47,6 +47,7 @@ Mend works from the shop's own order history. A forecast ranks the regulars who 
 
 - A BG/NBD forecast, fitted on the shop's own order records, gives each customer's expected purchases over the next 13 weeks.
 - Quiet regulars are customers with 3 or more purchase days who have been silent for 60 days or more. The demo shop has 1,357 of them (29 Oct 2026).
+- The forecast splits them into three groups. On the shop's own history, at five test dates, 10 percent of the likely gone came back within 91 days on their own (9 of 92), 38 percent of the middle group (1,371 of 3,595) and 60 percent of the likely back (653 of 1,088). Mend nudges only the middle group, biggest spenders first: 1,110 of the 1,357.
 - The model reproduces the published CDNOW parameters: r 0.243, alpha 4.414, a 0.793, b 2.426, log-likelihood -9582.4.
 - The backtest says what it found. Among quiet regulars the forecast ties ranking by most recent order: it won 3 of 5 test dates, mean AUC difference -0.005, 95 percent range -0.024 to +0.016. Across all customers it wins 5 of 5, +0.052, range +0.048 to +0.057. On 9 Sep 2011 the safest tenth of 5,256 customers came back within 91 days 92 percent of the time, and the most at risk tenth 10 percent.
 
@@ -275,10 +276,10 @@ The parts, every PayPal call and who makes it are in [ARCHITECTURE.md](ARCHITECT
 Everything here runs on the PayPal sandbox: real Payouts batches and real PayPal webhooks, with test money. No sign-up and no PayPal login.
 
 1. Open https://mend-web.onrender.com/demo and press **Start the demo**. A demo session opens for this browser.
-2. Step 1 shows the quiet regulars, ranked by Mend's forecast with the most at risk first, and how many there are. Rows marked as stand-ins are demo customers the seed script joined, not people. Press **Ask Claude for a plan**.
+2. Step 1 shows how many regulars went quiet and lists the ones worth a nudge, biggest spenders first. Rows marked as stand-ins are demo customers the seed script joined, not people. Press **Ask Claude for a plan**.
 3. Step 2: pick a suggestion such as "Win back my best lapsed regulars with 10 dollars", or type your own goal with an amount. Claude's plan shows the budget, the reward per customer, the share held back, how many customers were considered, and anything Claude adjusted to fit the demo caps. Press **Review the plan**.
 4. Step 3 shows every reward with its note and every held-back customer as a dotted thread. Optionally press **Have Claude write the notes** for one personal note per customer from their own past items. Press **Approve this exact plan**: Mend seals the plan and shows its fingerprint. Press **Send it with PayPal**.
-5. Step 4: press **Send with PayPal**. Mend sends one Payouts batch and shows PayPal's batch id. Watch the threads: each one is stitched as PayPal confirms that customer's payment, usually within about a minute. The most at risk customer is the one real sandbox account, so when the random draw pays it, PayPal marks its reward claimed. The stand-ins have no PayPal account, so PayPal holds their cashback as unclaimed. Press **See the results**.
+5. Step 4: press **Send with PayPal**. Mend sends one Payouts batch and shows PayPal's batch id. Watch the threads: each one is stitched as PayPal confirms that customer's payment, usually within about a minute. The first customer in the list is the one real sandbox account, so when the random draw pays it, PayPal marks its reward claimed. The stand-ins have no PayPal account, so PayPal holds their cashback as unclaimed. Press **See the results**.
 6. Step 5 compares the paid group with the held-back group and gives the verdict, which for a five-person demo group is "too early to tell". Press **Simulate a return purchase**: Mend buys from the shop with PayPal's sandbox test card for the customer you pick, and the return is counted for their group as simulated.
 7. Press **Take back** (the button shows the amount) to cancel the unclaimed cashback. PayPal returns it to the shop, and the results show how much came back. If you leave it, mend-jobs takes it back on its own once it has waited 10 minutes.
 8. Ask Mend in the side panel, for example "How many quiet regulars does my shop have right now?". It answers from live data and says which tools it used.
@@ -377,7 +378,7 @@ Every route a visitor's browser calls. Each state-changing POST needs an `Origin
 | POST | `/api/session/demo` | Opens a demo session |
 | POST | `/api/session/logout` | Ends the session |
 | GET | `/api/shop/summary` | The shop's live counts, the benchmark and the backtest |
-| GET | `/api/shop/quiet-regulars` | Quiet regulars ranked by the forecast, most at risk first |
+| GET | `/api/shop/quiet-regulars` | Quiet regulars worth a nudge, biggest spenders first, with the three group counts |
 | POST | `/api/campaigns/plan` | Claude reads a goal and the engine drafts a campaign within the caps |
 | POST | `/api/campaigns` | Drafts a campaign from settings given directly |
 | GET | `/api/campaigns/<id>` | Every reward, note and held-back row, with the review fingerprint |

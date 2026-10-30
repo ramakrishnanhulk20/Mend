@@ -254,7 +254,7 @@ The full reference, with every request and answer shape, is the API page of the 
 | `POST /api/session/demo` | anyone | Opens a demo session (4 per address an hour, 10 a day) |
 | `POST /api/session/logout` | demo, owner | Ends the session |
 | `GET /api/shop/summary` | anyone | The shop's live counts, the benchmark and the backtest |
-| `GET /api/shop/quiet-regulars` | demo, owner | Quiet regulars ranked by the forecast, most at risk first |
+| `GET /api/shop/quiet-regulars` | demo, owner | Quiet regulars worth a nudge, biggest spenders first, with the three group counts |
 | `POST /api/campaigns/plan` | demo, owner | Claude reads a goal; the engine drafts a campaign within the caps |
 | `POST /api/campaigns` | demo, owner | Drafts a campaign from settings given directly |
 | `GET /api/campaigns/<id>` | own campaigns | Every reward, note and held-back row, with the review fingerprint |

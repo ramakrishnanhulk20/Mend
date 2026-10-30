@@ -1,6 +1,6 @@
 ---
 title: The forecast
-description: How Mend ranks quiet regulars with the BG/NBD model, the published benchmark it reproduces, and an honest backtest on two years of real orders.
+description: How Mend sorts quiet regulars into three groups with the BG/NBD model, the published benchmark it reproduces, and an honest backtest on two years of real orders.
 ---
 
 ## In plain words
@@ -12,7 +12,7 @@ Mend uses a well-known customer model called BG/NBD (beta-geometric, negative bi
 
 The model learns from the whole shop how those paces and those chances to leave vary between customers. Then, for each customer, it looks at three facts from the shop's own order records: how many days they came back to buy, when they last bought, and how long they have been a customer. From those it estimates how many purchases that customer will make in the next 13 weeks.
 
-Mend ranks the shop's quiet regulars by that estimate, lowest first. A quiet regular has bought on 3 or more days and has been silent for 60 days or more. The customer expected to buy least is the most at risk, and comes first in the list.
+A quiet regular has bought on 3 or more days and has been silent for 60 days or more. Mend splits them by that estimate into three groups. Under 0.1 expected purchases, they are likely gone. At 1 or more, they are likely to come back anyway. Everyone between is worth a nudge, and only that middle group is listed and paid, biggest spenders first.
 
 ## It reproduces the published model
 
@@ -40,9 +40,24 @@ The demo shop's history is UCI Online Retail II: two years of a UK gift-ware who
 
 The fit on 9 Jun 2010 did not converge, so that date is reported and left out, leaving 5 test dates.
 
+### Who came back on their own, by group
+
+This is the test of who Mend nudges. At each test date Mend scored the quiet regulars, put each one in a group by the forecast, and checked who bought again within 91 days with no cashback at all.
+
+| Test date | Likely gone | Worth a nudge | Likely back |
+|---|---|---|---|
+| 9 Sep 2010 | none | 124 of 200 (62 percent) | 131 of 176 (74 percent) |
+| 9 Dec 2010 | 0 of 1 (0 percent) | 89 of 298 (30 percent) | 72 of 181 (40 percent) |
+| 9 Mar 2011 | 1 of 9 (11 percent) | 289 of 826 (35 percent) | 179 of 325 (55 percent) |
+| 9 Jun 2011 | 2 of 24 (8 percent) | 295 of 1,019 (29 percent) | 118 of 203 (58 percent) |
+| 9 Sep 2011 | 6 of 58 (10 percent) | 574 of 1,252 (46 percent) | 153 of 203 (75 percent) |
+| All five | 9 of 92 (10 percent) | 1,371 of 3,595 (38 percent) | 653 of 1,088 (60 percent) |
+
+About 1 in 10 of the likely gone came back, so cashback there is rarely answered. About 6 in 10 of the likely back came back without any, so cashback there mostly pays for a purchase that was coming anyway. The middle group is where cashback has room to change something, and the held-back group in every campaign measures whether it did. The likely-gone group is small at every date and empty on 9 Sep 2010, so its share rests on 92 customers in all.
+
 ### Among quiet regulars: a tie
 
-Quiet regulars are the customers a campaign actually ranks, so this is the result that matters. The forecast won 3 of 5 test dates. The mean AUC difference is -0.005, with a 95 percent range of -0.024 to +0.016. That is a tie with ranking by most recent order.
+Quiet regulars are the pool a campaign picks from. The forecast won 3 of 5 test dates. The mean AUC difference is -0.005, with a 95 percent range of -0.024 to +0.016. That is a tie with ranking by most recent order. As a strict ranking inside this pool the forecast is no better than recency, so Mend uses it to split the pool into groups and ranks the middle group by spend instead.
 
 | Test date | Customers | Came back | Forecast AUC | Recency AUC | Difference | 95 percent range |
 |---|---|---|---|---|---|---|
@@ -53,7 +68,7 @@ Quiet regulars are the customers a campaign actually ranks, so this is the resul
 | 9 Jun 2011 | 1,246 | 415 | 0.671 | 0.658 | +0.013 | -0.012 to +0.036 |
 | 9 Sep 2011 | 1,513 | 733 | 0.692 | 0.656 | +0.036 | +0.017 to +0.054 |
 
-Other rankings were tested under a rule fixed before the results were seen, and none beat recency among quiet regulars: purchase frequency won 0 of 5 (mean -0.228), an average of ranks 0 of 5 (mean -0.106), and the model's own chance that a customer is still active 1 of 5 (mean -0.018). Mend keeps the forecast: it is level with recency where campaigns rank, and better across the whole shop.
+Other rankings were tested under a rule fixed before the results were seen, and none beat recency among quiet regulars: purchase frequency won 0 of 5 (mean -0.228), an average of ranks 0 of 5 (mean -0.106), and the model's own chance that a customer is still active 1 of 5 (mean -0.018). Mend keeps the forecast: it is level with recency inside the pool, better across the whole shop, and its three groups come back at clearly different rates.
 
 ### Across all customers: better than recency
 
@@ -87,6 +102,6 @@ On 9 Sep 2011, Mend split all 5,256 customers into tenths by the forecast and ch
 
 ## What the forecast is not used for
 
-Mend uses the model to rank customers, never to promise how many orders the shop will get. On this seasonal shop, the model's totals for the whole shop were off by between -23 and +91 percent, so Mend does not show them.
+Mend uses the model to sort customers into groups, never to promise how many orders the shop will get. On this seasonal shop, the model's totals for the whole shop were off by between -23 and +91 percent, so Mend does not show them.
 
 The live numbers behind these tables are served by `GET /api/shop/summary` and drawn on the landing page.

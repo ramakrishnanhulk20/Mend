@@ -19,6 +19,7 @@ the new one, stays within what they paid net of every refund on record.
 
 from __future__ import annotations
 
+import math
 import re
 import uuid
 from collections.abc import Iterator
@@ -38,6 +39,15 @@ from mend_engine.paypal.payouts import normalise_email
 
 REGULAR_MIN_DAYS = 3
 SILENT_MIN_DAYS = 60
+# On the shop's own history, pooled over the backtest's five converged cutoffs, about
+# 1 in 10 quiet regulars scored below 0.1 came back within 13 weeks with no campaign,
+# and about 6 in 10 scored 1.0 or more did. A nudge is wasted on both: the first
+# rarely answers one, and the second mostly comes back without it.
+LIKELY_GONE_BELOW = 0.1
+LIKELY_BACK_FROM = 1.0
+LIKELY_GONE = "likely_gone"
+WORTH_A_NUDGE = "worth_a_nudge"
+LIKELY_BACK = "likely_back"
 REWARD_LOOKBACK = timedelta(days=365)
 
 _SESSION_ID = re.compile(r"[0-9a-f]{64}", re.ASCII)
@@ -130,16 +140,70 @@ def drafting_for(scope: DraftScope) -> Iterator[None]:
         _SCOPE.reset(token)
 
 
+def forecast_group(score: float) -> str:
+    """Which forecast group a score puts a customer in: LIKELY_GONE, WORTH_A_NUDGE or LIKELY_BACK.
+
+    score is expected purchases over the next 13 weeks. Below LIKELY_GONE_BELOW is
+    LIKELY_GONE, LIKELY_BACK_FROM or more is LIKELY_BACK, and everything between is
+    WORTH_A_NUDGE. Raises ValueError for a bool, anything but an int or a float, NaN,
+    an infinity or a negative score, so a broken score never lands in a group.
+    """
+    if isinstance(score, bool) or not isinstance(score, (int, float)):
+        raise ValueError("a score must be a number")
+    if not math.isfinite(score) or score < 0:
+        raise ValueError("a score must be a finite number from 0 up")
+    if score < LIKELY_GONE_BELOW:
+        return LIKELY_GONE
+    if score >= LIKELY_BACK_FROM:
+        return LIKELY_BACK
+    return WORTH_A_NUDGE
+
+
+def nudge_order(paid_minor: int, customer_ref: str) -> tuple[int, str]:
+    """The sort key that puts the biggest spender first and settles equal spend by customer_ref.
+
+    paid_minor is what the customer paid to as_of net of refunds to as_of
+    (ScoreSet.paid_minor), the number the console shows as "Spent", so the list and
+    the draft rank by the same number.
+    """
+    return (-paid_minor, customer_ref)
+
+
+def worth_a_nudge_refs(scores: ScoreSet) -> list[str]:
+    """Every customer who bought on 3 or more days, has been silent 60 or more days and is worth a nudge, biggest spenders first.
+
+    Reads the shop's records only, never members, so it is the whole group a member
+    could be drafted from, in the order quiet_regular_members ranks it: nudge_order on
+    scores.paid_minor, equal spend settled by customer_ref. Worth a nudge is
+    forecast_group's WORTH_A_NUDGE, and a score forecast_group refuses raises
+    ValueError. Raises ValueError if the scores did not converge.
+    """
+    if not scores.converged:
+        raise ValueError("the model did not converge, so nobody can be ranked")
+    worth = [
+        ref
+        for ref, score in scores.scores.items()
+        if scores.purchase_days[ref] >= REGULAR_MIN_DAYS
+        and scores.days_silent[ref] >= SILENT_MIN_DAYS
+        and forecast_group(score) == WORTH_A_NUDGE
+    ]
+    return sorted(worth, key=lambda ref: nudge_order(scores.paid_minor[ref], ref))
+
+
 def quiet_regular_members(
     conn: psycopg.Connection, scores: ScoreSet, as_of: date, scope: DraftScope | None = None
 ) -> list[Candidate]:
-    """Members who bought on 3 or more days and have been silent 60 or more days, most at risk first.
+    """Members who bought on 3 or more days, have been silent 60 or more days and are worth a nudge, biggest spenders first.
 
-    scores must come from score_customers at this same as_of. Most at risk means
-    fewest expected purchases over the next 13 weeks; equal scores fall back to
-    customer_ref order so the ranking is repeatable. A member whose email PayPal has
-    not verified, who agreed to no accepted consent wording, or whose email matches
-    no shop customer or more than one, is not a candidate. Nor is one a campaign of
+    scores must come from score_customers at this same as_of. Worth a nudge means
+    forecast_group puts the member's score in WORTH_A_NUDGE: from 0.1 up to, but not
+    including, 1.0 expected purchases over the next 13 weeks. A member likely gone or
+    likely back anyway is not a candidate, and a score forecast_group refuses raises
+    ValueError. Biggest spender means most paid to as_of net of refunds to as_of
+    (scores.paid_minor, the console's "Spent"), through nudge_order; equal spend falls
+    back to customer_ref order so the ranking is repeatable. A member whose email
+    PayPal has not verified, who agreed to no accepted consent wording, or whose email
+    matches no shop customer or more than one, is not a candidate. Nor is one a campaign of
     scope still holds (scope, or the one drafting_for set, or the owner's), nor one
     with nothing left to be paid: no reward may exceed what they paid by as_of net
     of every refund recorded up to now (net_of_later_refunds), and for the owner's
@@ -172,6 +236,8 @@ def quiet_regular_members(
             continue
         if scores.purchase_days[ref] < REGULAR_MIN_DAYS or scores.days_silent[ref] < SILENT_MIN_DAYS:
             continue
+        if forecast_group(scores.scores[ref]) != WORTH_A_NUDGE:
+            continue
         regulars.append((member_id, normalise_email(email), ref))
     paid = net_of_later_refunds(conn, scores, [ref for _member_id, _email, ref in regulars])
     sent = sent_by_receiver(conn) if scope.role == "owner" else {}
@@ -181,7 +247,7 @@ def quiet_regular_members(
         if room < 1:
             continue
         candidates.append(Candidate(member_id, ref, scores.scores[ref], room))
-    candidates.sort(key=lambda c: (c.score, c.customer_ref))
+    candidates.sort(key=lambda c: nudge_order(scores.paid_minor.get(c.customer_ref, 0), c.customer_ref))
     return candidates
 
 

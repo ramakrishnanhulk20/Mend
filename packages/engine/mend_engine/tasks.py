@@ -53,7 +53,17 @@ from mend_engine.campaigns.cancel import cancel_unclaimed as cancel_unclaimed_it
 # The filter the cancel's own audit rows use, so an answer never carries PayPal text the audit log would refuse.
 from mend_engine.campaigns.cancel import _error_detail as paypal_error_detail
 from mend_engine.campaigns.drafts import NOTE_TEMPLATE, DraftRefused, DraftSettings, build_draft, draft_view
-from mend_engine.campaigns.eligibility import OWNER_SCOPE, REGULAR_MIN_DAYS, SILENT_MIN_DAYS, DraftScope, drafting_for
+from mend_engine.campaigns.eligibility import (
+    LIKELY_BACK,
+    LIKELY_GONE,
+    OWNER_SCOPE,
+    REGULAR_MIN_DAYS,
+    SILENT_MIN_DAYS,
+    DraftScope,
+    drafting_for,
+    forecast_group,
+    worth_a_nudge_refs,
+)
 from mend_engine.campaigns.reconcile import reconcile as reconcile_campaigns
 from mend_engine.campaigns.results import ArmResults, PayoutStanding, RowStanding, campaign_results, display_names, stand_in_refs
 from mend_engine.campaigns.scoring import SHOP_ZONE, ScoreSet, score_customers
@@ -572,19 +582,26 @@ def shop_summary() -> dict:
 
 
 def quiet_regulars(actor: object, limit: object) -> dict:
-    """The shop's quiet regulars as of its latest order day, most at risk first, at most limit (1 to 50) of them.
+    """The shop's quiet regulars worth a nudge as of its latest order day, biggest spenders first, at most limit (1 to 50) of them.
 
-    Each row is position (1 = most at risk, an index into this answer and nothing
-    else), the customer's synthetic display_name, purchase_days, days_silent, score
-    (expected purchases over the next 13 weeks, rounded to 4 places), paid_net_minor
-    (paid to as_of net of refunds, USD cents), member (a verified member's email
-    matches, so they could be thanked) and stand_in (that member is a demo stand-in
-    the seed script joined, members.source 'seed', the rule results.stand_in_refs
-    uses; always False when member is False), so a stand-in is never shown as a
-    person who joined (C23). Never an email, member id or customer ref (C12, C15).
-    total counts every quiet regular, shown or not. Refuses with
-    "invalid_input" for a limit that is not a whole number from 1 to 50 and
-    "model_not_converged" when the model cannot rank anyone.
+    The order is eligibility.nudge_order on paid_net_minor, the rule a draft ranks
+    its candidates by. Each row is position (1 = first in that order, an index into
+    this answer and nothing else), the customer's synthetic display_name,
+    purchase_days, days_silent, score (expected purchases over the next 13 weeks,
+    rounded to 4 places), paid_net_minor (paid to as_of net of refunds, USD cents),
+    member (a verified member's email matches, so they could be thanked) and stand_in
+    (that member is a demo stand-in the seed script joined, members.source 'seed',
+    the rule results.stand_in_refs uses; always False when member is False), so a
+    stand-in is never shown as a person who joined (C23). Never an email, member id
+    or customer ref (C12, C15).
+
+    total counts every quiet regular by the campaign rule, shown or not, the same
+    count shop_summary gives as quiet_regulars. worth_a_nudge counts those whose score
+    eligibility.forecast_group puts from 0.1 up to below 1.0, the only ones listed.
+    likely_gone counts those scored below 0.1. likely_back counts those scored 1.0 or
+    more. The three always add up to total. Refuses with "invalid_input" for a limit
+    that is not a whole number from 1 to 50 and "model_not_converged" when the model
+    cannot rank anyone.
     """
 
     def work(config: Config, conn: psycopg.Connection) -> dict:
@@ -593,12 +610,14 @@ def quiet_regulars(actor: object, limit: object) -> dict:
             raise _Refused("invalid_input", f"limit must be a whole number from 1 to {MAX_QUIET_REGULARS}")
         as_of = _shop_as_of(conn)
         if as_of is None:
-            return {"ok": True, "as_of": None, "total": 0, "rows": []}
+            return {"ok": True, "as_of": None, "total": 0, "worth_a_nudge": 0, "likely_gone": 0, "likely_back": 0, "rows": []}
         scores = score_customers(conn, as_of)
         if not scores.converged:
             raise _Refused("model_not_converged", scores.message)
-        quiet = sorted(_quiet_refs(scores), key=lambda ref: (scores.scores[ref], ref))
-        shown = quiet[:limit]
+        quiet = _quiet_refs(scores)
+        groups = [forecast_group(scores.scores[ref]) for ref in quiet]
+        worth = worth_a_nudge_refs(scores)
+        shown = worth[:limit]
         names = dict(conn.execute("select customer_ref, display_name from shop_customers where customer_ref = any(%s)", (shown,)))
         members = _member_refs(conn)
         rows = [
@@ -614,7 +633,15 @@ def quiet_regulars(actor: object, limit: object) -> dict:
             }
             for position, ref in enumerate(shown, start=1)
         ]
-        return {"ok": True, "as_of": as_of.isoformat(), "total": len(quiet), "rows": rows}
+        return {
+            "ok": True,
+            "as_of": as_of.isoformat(),
+            "total": len(quiet),
+            "worth_a_nudge": len(worth),
+            "likely_gone": groups.count(LIKELY_GONE),
+            "likely_back": groups.count(LIKELY_BACK),
+            "rows": rows,
+        }
 
     return _run("quiet_regulars", work)
 

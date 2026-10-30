@@ -3,6 +3,7 @@
 # joining or leaving while the list is being read, two drafts racing for the same
 # members (tasks.draft_campaign serialises them with a lock, test_tasks.py), and two
 # threads missing the score cache at once.
+import math
 import uuid
 from collections.abc import Iterator
 from dataclasses import replace
@@ -14,7 +15,16 @@ import pytest
 from psycopg import sql
 from test_membership import CONSENT_2026_10_27
 
-from mend_engine.campaigns.eligibility import Candidate, quiet_regular_members
+from mend_engine.campaigns.eligibility import (
+    LIKELY_BACK,
+    LIKELY_GONE,
+    WORTH_A_NUDGE,
+    Candidate,
+    forecast_group,
+    nudge_order,
+    quiet_regular_members,
+    worth_a_nudge_refs,
+)
 from mend_engine.campaigns.scoring import ScoreSet, paid_net_of_refunds, score_customers
 from mend_engine.db.connect import PGDATA
 from mend_engine.db.migrate import apply_schema
@@ -76,7 +86,7 @@ def test_only_members_who_are_quiet_regulars_are_eligible(conn: psycopg.Connecti
         "C2": (0.10, 2, 400),  # only two purchase days
         "C3": (0.10, 9, 59),  # one day short of quiet
         "C4": (0.20, 9, 200),  # quiet regular who never joined
-        "C5": (0.05, 12, 90),
+        "C5": (0.15, 12, 90),
     }
     for ref in rows:
         customer(conn, ref)
@@ -86,7 +96,7 @@ def test_only_members_who_are_quiet_regulars_are_eligible(conn: psycopg.Connecti
     found = quiet_regular_members(conn, scores(rows), AS_OF)
 
     assert found == [
-        Candidate(ids["C5"], "C5", 0.05, 1004),
+        Candidate(ids["C5"], "C5", 0.15, 1004),
         Candidate(ids["C1"], "C1", 0.30, 1000),
     ]
 
@@ -97,13 +107,80 @@ def test_a_customer_with_no_score_is_not_eligible(conn: psycopg.Connection) -> N
     assert quiet_regular_members(conn, scores({}), AS_OF) == []
 
 
-def test_most_at_risk_come_first_and_ties_follow_the_customer_ref(conn: psycopg.Connection) -> None:
-    rows = {"C40": (0.5, 5, 100), "C10": (0.0, 5, 100), "C30": (0.2, 5, 100), "C20": (0.0, 5, 100)}
+def test_worth_a_nudge_members_come_biggest_spender_first_and_equal_spend_follows_the_customer_ref(conn: psycopg.Connection) -> None:
+    # The score order, C20 C40 C30 C10, is not the spend order, so the score cannot be what ranks.
+    rows = {"C40": (0.2, 5, 100), "C10": (0.9, 5, 100), "C30": (0.5, 5, 100), "C20": (0.1, 5, 100)}
     for ref in rows:
         customer(conn, ref)
         member(conn, ref.lower() + "@shop.example")
-    found = quiet_regular_members(conn, scores(rows), AS_OF)
-    assert [c.customer_ref for c in found] == ["C10", "C20", "C30", "C40"]
+    spent = replace(scores(rows), paid_minor={"C40": 900, "C10": 2500, "C30": 4000, "C20": 2500})
+    # A refund recorded after as_of lowers what C30 may still be paid, never where C30 stands.
+    conn.execute(
+        "insert into shop_refunds (refund_ref, customer_ref, refunded_at, amount_minor) values ('X1', 'C30', %s, 3500)",
+        (datetime(2026, 10, 20, 12, tzinfo=timezone.utc),),
+    )
+    found = quiet_regular_members(conn, spent, AS_OF)
+    assert [(c.customer_ref, c.paid_minor) for c in found] == [("C30", 500), ("C10", 2500), ("C20", 2500), ("C40", 900)]
+
+
+def test_members_scored_below_0_1_or_from_1_0_are_not_candidates(conn: psycopg.Connection) -> None:
+    rows = {"C1": (0.0999, 5, 100), "C2": (0.1, 5, 100), "C3": (0.9999, 5, 100), "C4": (1.0, 5, 100)}
+    for ref in rows:
+        customer(conn, ref)
+        member(conn, ref.lower() + "@shop.example")
+    assert sorted(c.customer_ref for c in quiet_regular_members(conn, scores(rows), AS_OF)) == ["C2", "C3"]
+
+
+@pytest.mark.parametrize(
+    ("score", "group"),
+    [
+        (0.0, LIKELY_GONE),
+        (0.0999, LIKELY_GONE),
+        (0.1, WORTH_A_NUDGE),
+        (0.5, WORTH_A_NUDGE),
+        (0.9999, WORTH_A_NUDGE),
+        (1.0, LIKELY_BACK),
+        (3.0, LIKELY_BACK),
+    ],
+)
+def test_forecast_group_splits_scores_at_0_1_and_1_0(score: float, group: str) -> None:
+    assert forecast_group(score) == group
+
+
+@pytest.mark.parametrize("bad", [True, "0.5", math.nan, math.inf, -0.01])
+def test_forecast_group_refuses_anything_but_a_finite_number_from_0_up(bad: object) -> None:
+    with pytest.raises(ValueError):
+        forecast_group(bad)  # type: ignore[arg-type]
+
+
+def test_nudge_order_puts_the_biggest_spender_first_and_settles_equal_spend_by_customer_ref() -> None:
+    assert nudge_order(1250, "C7") == (-1250, "C7")
+    spenders = [(900, "C3"), (4000, "C9"), (900, "C1"), (0, "C2")]
+    assert sorted(spenders, key=lambda s: nudge_order(*s)) == [(4000, "C9"), (900, "C1"), (900, "C3"), (0, "C2")]
+
+
+def test_worth_a_nudge_refs_keeps_only_quiet_regulars_worth_a_nudge() -> None:
+    rows = {
+        "C1": (0.0999, 5, 100),  # likely gone
+        "C2": (0.1, 5, 100),
+        "C3": (0.5, 2, 100),  # only two purchase days
+        "C4": (0.5, 5, 59),  # one day short of quiet
+        "C5": (1.0, 5, 100),  # likely back
+        "C6": (0.9999, 3, 60),  # exactly at both day limits
+    }
+    assert sorted(worth_a_nudge_refs(scores(rows))) == ["C2", "C6"]
+
+
+def test_worth_a_nudge_refs_puts_the_biggest_spender_first_and_settles_equal_spend_by_customer_ref() -> None:
+    # The score order, C20 C40 C30 C10, is not the spend order, so the score cannot be what ranks.
+    rows = {"C40": (0.2, 5, 100), "C10": (0.9, 5, 100), "C30": (0.5, 5, 100), "C20": (0.1, 5, 100)}
+    spent = replace(scores(rows), paid_minor={"C40": 900, "C10": 2500, "C30": 4000, "C20": 2500})
+    assert worth_a_nudge_refs(spent) == ["C30", "C10", "C20", "C40"]
+
+
+def test_worth_a_nudge_refs_refuses_scores_that_did_not_converge() -> None:
+    with pytest.raises(ValueError, match="did not converge"):
+        worth_a_nudge_refs(ScoreSet(False, "not converged: a ran to its limit", {}, {}, {}, {}, AS_OF))
 
 
 def test_scores_that_did_not_converge_rank_nobody(conn: psycopg.Connection) -> None:
@@ -206,7 +283,7 @@ def test_a_member_who_agreed_under_the_shops_earlier_made_up_name_stays_eligible
         "update members set consent_version = '2026-10-27.1', consent_text_sha256 = %s where member_id = %s",
         (consent_hash(CONSENT_2026_10_27), ids["C2"]),
     )
-    assert [c.member_id for c in quiet_regular_members(conn, scores(rows), AS_OF)] == [ids["C1"], ids["C2"]]
+    assert [c.member_id for c in quiet_regular_members(conn, scores(rows), AS_OF)] == [ids["C2"], ids["C1"]]
 
 
 ROUTE = {
@@ -253,7 +330,7 @@ def campaign_holding(
 def test_a_member_in_a_running_measurement_of_the_same_scope_is_not_eligible_and_a_draft_holds_nobody(conn: psycopg.Connection) -> None:
     from mend_engine.campaigns.eligibility import DraftScope, drafting_for
 
-    rows = {f"C{n}": (0.01 * n, 5, 100) for n in range(1, 11)}
+    rows = {f"C{n}": (0.1 + 0.01 * n, 5, 100) for n in range(1, 11)}
     for ref in rows:
         customer(conn, ref)
     ids = {ref: member(conn, ref.lower() + "@shop.example") for ref in rows}
@@ -283,12 +360,12 @@ def test_a_member_in_a_running_measurement_of_the_same_scope_is_not_eligible_and
         found = quiet_regular_members(conn, scores(rows), AS_OF) if scope is None else quiet_regular_members(conn, scores(rows), AS_OF, scope)
         return [c.customer_ref for c in found]
 
-    assert eligible() == ["C1", "C2", "C4", "C5", "C6", "C7", "C9"]
+    assert eligible() == ["C9", "C7", "C6", "C5", "C4", "C2", "C1"]
     demo = eligible(DraftScope("demo", session))
-    assert demo == ["C1", "C2", "C3", "C4", "C5", "C7", "C8", "C9", "C10"]
+    assert demo == ["C10", "C9", "C8", "C7", "C5", "C4", "C3", "C2", "C1"]
     with drafting_for(DraftScope("demo", session)):
         assert eligible() == demo
-    assert eligible() == ["C1", "C2", "C4", "C5", "C6", "C7", "C9"]
+    assert eligible() == ["C9", "C7", "C6", "C5", "C4", "C2", "C1"]
     with pytest.raises(ValueError):
         DraftScope("demo", None)
 
@@ -296,7 +373,7 @@ def test_a_member_in_a_running_measurement_of_the_same_scope_is_not_eligible_and
 def test_a_campaign_with_no_recorded_send_counts_from_its_first_batch_row_and_with_neither_holds_until_voided(
     conn: psycopg.Connection,
 ) -> None:
-    rows = {f"C{n}": (0.01 * n, 5, 100) for n in range(1, 5)}
+    rows = {f"C{n}": (0.1 + 0.01 * n, 5, 100) for n in range(1, 5)}
     for ref in rows:
         customer(conn, ref)
     ids = {ref: member(conn, ref.lower() + "@shop.example") for ref in rows}
@@ -314,7 +391,7 @@ def test_a_campaign_with_no_recorded_send_counts_from_its_first_batch_row_and_wi
         )
     assert conn.execute("select count(*) from campaign_status_moves where to_status = 'submitted'").fetchone()[0] == 0
 
-    assert [c.customer_ref for c in quiet_regular_members(conn, scores(rows), AS_OF)] == ["C1", "C4"]
+    assert [c.customer_ref for c in quiet_regular_members(conn, scores(rows), AS_OF)] == ["C4", "C1"]
 
 
 def sent_reward(conn: psycopg.Connection, receiver: str, amount_minor: int, days_ago: int, status: str | None = None) -> None:

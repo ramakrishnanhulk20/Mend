@@ -116,8 +116,9 @@ def build_draft(
 ) -> DraftResult:
     """Build and store one campaign draft for the quiet regulars among the shop's members.
 
-    Takes the max_candidates most at risk eligible members, draws the holdout with
-    the operating system's random source, gives every rewarded member
+    Takes the first max_candidates eligible members in eligibility's order
+    (quiet_regular_members: worth a nudge, biggest spenders first), draws the holdout
+    with the operating system's random source, gives every rewarded member
     reward_amounts() and the code-owned thank-you note, and writes the campaign
     (status 'draft'), one row per candidate with refs "R1", "R2", ... in rank order,
     and one audit_log row, all in one transaction. Holdout rows carry no amount and

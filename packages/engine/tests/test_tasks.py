@@ -27,6 +27,7 @@ from psycopg.types.json import Jsonb
 from mend_engine import store_facts, tasks
 from mend_engine.campaigns.attribution import attribute_purchase
 from mend_engine.campaigns.drafts import NOTE_TEMPLATE
+from mend_engine.campaigns.scoring import score_customers
 from mend_engine.config import SANDBOX_API_HOST, Config, ConfigError
 from mend_engine.db.connect import PGDATA, connect
 from mend_engine.db.migrate import apply_schema
@@ -515,7 +516,8 @@ def test_campaigns_paypal_refused_and_voided_use_none_of_a_demo_sessions_sends_o
     assert tasks.demo_spent_last_24h_minor(conn) == 0
     paypal.create_status = 201
     assert tasks.submit_campaign(third, demo)["sent"] is True
-    assert tasks.demo_spent_last_24h_minor(conn) == 1000
+    # The first two approvals held 20 of the seed's 28 members worth a nudge, so the third drafted 8 and rewards 4 at 200 cents.
+    assert tasks.demo_spent_last_24h_minor(conn) == 800
 
 
 def test_one_address_at_its_demo_send_limit_cannot_take_the_whole_demo_pool() -> None:
@@ -1029,20 +1031,27 @@ def test_the_shop_summary_returns_stored_facts_and_treats_a_malformed_one_as_mis
         store_facts.store(conn, store_facts.UCI_KEY, {**BACKTEST, "passed": "yes"})
 
 
-def test_quiet_regulars_lists_the_most_at_risk_first_and_never_an_identifier(conn: psycopg.Connection, paypal: FakePayPal) -> None:
+def test_quiet_regulars_lists_worth_a_nudge_rows_biggest_spender_first_and_never_an_identifier(conn: psycopg.Connection, paypal: FakePayPal) -> None:
     seed_shop(conn)
     quiet = [r[0] for r in conn.execute(QUIET_BY_SQL)]
+    # Every row looks alike in the seed, so each customer gets its own name to check the order of equal spend by.
+    refs = [ref for (ref,) in conn.execute("select customer_ref from shop_customers order by customer_ref")]
+    named = {f"Shopper {n}": ref for n, ref in enumerate(refs)}
+    with conn.cursor() as cur:
+        cur.executemany("update shop_customers set display_name = %s where customer_ref = %s", list(named.items()))
     member_ids = [str(r[0]) for r in conn.execute("select member_id from members")]
     demo = actor(conn, "demo")
 
     found = tasks.quiet_regulars(demo, 50)
 
-    assert found["ok"] and found["total"] == len(quiet) and len(quiet) > 50 and len(found["rows"]) == 50
     rows = found["rows"]
-    assert [row["position"] for row in rows] == list(range(1, 51))
+    assert found["ok"] and found["total"] == len(quiet) and 3 < found["worth_a_nudge"] == len(rows) < len(quiet)
+    assert [row["position"] for row in rows] == list(range(1, len(rows) + 1))
     assert all(set(row) == {"position", "display_name", "purchase_days", "days_silent", "score", "paid_net_minor", "member", "stand_in"} for row in rows)
     assert all(row["purchase_days"] >= 3 and row["days_silent"] >= 60 and row["paid_net_minor"] > 0 for row in rows)
-    assert [row["score"] for row in rows] == sorted(row["score"] for row in rows)
+    # Most spent first, equal spend by customer_ref; the seed has equal spend, so that rule is exercised.
+    order = [(-row["paid_net_minor"], named[row["display_name"]]) for row in rows]
+    assert order == sorted(order) and len({row["paid_net_minor"] for row in rows}) < len(rows)
     assert tasks.quiet_regulars(demo, 3)["rows"] == rows[:3]
     text = json.dumps(found)
     assert "@" not in text and not re.search(r"C1[0-9]{3}", text) and not any(m in text for m in member_ids)
@@ -1050,6 +1059,31 @@ def test_quiet_regulars_lists_the_most_at_risk_first_and_never_an_identifier(con
     assert all(row["member"] for row in rows)
     conn.execute("delete from members")
     assert not any(row["member"] for row in tasks.quiet_regulars(demo, 50)["rows"])
+
+
+def test_quiet_regulars_counts_every_forecast_group_and_lists_only_scores_from_0_1_to_below_1_0(
+    conn: psycopg.Connection, paypal: FakePayPal
+) -> None:
+    seed_shop(conn)
+
+    found = tasks.quiet_regulars(actor(conn, "demo"), 50)
+
+    groups = (found["worth_a_nudge"], found["likely_gone"], found["likely_back"])
+    assert sum(groups) == found["total"] == tasks.shop_summary()["quiet_regulars"]
+    # The seed has quiet regulars in every group, so the two skipped groups really are skipped.
+    assert min(groups) > 0 and len(found["rows"]) == found["worth_a_nudge"]
+    assert all(0.1 <= row["score"] < 1.0 for row in found["rows"])
+    # Counted again from the raw scores and the two cut-offs, without forecast_group.
+    scored = score_customers(conn, date.fromisoformat(found["as_of"])).scores
+    quiet = [r[0] for r in conn.execute(QUIET_BY_SQL)]
+    assert found["likely_gone"] == sum(scored[ref] < 0.1 for ref in quiet)
+    assert found["likely_back"] == sum(scored[ref] >= 1.0 for ref in quiet)
+
+
+def test_quiet_regulars_of_a_shop_with_no_orders_answers_every_count_as_zero(conn: psycopg.Connection, paypal: FakePayPal) -> None:
+    assert tasks.quiet_regulars(actor(conn, "demo"), 10) == {
+        "ok": True, "as_of": None, "total": 0, "worth_a_nudge": 0, "likely_gone": 0, "likely_back": 0, "rows": [],
+    }
 
 
 def test_quiet_regulars_counts_as_a_member_only_someone_on_an_accepted_consent_wording(conn: psycopg.Connection, paypal: FakePayPal) -> None:

@@ -143,7 +143,9 @@ def test_a_draft_stores_ranked_refs_a_fixed_holdout_and_amounts_under_every_cap(
     rows = stored_rows(conn, result.campaign_id)
     assert [r[0] for r in rows] == [f"R{n}" for n in range(1, 21)] and [r[3] for r in rows] == list(range(1, 21))
     assert [r[1] for r in rows] == expected_order
-    assert [r[4] for r in rows] == sorted(r[4] for r in rows)
+    # No refunds in this seed, so what it paid is the spend the ranking orders by.
+    spent = [paid[customer_of[r[1]]] for r in rows]
+    assert spent == sorted(spent, reverse=True) and all(0.1 <= r[4] < 1.0 for r in rows)
     reward = [r for r in rows if r[2] == "reward"]
     holdout = [r for r in rows if r[2] == "holdout"]
     assert (len(reward), len(holdout)) == (result.rewarded, result.held_back) == (10, 10)

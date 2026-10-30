@@ -182,6 +182,30 @@ const ALL_CUSTOMERS = {
   interval_high: 0.057,
   cutoffs: [{ cutoff: "2011-09-09", customers: 5256, returned: 1873, auc_model: 0.8007, auc_recency: 0.7626, difference: 0.0381, interval_low: 0.031, interval_high: 0.045 }],
 };
+// The forecast groups as store_facts.py writes them. The pooled shares are 9 of 92, 702 of 1,100 and 120 of 160.
+const BANDS = {
+  likely_gone_below: 0.1,
+  likely_back_from: 1.0,
+  regular_min_days: 3,
+  silent_min_days: 60,
+  horizon_weeks: 13,
+  cutoffs: [{ cutoff: "2010-09-09", converged: true, likely_gone: { customers: 0, returned: 0 }, worth_a_nudge: { customers: 326, returned: 210 }, likely_back: { customers: 50, returned: 34 } }],
+  pooled: { likely_gone: { customers: 92, returned: 9 }, worth_a_nudge: { customers: 1100, returned: 702 }, likely_back: { customers: 160, returned: 120 } },
+  rising: true,
+};
+// Two rows of the worth-a-nudge group, the second a demo stand-in, with names the model must never see.
+const QUIET = {
+  ok: true,
+  as_of: "2026-10-16",
+  total: 1357,
+  worth_a_nudge: 1110,
+  likely_gone: 77,
+  likely_back: 170,
+  rows: [
+    { position: 1, display_name: "Priya X.", purchase_days: 7, days_silent: 95, score: 0.0812, paid_net_minor: 48210, member: true, stand_in: false },
+    { position: 2, display_name: "Arjun K.", purchase_days: 5, days_silent: 80, score: 0.31, paid_net_minor: 30000, member: true, stand_in: true },
+  ],
+};
 const VIEW = {
   ok: true,
   campaign_id: CAMPAIGN,
@@ -544,6 +568,77 @@ describe("the agent's tools", () => {
       intervalHigh: null,
       verdict: "no interval was measured, so no claim either way",
     });
+  });
+
+  it("give the forecast groups' evidence as the share of each group that came back on its own, rounded to three places, with the holdout it was measured over", async () => {
+    const current = turn();
+    const tools = agentTools(current);
+    const description = runnable(tools).find((candidate) => candidate.name === "shop_summary")?.description ?? "";
+    expect(description).toContain("the quiet regulars, the pool a campaign picks from");
+    expect(description).not.toContain("the live segment, the regulars a campaign picks from");
+    expect(description).toContain("forecastGroups is the evidence for who Mend picks");
+    expect(description).toContain("Mend nudges only the middle group, worthANudge");
+    expect(description).toContain("say not measured when it is null");
+    expect(description.indexOf("forecastGroups is the evidence")).toBeLessThan(description.indexOf("held-back group"));
+    state.engine.shop_summary = () => ({ ...SUMMARY, backtest: { ...BACKTEST, bands: BANDS } });
+    const shown = JSON.parse(String(await tool(tools, "shop_summary")({}))) as Record<string, unknown>;
+    expect(shown.forecastGroups).toEqual({
+      expectedOrdersOver: "13 weeks",
+      cameBackWithinDays: 91,
+      likelyGone: { customers: 92, cameBackOnTheirOwn: 9, share: 0.098 },
+      worthANudge: { customers: 1100, cameBackOnTheirOwn: 702, share: 0.638 },
+      likelyBack: { customers: 160, cameBackOnTheirOwn: 120, share: 0.75 },
+      rising: true,
+    });
+
+    state.engine.shop_summary = () => ({ ...SUMMARY, backtest: { ...BACKTEST, bands: { ...BANDS, pooled: { ...BANDS.pooled, likely_gone: { customers: 0, returned: 0 } } } } });
+    const empty = JSON.parse(String(await tool(tools, "shop_summary")({}))) as { forecastGroups: { likelyGone: unknown } };
+    current.session.close();
+    expect(empty.forecastGroups.likelyGone).toEqual({ customers: 0, cameBackOnTheirOwn: 0, share: null });
+  });
+
+  it("claim nothing about the forecast groups from a backtest stored before them, or with no backtest", async () => {
+    const current = turn();
+    const tools = agentTools(current);
+    state.engine.shop_summary = () => ({ ...SUMMARY, backtest: BACKTEST });
+    const before = JSON.parse(String(await tool(tools, "shop_summary")({}))) as Record<string, unknown>;
+    expect(before).toHaveProperty("forecastGroups", null);
+    state.engine.shop_summary = () => SUMMARY;
+    const none = JSON.parse(String(await tool(tools, "shop_summary")({}))) as Record<string, unknown>;
+    current.session.close();
+    expect(none).toHaveProperty("forecastGroups", null);
+  });
+
+  it("list the worth-a-nudge group biggest spenders first by position only, with the three forecast group counts, and never a name", async () => {
+    state.engine.quiet_regulars = () => QUIET;
+    const current = turn();
+    const tools = agentTools(current);
+    const description = runnable(tools).find((candidate) => candidate.name === "quiet_regulars")?.description ?? "";
+    expect(description).toContain("worthANudge is everyone between, the only group a campaign picks from");
+    expect(description).toContain("up to 50 of the worth-a-nudge group, biggest spenders first");
+    expect(description).toContain("Mend skips the likely gone and the likely back on purpose: say so when the owner asks who is most at risk");
+    expect(description).toContain("always call those demo stand-ins");
+    const shown = JSON.parse(String(await tool(tools, "quiet_regulars")({}))) as Record<string, unknown>;
+    current.session.close();
+    expect(shown).toEqual({
+      asOf: "2026-10-16",
+      totalQuietRegulars: 1357,
+      forecastGroups: { likelyGone: 77, worthANudge: 1110, likelyBack: 170 },
+      worthANudgeBiggestSpendersFirst: [
+        { position: 1, purchaseDays: 7, daysSilent: 95, expectedPurchasesNext13Weeks: 0.0812, paidNetMinor: 48210, member: true, demoStandIn: false },
+        { position: 2, purchaseDays: 5, daysSilent: 80, expectedPurchasesNext13Weeks: 0.31, paidNetMinor: 30000, member: true, demoStandIn: true },
+      ],
+    });
+    expect(shown).not.toHaveProperty("mostAtRisk");
+    expect(JSON.stringify(shown)).not.toMatch(/Priya|Arjun|@/);
+    expect(state.engineCalls).toEqual([{ task: "quiet_regulars", args: [{ role: "owner", session: OWNER.sessionId }, 50] }]);
+  });
+
+  it("refuse a quiet regulars answer whose forecast groups do not add up, so the model never reads it", async () => {
+    state.engine.quiet_regulars = () => ({ ...QUIET, likely_back: 171 });
+    const current = turn();
+    await expect(tool(agentTools(current), "quiet_regulars")({})).rejects.toThrow("problem inside Mend");
+    current.session.close();
   });
 
   it("end an engine wait when the turn runs out of time, and never wait past the turn's 60 seconds", async () => {

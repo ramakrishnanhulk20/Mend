@@ -190,6 +190,9 @@ describe("an answer", () => {
     const answer = {
       asOf: "2026-10-16",
       total: 1357,
+      worthANudge: 1110,
+      likelyGone: 77,
+      likelyBack: 170,
       rows: [{ position: 1, displayName: "Priya X.", purchaseDays: 7, daysSilent: 95, score: 0.08, paidNetMinor: 4821, member: true, extra: 1 }],
     };
     const { fetchFn, calls } = fakeFetch(() => json(200, answer));
@@ -199,7 +202,21 @@ describe("an answer", () => {
 
     expect(calls[0].url).toBe("/api/shop/quiet-regulars?limit=50");
     expect(QuietRegularsSchema.safeParse(result).success).toBe(true);
+    expect(result).toMatchObject({ total: 1357, worthANudge: 1110, likelyGone: 77, likelyBack: 170 });
     expect(result.rows[0]).toMatchObject({ displayName: "Priya X.", paidNetMinor: 4821, member: true });
+  });
+
+  it.each([
+    ["no forecast group counts", { worthANudge: undefined, likelyGone: undefined, likelyBack: undefined }],
+    ["no worth-a-nudge count", { worthANudge: undefined }],
+    ["a group count as text", { likelyGone: "77" }],
+    ["a group count that is not a whole number", { likelyBack: 1.5 }],
+    ["a negative group count", { likelyGone: -1 }],
+  ])("that has %s is an unexpected_answer ApiError", async (_label, change) => {
+    const answer = { asOf: "2026-10-16", total: 1357, worthANudge: 1110, likelyGone: 77, likelyBack: 170, rows: [], ...change };
+    const { fetchFn } = fakeFetch(() => json(200, answer));
+
+    await expect(createConsoleApi(fetchFn).quietRegulars(50)).rejects.toMatchObject({ code: "unexpected_answer" });
   });
 });
 
@@ -676,9 +693,10 @@ describe("a 401", () => {
 
 describe("a quiet regular", () => {
   const ROW = { position: 1, displayName: "Priya X.", purchaseDays: 7, daysSilent: 95, score: 0.003, paidNetMinor: 100, member: true };
+  const GROUPS = { worthANudge: 1, likelyGone: 0, likelyBack: 0 };
 
   it("is not a stand-in when the answer has no such field", async () => {
-    const { fetchFn } = fakeFetch(() => json(200, { asOf: null, total: 1, rows: [ROW] }));
+    const { fetchFn } = fakeFetch(() => json(200, { asOf: null, total: 1, ...GROUPS, rows: [ROW] }));
     const api = createConsoleApi(fetchFn);
 
     const result = await api.quietRegulars(50);
@@ -687,7 +705,7 @@ describe("a quiet regular", () => {
   });
 
   it("carries standIn when the answer has it", async () => {
-    const { fetchFn } = fakeFetch(() => json(200, { asOf: null, total: 1, rows: [{ ...ROW, standIn: true }] }));
+    const { fetchFn } = fakeFetch(() => json(200, { asOf: null, total: 1, ...GROUPS, rows: [{ ...ROW, standIn: true }] }));
     const api = createConsoleApi(fetchFn);
 
     const result = await api.quietRegulars(50);

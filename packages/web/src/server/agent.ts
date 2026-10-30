@@ -179,6 +179,12 @@ const BACKTEST_GROUP = z.object({
   intervalLow: z.number().nullable(),
   intervalHigh: z.number().nullable(),
 });
+const BAND_COUNT = z.object({ customers: z.number(), returned: z.number() });
+const BANDS = z.object({
+  horizonWeeks: z.number(),
+  pooled: z.object({ likelyGone: BAND_COUNT, worthANudge: BAND_COUNT, likelyBack: BAND_COUNT }),
+  rising: z.boolean(),
+});
 const SUMMARY = z.object({
   asOf: z.string().nullable(),
   shopCustomers: z.number(),
@@ -188,7 +194,15 @@ const SUMMARY = z.object({
   quietRegulars: z.number(),
   quietRegularsPaid12mMinor: z.number(),
   backtest: z
-    .object({ converged: z.number(), modelWins: z.number(), meanAucGain: z.number().nullable(), headline: BACKTEST_GROUP.nullable(), allCustomers: BACKTEST_GROUP.nullable() })
+    .object({
+      holdoutDays: z.number(),
+      converged: z.number(),
+      modelWins: z.number(),
+      meanAucGain: z.number().nullable(),
+      headline: BACKTEST_GROUP.nullable(),
+      allCustomers: BACKTEST_GROUP.nullable(),
+      bands: BANDS.nullable(),
+    })
     .nullable(),
 });
 
@@ -217,6 +231,16 @@ function modelClaim(group: z.infer<typeof BACKTEST_GROUP>, label: string) {
   };
 }
 
+// The share is worked out here, rounded to three places, and is null for an empty group so the
+// model says "not measured" instead of reading a zero as a result.
+function bandEvidence(band: z.infer<typeof BAND_COUNT>) {
+  return {
+    customers: band.customers,
+    cameBackOnTheirOwn: band.returned,
+    share: band.customers === 0 ? null : Math.round((band.returned / band.customers) * 1000) / 1000,
+  };
+}
+
 function liveSegmentLabel(group: z.infer<typeof BACKTEST_GROUP>): string {
   return group.regularMinDays === null || group.silentMinDays === null
     ? "live segment"
@@ -225,6 +249,9 @@ function liveSegmentLabel(group: z.infer<typeof BACKTEST_GROUP>): string {
 const QUIET = z.object({
   asOf: z.string().nullable(),
   total: z.number(),
+  worthANudge: z.number(),
+  likelyGone: z.number(),
+  likelyBack: z.number(),
   rows: z.array(z.object({ position: z.number(), purchaseDays: z.number(), daysSilent: z.number(), score: z.number(), paidNetMinor: z.number(), member: z.boolean(), standIn: z.boolean() })),
 });
 const VIEW = z.object({
@@ -345,7 +372,7 @@ export function agentTools(turn: Turn): AgentTool[] {
       name: "shop_summary",
       action: "shop.summary",
       description:
-        "Call when the owner asks how the shop is doing: how many customers and members it has, how many regulars have gone quiet, what they used to spend, or whether Mend's model is proven. Returns counts, and money in US cents. membersJoined counts the people who joined through Log in with PayPal. demoStandIns counts the members a script joined so the demo has someone to reward. They are labelled demo stand-ins: not people who joined, and no person agreed for them. Always call them demo stand-ins, report them apart from membersJoined, and never add the two into one number of members. Then comes a backtest on the shop's past orders of Mend's model against simply ranking customers by how recently they bought. modelVersusRecencyLiveSegment comes first and is the claim to lead with: the live segment, the regulars a campaign picks from, with the cutoffs the model was ahead at out of those measured, the mean AUC difference (model minus recency) and its interval, and a verdict Mend's code worked out from that interval. When the verdict says the interval includes zero, the model ties recency there: say so, and never claim it beats recency for these customers. It is null when the live segment was not measured; then say that, and claim nothing for it. modelVersusRecencyAllCustomers is the same measure over every customer; always label it as all customers. What measures a campaign's real lift is its held-back group: customers kept back at random and compared with the rewarded ones in campaign_results.",
+        "Call when the owner asks how the shop is doing: how many customers and members it has, how many regulars have gone quiet, what they used to spend, or whether Mend's model is proven. Returns counts, and money in US cents. membersJoined counts the people who joined through Log in with PayPal. demoStandIns counts the members a script joined so the demo has someone to reward. They are labelled demo stand-ins: not people who joined, and no person agreed for them. Always call them demo stand-ins, report them apart from membersJoined, and never add the two into one number of members. Then comes a backtest on the shop's past orders of Mend's model against simply ranking customers by how recently they bought. modelVersusRecencyLiveSegment comes first and is the claim to lead with: the quiet regulars, the pool a campaign picks from, with the cutoffs the model was ahead at out of those measured, the mean AUC difference (model minus recency) and its interval, and a verdict Mend's code worked out from that interval. When the verdict says the interval includes zero, the model ties recency there: say so, and never claim it beats recency for these customers. It is null when the live segment was not measured; then say that, and claim nothing for it. modelVersusRecencyAllCustomers is the same measure over every customer; always label it as all customers. forecastGroups is the evidence for who Mend picks: among quiet regulars at past dates in the shop's history, the share in each forecast group who came back on their own within the holdout, with no campaign. Mend nudges only the middle group, worthANudge. Report the shares as measured, and say not measured when it is null. What measures a campaign's real lift is its held-back group: customers kept back at random and compared with the rewarded ones in campaign_results.",
       input: z.strictObject({}),
       run: async () => {
         const summary = SUMMARY.parse(await answered(turn, "shop_summary", []));
@@ -374,6 +401,17 @@ export function agentTools(turn: Turn): AgentTool[] {
           quietRegularsPaid12mMinor: summary.quietRegularsPaid12mMinor,
           modelVersusRecencyLiveSegment: backtest === null || backtest.headline === null ? null : modelClaim(backtest.headline, liveSegmentLabel(backtest.headline)),
           modelVersusRecencyAllCustomers: allCustomers,
+          forecastGroups:
+            backtest === null || backtest.bands === null
+              ? null
+              : {
+                  expectedOrdersOver: `${backtest.bands.horizonWeeks} weeks`,
+                  cameBackWithinDays: backtest.holdoutDays,
+                  likelyGone: bandEvidence(backtest.bands.pooled.likelyGone),
+                  worthANudge: bandEvidence(backtest.bands.pooled.worthANudge),
+                  likelyBack: bandEvidence(backtest.bands.pooled.likelyBack),
+                  rising: backtest.bands.rising,
+                },
         };
       },
     }),
@@ -381,14 +419,15 @@ export function agentTools(turn: Turn): AgentTool[] {
       name: "quiet_regulars",
       action: "shop.quiet_regulars",
       description:
-        "Call when the owner asks which regulars have gone quiet, who is most at risk of not coming back, or who could be won back. Returns the 50 most at risk, the same list the console shows, by position only, never names, with how often they bought, days since they last bought, expected purchases in the next 13 weeks, what they paid in US cents, and whether they are members who can be thanked. demoStandIn true means a demo stand-in a script joined, never a person who signed up: always call those demo stand-ins.",
+        "Call when the owner asks which regulars have gone quiet, who is worth winning back, who is most at risk, or who could be thanked. Returns how many regulars went quiet and how Mend's forecast splits them: likelyGone expects less than a tenth of an order in the next 13 weeks, likelyBack expects one order or more and is likely to come back without a nudge, and worthANudge is everyone between, the only group a campaign picks from. Then up to 50 of the worth-a-nudge group, biggest spenders first, the same list the console shows, by position only, never names, with how often they bought, days since they last bought, expected purchases in the next 13 weeks, what they paid in US cents, and whether they are members who can be thanked. Mend skips the likely gone and the likely back on purpose: say so when the owner asks who is most at risk. demoStandIn true means a demo stand-in a script joined, never a person who signed up: always call those demo stand-ins.",
       input: z.strictObject({}),
       run: async () => {
         const quiet = QUIET.parse(await answered(turn, "quiet_regulars", [actor, QUIET_REGULARS_SHOWN]));
         return {
           asOf: quiet.asOf,
           totalQuietRegulars: quiet.total,
-          mostAtRisk: quiet.rows.map((row) => ({
+          forecastGroups: { likelyGone: quiet.likelyGone, worthANudge: quiet.worthANudge, likelyBack: quiet.likelyBack },
+          worthANudgeBiggestSpendersFirst: quiet.rows.map((row) => ({
             position: row.position,
             purchaseDays: row.purchaseDays,
             daysSilent: row.daysSilent,

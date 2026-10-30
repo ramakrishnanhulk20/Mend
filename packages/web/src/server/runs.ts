@@ -294,9 +294,78 @@ function group(answer: z.output<typeof GROUP_ANSWER>): z.input<typeof GROUP> {
   };
 }
 
+// How many quiet regulars fell in one forecast group at a past date, and how many of them
+// came back on their own within the holdout. More returning than were there is impossible,
+// so such a count is refused rather than shown.
+const bandCount = z.strictObject({ customers: count, returned: count }).refine((c) => c.returned <= c.customers, "more returned than were in the group");
+const threshold = z.number().min(0).max(100);
+const bandDays = z.number().int().min(0).max(100);
+
+// The engine writes null for a cutoff where the model did not converge, so no group was measured.
+const BANDS_ANSWER = z.strictObject({
+  likely_gone_below: threshold,
+  likely_back_from: threshold,
+  regular_min_days: bandDays,
+  silent_min_days: bandDays,
+  horizon_weeks: bandDays,
+  cutoffs: z
+    .array(
+      z.strictObject({
+        cutoff: day,
+        converged: z.boolean(),
+        likely_gone: bandCount.nullable(),
+        worth_a_nudge: bandCount.nullable(),
+        likely_back: bandCount.nullable(),
+      }),
+    )
+    .max(20),
+  pooled: z.strictObject({ likely_gone: bandCount, worth_a_nudge: bandCount, likely_back: bandCount }),
+  rising: z.boolean(),
+});
+const BANDS = z.strictObject({
+  likelyGoneBelow: threshold,
+  likelyBackFrom: threshold,
+  regularMinDays: bandDays,
+  silentMinDays: bandDays,
+  horizonWeeks: bandDays,
+  cutoffs: z
+    .array(
+      z.strictObject({
+        cutoff: day,
+        converged: z.boolean(),
+        likelyGone: bandCount.nullable(),
+        worthANudge: bandCount.nullable(),
+        likelyBack: bandCount.nullable(),
+      }),
+    )
+    .max(20),
+  pooled: z.strictObject({ likelyGone: bandCount, worthANudge: bandCount, likelyBack: bandCount }),
+  rising: z.boolean(),
+});
+
+function bands(answer: z.output<typeof BANDS_ANSWER>): z.input<typeof BANDS> {
+  return {
+    likelyGoneBelow: answer.likely_gone_below,
+    likelyBackFrom: answer.likely_back_from,
+    regularMinDays: answer.regular_min_days,
+    silentMinDays: answer.silent_min_days,
+    horizonWeeks: answer.horizon_weeks,
+    cutoffs: answer.cutoffs.map((c) => ({
+      cutoff: c.cutoff,
+      converged: c.converged,
+      likelyGone: c.likely_gone,
+      worthANudge: c.worth_a_nudge,
+      likelyBack: c.likely_back,
+    })),
+    pooled: { likelyGone: answer.pooled.likely_gone, worthANudge: answer.pooled.worth_a_nudge, likelyBack: answer.pooled.likely_back },
+    rising: answer.rising,
+  };
+}
+
 // Every older key keeps its all-customer meaning. headline (the live segment) and
 // all_customers were added together, so a row stored before them has neither, and a row
-// with only one of them is malformed.
+// with only one of them is malformed. bands came later still, so a row without it is
+// valid and the web gives it null.
 const BACKTEST_ANSWER = z
   .strictObject({
     source: z.string().min(1).max(200),
@@ -311,6 +380,7 @@ const BACKTEST_ANSWER = z
     computed_at: time,
     headline: GROUP_ANSWER.optional(),
     all_customers: GROUP_ANSWER.optional(),
+    bands: BANDS_ANSWER.optional(),
   })
   .refine((answer) => (answer.headline === undefined) === (answer.all_customers === undefined), "headline and all_customers come together");
 // The live-segment headline comes before the all-customer result, and both are null for a row stored before them.
@@ -327,7 +397,16 @@ const BACKTEST = z.strictObject({
   deciles: z.array(DECILE).max(10),
   passed: z.boolean(),
   computedAt: time,
+  bands: BANDS.nullable(),
 });
+
+// The three forecast groups split the quiet regulars: none left out, none counted twice.
+function answerGroupsAddUp(a: { total: number; worth_a_nudge: number; likely_gone: number; likely_back: number }): boolean {
+  return a.worth_a_nudge + a.likely_gone + a.likely_back === a.total;
+}
+function bodyGroupsAddUp(a: { total: number; worthANudge: number; likelyGone: number; likelyBack: number }): boolean {
+  return a.worthANudge + a.likelyGone + a.likelyBack === a.total;
+}
 
 const QUIET_ROW_ANSWER = z.strictObject({
   position: z.number().int().min(1).max(50),
@@ -545,6 +624,7 @@ const SPECS: Readonly<Record<TaskName, Spec>> = {
               deciles: a.backtest.deciles.map((d) => ({ decile: d.decile, customers: d.customers, returnedShare: d.returned_share })),
               passed: a.backtest.passed,
               computedAt: a.backtest.computed_at,
+              bands: a.backtest.bands === undefined ? null : bands(a.backtest.bands),
             },
     }),
     z
@@ -564,10 +644,23 @@ const SPECS: Readonly<Record<TaskName, Spec>> = {
   ),
   quiet_regulars: spec(
     200,
-    z.strictObject({ ok: z.literal(true), as_of: day.nullable(), total: count, rows: z.array(QUIET_ROW_ANSWER).max(50) }),
+    z
+      .strictObject({
+        ok: z.literal(true),
+        as_of: day.nullable(),
+        total: count,
+        worth_a_nudge: count,
+        likely_gone: count,
+        likely_back: count,
+        rows: z.array(QUIET_ROW_ANSWER).max(50),
+      })
+      .refine(answerGroupsAddUp, "the forecast groups do not add up to the quiet regulars"),
     (a) => ({
       asOf: a.as_of,
       total: a.total,
+      worthANudge: a.worth_a_nudge,
+      likelyGone: a.likely_gone,
+      likelyBack: a.likely_back,
       rows: a.rows.map((row) => ({
         position: row.position,
         displayName: row.display_name,
@@ -580,7 +673,8 @@ const SPECS: Readonly<Record<TaskName, Spec>> = {
       })),
     }),
     z
-      .strictObject({ asOf: day.nullable(), total: count, rows: z.array(QUIET_ROW).max(50) })
+      .strictObject({ asOf: day.nullable(), total: count, worthANudge: count, likelyGone: count, likelyBack: count, rows: z.array(QUIET_ROW).max(50) })
+      .refine(bodyGroupsAddUp, "the forecast groups do not add up to the quiet regulars")
       .refine(carriesNoIdentifier, "the list carries an email or a UUID"),
   ),
   process_events: spec(

@@ -22,7 +22,7 @@ const PANELS = [
     numeral: "02",
     label: "Forecast",
     title: "Mend sees who is slipping.",
-    body: "A BG/NBD forecast, the standard model for repeat buying, reads each regular's order history and estimates the chance they are still coming back. The ones sliding fastest rise to the top.",
+    body: "A BG/NBD forecast, the standard model for repeat buying, reads each regular's order history and estimates how many orders they will place in the next 13 weeks. Mend leaves the steady and the long gone alone, and nudges the ones still slipping, biggest spenders first.",
     description:
       "Drawing: three threads labelled steady, slipping and gone quiet; the second has small gaps and the third breaks off.",
     Drawing: ForecastDrawing,

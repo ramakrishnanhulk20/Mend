@@ -2,6 +2,7 @@
 // the network fetch in useShopSummary.ts or how the charts draw these numbers.
 import { describe, expect, it } from "vitest";
 import {
+  type ForecastBands,
   ShopSummarySchema,
   formatCount,
   formatDay,
@@ -23,6 +24,31 @@ const DECILES = [
   [525, 0.17142857142857143],
   [525, 0.09523809523809523],
 ].map(([customers, returnedShare], i) => ({ decile: i + 1, customers, returnedShare }));
+
+// The forecast groups as the server sends them, with one cutoff the model could not fit.
+const BANDS = {
+  likelyGoneBelow: 0.1,
+  likelyBackFrom: 1,
+  regularMinDays: 3,
+  silentMinDays: 60,
+  horizonWeeks: 13,
+  cutoffs: [
+    { cutoff: "2010-06-09", converged: false, likelyGone: null, worthANudge: null, likelyBack: null },
+    {
+      cutoff: "2010-09-09",
+      converged: true,
+      likelyGone: { customers: 0, returned: 0 },
+      worthANudge: { customers: 326, returned: 210 },
+      likelyBack: { customers: 50, returned: 34 },
+    },
+  ],
+  pooled: {
+    likelyGone: { customers: 92, returned: 9 },
+    worthANudge: { customers: 1100, returned: 702 },
+    likelyBack: { customers: 160, returned: 120 },
+  },
+  rising: true,
+};
 
 function liveAnswer() {
   return {
@@ -84,6 +110,36 @@ describe("ShopSummarySchema", () => {
       expect(parsed.data.backtest?.headline?.group).toBe("live segment");
       expect(parsed.data.backtest).toHaveProperty("computedAt");
     }
+  });
+
+  it("accepts the forecast groups and keeps them, with the fields it does not list", () => {
+    const answer = liveAnswer();
+    const parsed = ShopSummarySchema.safeParse({ ...answer, backtest: { ...answer.backtest, bands: BANDS } });
+    expect(parsed.success).toBe(true);
+    if (!parsed.success) return;
+    const bands: ForecastBands | null | undefined = parsed.data.backtest?.bands;
+    expect(bands?.pooled.worthANudge).toEqual({ customers: 1100, returned: 702 });
+    expect(bands?.cutoffs[0]).toMatchObject({ converged: false, likelyGone: null, worthANudge: null, likelyBack: null });
+    expect(bands).toMatchObject({ horizonWeeks: 13, rising: true, regularMinDays: 3 });
+  });
+
+  it("accepts a backtest with null bands, and one stored before bands with the key missing", () => {
+    const answer = liveAnswer();
+    const nullBands = ShopSummarySchema.safeParse({ ...answer, backtest: { ...answer.backtest, bands: null } });
+    expect(nullBands.success).toBe(true);
+    if (nullBands.success) expect(nullBands.data.backtest?.bands).toBeNull();
+    const missing = ShopSummarySchema.safeParse(answer);
+    expect(missing.success).toBe(true);
+    if (missing.success) expect(missing.data.backtest?.bands).toBeUndefined();
+  });
+
+  it("rejects forecast groups with a pooled group missing, a count as text, or the rising flag as text", () => {
+    const answer = liveAnswer();
+    const withBands = (bands: unknown) => ShopSummarySchema.safeParse({ ...answer, backtest: { ...answer.backtest, bands } }).success;
+    expect(withBands({ ...BANDS, pooled: { likelyGone: BANDS.pooled.likelyGone, worthANudge: BANDS.pooled.worthANudge } })).toBe(false);
+    expect(withBands({ ...BANDS, pooled: { ...BANDS.pooled, likelyBack: { customers: "160", returned: 120 } } })).toBe(false);
+    expect(withBands({ ...BANDS, rising: "yes" })).toBe(false);
+    expect(withBands({ ...BANDS, cutoffs: [{ cutoff: "2010-09-09", converged: true }] })).toBe(false);
   });
 
   it("rejects a body that has no quietRegulars", () => {

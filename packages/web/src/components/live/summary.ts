@@ -21,6 +21,26 @@ const measuredGroup = z.looseObject({
   intervalHigh: z.number().nullable(),
 });
 
+const bandCount = z.looseObject({ customers: count, returned: count });
+
+// A cutoff the model did not converge at has no group counts, so each is null there.
+const forecastBands = z.looseObject({
+  likelyGoneBelow: z.number(),
+  likelyBackFrom: z.number(),
+  horizonWeeks: z.number(),
+  pooled: z.looseObject({ likelyGone: bandCount, worthANudge: bandCount, likelyBack: bandCount }),
+  rising: z.boolean(),
+  cutoffs: z.array(
+    z.looseObject({
+      cutoff: z.string(),
+      converged: z.boolean(),
+      likelyGone: bandCount.nullable(),
+      worthANudge: bandCount.nullable(),
+      likelyBack: bandCount.nullable(),
+    }),
+  ),
+});
+
 export const ShopSummarySchema = z.looseObject({
   asOf: z.string().nullable(),
   shopCustomers: count,
@@ -56,11 +76,14 @@ export const ShopSummarySchema = z.looseObject({
       allCustomers: measuredGroup.nullable(),
       passed: z.boolean(),
       computedAt: z.string(),
+      // A summary stored before the forecast groups were measured has none.
+      bands: forecastBands.nullable().optional(),
     })
     .nullable(),
 });
 
 export type ShopSummary = z.infer<typeof ShopSummarySchema>;
+export type ForecastBands = NonNullable<NonNullable<ShopSummary["backtest"]>["bands"]>;
 
 const COUNT_FORMAT = new Intl.NumberFormat("en-US");
 

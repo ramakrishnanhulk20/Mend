@@ -7,7 +7,7 @@ import { ApiError, type ConsoleApi } from "./api";
 import { EASE, FOCUS_RING, PRIMARY_BUTTON, Spinner } from "./ui";
 
 const HAPPENS = [
-  { title: "See who went quiet", line: "Mend's forecast ranks the shop's regulars." },
+  { title: "See who went quiet", line: "Mend's forecast picks the quiet regulars worth a nudge." },
   {
     title: "Ask Claude for a plan",
     line: "Say what you want in a sentence. Claude sets the budget and reward within the demo's caps.",

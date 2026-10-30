@@ -95,6 +95,9 @@ const QuietRegularSchema = z.looseObject({
 export const QuietRegularsSchema = z.looseObject({
   asOf: z.string().nullable(),
   total: count,
+  worthANudge: count,
+  likelyGone: count,
+  likelyBack: count,
   rows: z.array(QuietRegularSchema),
 });
 

@@ -150,6 +150,9 @@ const ANSWERS: Record<string, unknown> = {
     ok: true,
     as_of: "2026-10-16",
     total: 1357,
+    worth_a_nudge: 1110,
+    likely_gone: 77,
+    likely_back: 170,
     rows: [{ position: 1, display_name: "Priya X.", purchase_days: 7, days_silent: 95, score: 0.08, paid_net_minor: 4821, member: true, stand_in: false }],
   },
   process_events: { ok: true, ran: true, outcomes: { "status recorded": 2 }, retrying: 0 },
@@ -443,6 +446,9 @@ describe("the shop routes", () => {
     expect(await json(response)).toEqual({
       asOf: "2026-10-16",
       total: 1357,
+      worthANudge: 1110,
+      likelyGone: 77,
+      likelyBack: 170,
       rows: [{ position: 1, displayName: "Priya X.", purchaseDays: 7, daysSilent: 95, score: 0.08, paidNetMinor: 4821, member: true, standIn: false }],
     });
     await GET(request("GET", "/api/shop/quiet-regulars", { session: demo }));

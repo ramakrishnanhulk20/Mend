@@ -3,7 +3,7 @@
 import { useCallback, useEffect, useState } from "react";
 import { motion } from "motion/react";
 import { useStill } from "@/components/motion/useStill";
-import { formatDay } from "@/components/live/summary";
+import { formatCount, formatDay } from "@/components/live/summary";
 import { ApiError, type ConsoleApi, type QuietRegular, type QuietRegulars } from "./api";
 import { formatUsd, plural } from "./money";
 import { EASE, FOCUS_RING, PRIMARY_BUTTON, TextButton } from "./ui";
@@ -219,6 +219,19 @@ function PlaceholderRows({ still }: { still: boolean }) {
 
 const LABEL = "font-mono text-[12px] uppercase tracking-[0.14em] text-bone-faint";
 
+const PAYABLE = "Only customers who joined the shop's thank-you list with Log in with PayPal can be paid.";
+
+// The middle group can be empty while the other two are not, and a shop with no quiet regulars has no groups at all, so each case reads on its own.
+function forecastLine(data: QuietRegulars): string {
+  if (data.worthANudge > 0) {
+    return `Mend lists the ${formatCount(data.worthANudge)} worth a nudge, biggest spenders first. It skips the ${formatCount(data.likelyGone)} the forecast calls likely gone and the ${formatCount(data.likelyBack)} likely to come back anyway. ${PAYABLE}`;
+  }
+  if (data.total > 0) {
+    return `None of them is worth a nudge right now: the forecast calls ${formatCount(data.likelyGone)} likely gone and ${formatCount(data.likelyBack)} likely to come back anyway. ${PAYABLE}`;
+  }
+  return PAYABLE;
+}
+
 function FailurePanel({ failure, onRetry }: { failure: Failure; onRetry: () => void }) {
   let text: string;
   let canRetry = true;
@@ -309,10 +322,7 @@ export function RegularsStep({ api, onPlan }: RegularsStepProps) {
           >
             {plural(data.total, "regular", "regulars")} went quiet.
           </h1>
-          <p className="mt-5 max-w-[60ch] text-[16px] leading-[1.55] text-bone-dim">
-            Ranked by Mend&apos;s forecast, most at risk first. Only customers who joined the shop&apos;s
-            thank-you list with Log in with PayPal can be paid.
-          </p>
+          <p className="mt-5 max-w-[60ch] text-[16px] leading-[1.55] text-bone-dim">{forecastLine(data)}</p>
           {data.asOf !== null && (
             <p className="mt-2 font-mono text-[12px] text-bone-faint">Records run to {formatDay(data.asOf)}</p>
           )}

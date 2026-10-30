@@ -120,7 +120,7 @@ describe("suggestionsFor", () => {
   it("asks about the last campaign when no PayPal order is known", () => {
     expect(suggestionsFor(null)).toEqual([
       "How many quiet regulars does the shop have?",
-      "Which regulars are most at risk right now?",
+      "Which regulars are worth a nudge right now?",
       "Which of these customers can be paid?",
     ]);
   });

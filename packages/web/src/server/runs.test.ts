@@ -61,6 +61,11 @@ let logLines: string[] = [];
 const schema = `web_runs_${process.pid}_${Date.now()}`;
 
 const QUIET_ROW = { position: 1, display_name: "Priya X.", purchase_days: 7, days_silent: 95, score: 0.0812, paid_net_minor: 48210, member: true, stand_in: false };
+
+// An answer whose three forecast groups add up to total. Without a split, every regular is worth a nudge.
+function quietAnswer(rows: readonly unknown[], total: number, groups = { worth_a_nudge: total, likely_gone: 0, likely_back: 0 }): EngineAnswer {
+  return { ok: true, as_of: "2026-10-16", total, ...groups, rows: [...rows] };
+}
 const BENCHMARK = {
   source: "CDNOW sample, Fader, Hardie and Lee (2005)",
   customers: 2357,
@@ -80,6 +85,30 @@ const BACKTEST = {
   deciles: [{ decile: 10, customers: 525, returned_share: 0.0952 }],
   passed: true,
   computed_at: "2026-10-24T05:35:27.783038+00:00",
+};
+// The forecast groups as the engine writes them: one cutoff the model could not fit, and one where nobody was likely gone.
+const BANDS = {
+  likely_gone_below: 0.1,
+  likely_back_from: 1.0,
+  regular_min_days: 3,
+  silent_min_days: 60,
+  horizon_weeks: 13,
+  cutoffs: [
+    { cutoff: "2010-06-09", converged: false, likely_gone: null, worth_a_nudge: null, likely_back: null },
+    {
+      cutoff: "2010-09-09",
+      converged: true,
+      likely_gone: { customers: 0, returned: 0 },
+      worth_a_nudge: { customers: 326, returned: 210 },
+      likely_back: { customers: 50, returned: 34 },
+    },
+  ],
+  pooled: {
+    likely_gone: { customers: 92, returned: 9 },
+    worth_a_nudge: { customers: 1100, returned: 702 },
+    likely_back: { customers: 160, returned: 118 },
+  },
+  rising: true,
 };
 // The live segment and all customers as store_facts.py _group_fact writes them, with today's measured pooled numbers.
 const HEADLINE = {
@@ -381,6 +410,48 @@ describe("finished runs become each route's own response", () => {
     expect(finished("shop_summary", { ...SUMMARY, backtest: { ...BACKTEST, ...groups } }).status).toBe(500);
   });
 
+  it("the summary carries the forecast groups in camelCase when the row has them, and null for a row stored before them", async () => {
+    const withBands = await finished("shop_summary", { ...SUMMARY, backtest: { ...BACKTEST, bands: BANDS } }).json();
+    expect(withBands.backtest.bands).toEqual({
+      likelyGoneBelow: 0.1,
+      likelyBackFrom: 1,
+      regularMinDays: 3,
+      silentMinDays: 60,
+      horizonWeeks: 13,
+      cutoffs: [
+        { cutoff: "2010-06-09", converged: false, likelyGone: null, worthANudge: null, likelyBack: null },
+        {
+          cutoff: "2010-09-09",
+          converged: true,
+          likelyGone: { customers: 0, returned: 0 },
+          worthANudge: { customers: 326, returned: 210 },
+          likelyBack: { customers: 50, returned: 34 },
+        },
+      ],
+      pooled: { likelyGone: { customers: 92, returned: 9 }, worthANudge: { customers: 1100, returned: 702 }, likelyBack: { customers: 160, returned: 118 } },
+      rising: true,
+    });
+    const before = await finished("shop_summary", SUMMARY).json();
+    expect(before.backtest.bands).toBeNull();
+    expect(Object.keys(before.backtest)).toContain("bands");
+  });
+
+  it.each([
+    ["more returned than were in a pooled group", { ...BANDS, pooled: { ...BANDS.pooled, likely_gone: { customers: 92, returned: 93 } } }],
+    ["more returned than were in a cutoff's group", { ...BANDS, cutoffs: [{ ...BANDS.cutoffs[1], worth_a_nudge: { customers: 10, returned: 11 } }] }],
+    ["a field nobody listed", { ...BANDS, note: "x" }],
+    ["a pooled group missing", { ...BANDS, pooled: { likely_gone: BANDS.pooled.likely_gone, worth_a_nudge: BANDS.pooled.worth_a_nudge } }],
+    ["a count that is not a whole number", { ...BANDS, pooled: { ...BANDS.pooled, likely_back: { customers: 160.5, returned: 118 } } }],
+    ["a negative count", { ...BANDS, pooled: { ...BANDS.pooled, likely_back: { customers: 160, returned: -1 } } }],
+    ["a cutoff that is not a day", { ...BANDS, cutoffs: [{ ...BANDS.cutoffs[0], cutoff: "last spring" }] }],
+    ["more than 20 cutoffs", { ...BANDS, cutoffs: Array.from({ length: 21 }, () => BANDS.cutoffs[0]) }],
+    ["a threshold above 100", { ...BANDS, likely_back_from: 101 }],
+    ["a negative threshold", { ...BANDS, likely_gone_below: -0.1 }],
+    ["the rising flag as text", { ...BANDS, rising: "true" }],
+  ])("the summary is refused with 500 for forecast groups with %s", (_label, bands) => {
+    expect(finished("shop_summary", { ...SUMMARY, backtest: { ...BACKTEST, bands } }).status).toBe(500);
+  });
+
   it.each([
     ["an extra field", { ...SUMMARY, owner_email: "x" }],
     ["an email in a stored fact", { ...SUMMARY, benchmark: { ...BENCHMARK, source: "ram@shop.example" } }],
@@ -392,12 +463,15 @@ describe("finished runs become each route's own response", () => {
     expect(await response.json()).toEqual({ error: "internal", message: "Something went wrong.", ref: REF });
   });
 
-  it("quiet regulars carry position, name, numbers, the member flag and the stand-in flag, and nothing else", async () => {
-    const response = finished("quiet_regulars", { ok: true, as_of: "2026-10-16", total: 1357, rows: [QUIET_ROW] });
+  it("quiet regulars carry the three forecast group counts, then position, name, numbers, the member flag and the stand-in flag, and nothing else", async () => {
+    const response = finished("quiet_regulars", quietAnswer([QUIET_ROW], 1357, { worth_a_nudge: 1110, likely_gone: 77, likely_back: 170 }));
     const body = await response.json();
     expect(body).toEqual({
       asOf: "2026-10-16",
       total: 1357,
+      worthANudge: 1110,
+      likelyGone: 77,
+      likelyBack: 170,
       rows: [{ position: 1, displayName: "Priya X.", purchaseDays: 7, daysSilent: 95, score: 0.0812, paidNetMinor: 48210, member: true, standIn: false }],
     });
     expect(JSON.stringify(body)).not.toMatch(/@|[0-9a-f]{8}-[0-9a-f]{4}-/i);
@@ -409,7 +483,7 @@ describe("finished runs become each route's own response", () => {
       { ...QUIET_ROW, position: 2, display_name: "Arjun K." },
       { ...QUIET_ROW, position: 3, display_name: "Lena P.", member: false },
     ];
-    const body = await finished("quiet_regulars", { ok: true, as_of: "2026-10-16", total: 3, rows }).json();
+    const body = await finished("quiet_regulars", quietAnswer(rows, 3)).json();
     expect(body.rows.map((row: { member: boolean; standIn: boolean }) => [row.member, row.standIn])).toEqual([
       [true, true],
       [true, false],
@@ -427,14 +501,33 @@ describe("finished runs become each route's own response", () => {
     ["the stand-in flag as a number", { ...QUIET_ROW, stand_in: 1 }],
     ["no stand-in flag", { ...QUIET_ROW, stand_in: undefined }],
   ])("quiet regulars are refused with 500 for %s", async (_label, row) => {
-    const response = finished("quiet_regulars", { ok: true, as_of: "2026-10-16", total: 1, rows: [row] });
+    const response = finished("quiet_regulars", quietAnswer([row], 1));
     expect(response.status).toBe(500);
     expect(await response.text()).not.toMatch(/maya|C1042|0b6c2f8e/i);
   });
 
   it("more than 50 quiet regulars is a malformed answer", () => {
     const rows = Array.from({ length: 51 }, (_, n) => ({ ...QUIET_ROW, position: Math.min(n + 1, 50) }));
-    expect(successBody("quiet_regulars", { ok: true, as_of: "2026-10-16", total: 51, rows })).toBeNull();
+    expect(successBody("quiet_regulars", quietAnswer(rows, 51))).toBeNull();
+  });
+
+  it.each([
+    ["groups that add up to less than the total", { worth_a_nudge: 1110, likely_gone: 77, likely_back: 169 }],
+    ["groups that add up to more than the total", { worth_a_nudge: 1110, likely_gone: 77, likely_back: 171 }],
+    ["a group counted twice", { worth_a_nudge: 1357, likely_gone: 77, likely_back: 170 }],
+  ])("a quiet regulars answer with %s is a malformed answer, refused with a generic 500", async (_label, groups) => {
+    const response = finished("quiet_regulars", quietAnswer([QUIET_ROW], 1357, groups));
+    expect(response.status).toBe(500);
+    expect(await response.json()).toEqual({ error: "internal", message: "Something went wrong.", ref: REF });
+  });
+
+  it.each([
+    ["no forecast groups", { worth_a_nudge: undefined, likely_gone: undefined, likely_back: undefined }],
+    ["a group count that is not a whole number", { worth_a_nudge: 1109.5, likely_gone: 77.5, likely_back: 170 }],
+    ["a negative group count", { worth_a_nudge: 1500, likely_gone: -143, likely_back: 0 }],
+    ["a group nobody listed", { skipped: 1 }],
+  ])("a quiet regulars answer with %s is refused", (_label, change) => {
+    expect(successBody("quiet_regulars", { ...quietAnswer([QUIET_ROW], 1357, { worth_a_nudge: 1110, likely_gone: 77, likely_back: 170 }), ...change })).toBeNull();
   });
 
   it("an engine refusal keeps its code and the engine's ref; a failed run is a generic 500", async () => {

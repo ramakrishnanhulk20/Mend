@@ -54,7 +54,7 @@ export function askFailureText(status: number, code: string): string {
 export function suggestionsFor(orderId: string | null): string[] {
   return [
     "How many quiet regulars does the shop have?",
-    "Which regulars are most at risk right now?",
+    "Which regulars are worth a nudge right now?",
     orderId === null ? "Which of these customers can be paid?" : `What happened with PayPal order ${orderId}?`,
   ];
 }

@@ -12,7 +12,7 @@ const MAX_LIMIT = 50;
 const LIMIT = /^[1-9][0-9]?$/;
 
 /**
- * The shop's quiet regulars right now, most at risk first: ?limit= from 1 to 50,
+ * The shop's quiet regulars right now, worth a nudge, biggest spenders first: ?limit= from 1 to 50,
  * default 50. Each row is a position, a synthetic display name, purchase days, days
  * silent, the model's score, what they paid net of refunds and whether they joined;
  * never an email, member id or customer ref (C12, C15). A demo or owner session is

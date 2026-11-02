@@ -97,6 +97,8 @@ const ROW_ANSWER = z.strictObject({
   amount_minor: cents.nullable(),
   note: z.string().max(400).nullable(),
   stand_in: z.boolean(),
+  // Whether the row's member is still on the thank-you list. Never says who (C28).
+  on_list: z.boolean(),
 });
 
 // A reward's payout item status as Mend's ledger stores it; the engine shows any other
@@ -111,21 +113,32 @@ const RESULT_ROW_ANSWER = z
     rank: z.number().int().min(1),
     display_name: displayName.nullable(),
     stand_in: z.boolean(),
+    on_list: z.boolean(),
     payout_status: payoutStatus.nullable(),
     simulated_return: z.boolean(),
     real_return: z.boolean(),
   })
   .refine((row) => row.role === "reward" || row.payout_status === null, "a held-back row has no payout");
-const RESULT_ROW = z.strictObject({
-  ref: memberRef,
-  role: z.enum(["reward", "holdout"]),
-  rank: z.number().int().min(1),
-  displayName: displayName.nullable(),
-  standIn: z.boolean(),
-  payoutStatus: payoutStatus.nullable(),
-  simulatedReturn: z.boolean(),
-  realReturn: z.boolean(),
-});
+// C28: nobody who left is named again, so a row whose member is gone must carry no name. A removed
+// stand-in is allowed to be off the list: the rule is about the name, not about standIn.
+function goneMemberHasNoName(row: { onList: boolean; displayName: string | null }): boolean {
+  return row.onList || row.displayName === null;
+}
+const GONE_MEMBER_NAMED = "a row whose member is gone carries no name";
+
+const RESULT_ROW = z
+  .strictObject({
+    ref: memberRef,
+    role: z.enum(["reward", "holdout"]),
+    rank: z.number().int().min(1),
+    displayName: displayName.nullable(),
+    standIn: z.boolean(),
+    onList: z.boolean(),
+    payoutStatus: payoutStatus.nullable(),
+    simulatedReturn: z.boolean(),
+    realReturn: z.boolean(),
+  })
+  .refine(goneMemberHasNoName, GONE_MEMBER_NAMED);
 
 function resultRow(answer: z.output<typeof RESULT_ROW_ANSWER>): z.input<typeof RESULT_ROW> {
   return {
@@ -134,6 +147,7 @@ function resultRow(answer: z.output<typeof RESULT_ROW_ANSWER>): z.input<typeof R
     rank: answer.rank,
     displayName: answer.display_name,
     standIn: answer.stand_in,
+    onList: answer.on_list,
     payoutStatus: answer.payout_status,
     simulatedReturn: answer.simulated_return,
     realReturn: answer.real_return,
@@ -470,6 +484,7 @@ const SPECS: Readonly<Record<TaskName, Spec>> = {
         amountMinor: row.amount_minor,
         note: row.note,
         standIn: row.stand_in,
+        onList: row.on_list,
       })),
       reviewHash: a.review_hash,
       reviewProblem: a.review_problem,
@@ -485,15 +500,18 @@ const SPECS: Readonly<Record<TaskName, Spec>> = {
       totalMinor: cents,
       rows: z
         .array(
-          z.strictObject({
-            ref: memberRef,
-            role: z.enum(["reward", "holdout"]),
-            rank: z.number().int().min(1),
-            displayName: displayName.nullable(),
-            amountMinor: cents.nullable(),
-            note: z.string().max(400).nullable(),
-            standIn: z.boolean(),
-          }),
+          z
+            .strictObject({
+              ref: memberRef,
+              role: z.enum(["reward", "holdout"]),
+              rank: z.number().int().min(1),
+              displayName: displayName.nullable(),
+              amountMinor: cents.nullable(),
+              note: z.string().max(400).nullable(),
+              standIn: z.boolean(),
+              onList: z.boolean(),
+            })
+            .refine(goneMemberHasNoName, GONE_MEMBER_NAMED),
         )
         .max(250),
       reviewHash: z.string().regex(/^[0-9a-f]{64}$/).nullable(),

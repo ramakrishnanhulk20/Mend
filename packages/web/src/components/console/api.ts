@@ -149,6 +149,8 @@ const CampaignRowSchema = z.looseObject({
   amountMinor: count.nullable(),
   note: z.string().nullable(),
   standIn: z.boolean(),
+  // False once the row's member has left or been removed. Older answers have no such field, and a row from one reads as still on the list.
+  onList: z.boolean().default(true),
 });
 
 export const CampaignViewSchema = z.looseObject({
@@ -221,6 +223,7 @@ const ResultRowSchema = z.looseObject({
   rank: z.number().int().min(1),
   displayName: z.string().nullish(),
   standIn: z.boolean(),
+  onList: z.boolean().default(true),
   // Mend's ledger word for the reward's payment, such as UNCLAIMED. Null for a held-back row or a reward not sent yet.
   payoutStatus: z.string().nullable(),
   simulatedReturn: z.boolean(),

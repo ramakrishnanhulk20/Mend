@@ -37,6 +37,8 @@ const KNOT_AT = WIDTH - KNOT_RADIUS - KNOT_RING;
 
 const STAND_IN_TITLE =
   "Joined by a script so the demo has people to pay. Their reward stays unclaimed until it is cancelled.";
+const LEFT_TITLE =
+  "This customer is no longer on the shop's thank-you list. Mend keeps their place in the results and never shows who they were.";
 const HOLDOUT_NOTE = "Held back on purpose. Never paid, so the results have something to compare with.";
 
 const LABEL_COLOR: Record<ThreadState, string> = {
@@ -303,6 +305,10 @@ function ThreadRow({
           {row.standIn ? (
             <span title={STAND_IN_TITLE} className="text-bone-faint">
               demo stand-in
+            </span>
+          ) : !row.onList ? (
+            <span title={LEFT_TITLE} className="text-bone-faint">
+              no longer on the list
             </span>
           ) : (
             <span className="text-bone-dim">joined with PayPal</span>

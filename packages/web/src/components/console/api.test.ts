@@ -339,6 +339,31 @@ describe("the campaign calls", () => {
     expect(view.rows[0].displayName).toBeUndefined();
   });
 
+  it("reads a view row with no onList as still on the list, as older answers have", async () => {
+    const { fetchFn } = fakeFetch(() => json(200, VIEW));
+    const view = await createConsoleApi(fetchFn).view(CAMPAIGN);
+
+    expect(view.rows.map((row) => row.onList)).toEqual([true, true]);
+  });
+
+  it("carries onList false on a view row whose member is gone, stand-in or not", async () => {
+    const gone = { ...VIEW, rows: [{ ...VIEW.rows[0], onList: false }, { ...VIEW.rows[1], onList: false }] };
+    const { fetchFn } = fakeFetch(() => json(200, gone));
+    const view = await createConsoleApi(fetchFn).view(CAMPAIGN);
+
+    expect(view.rows.map((row) => [row.standIn, row.onList])).toEqual([
+      [false, false],
+      [true, false],
+    ]);
+  });
+
+  it("refuses a view whose onList is not true or false", async () => {
+    const bad = { ...VIEW, rows: [{ ...VIEW.rows[0], onList: "no" }] };
+    const { fetchFn } = fakeFetch(() => json(200, bad));
+
+    await expect(createConsoleApi(fetchFn).view(CAMPAIGN)).rejects.toMatchObject({ code: "unexpected_answer" });
+  });
+
   it("refuses a view whose displayName is not text", async () => {
     const bad = { ...VIEW, rows: [{ ...VIEW.rows[0], displayName: 7 }] };
     const { fetchFn } = fakeFetch(() => json(200, bad));
@@ -500,6 +525,18 @@ describe("the payout and results calls", () => {
     const results = await createConsoleApi(fetchFn).results(CAMPAIGN);
 
     expect(results.rows.map((row) => row.displayName)).toEqual(["Priya X.", null, undefined]);
+  });
+
+  it("reads a results row with no onList as still on the list, and carries onList false when the member is gone", async () => {
+    const mixed = { ...RESULTS, rows: [RESULTS.rows[0], { ...RESULTS.rows[1], onList: false }, { ...RESULTS.rows[2], onList: true }] };
+    const { fetchFn } = fakeFetch(() => json(200, mixed));
+    const results = await createConsoleApi(fetchFn).results(CAMPAIGN);
+
+    expect(results.rows.map((row) => [row.standIn, row.onList])).toEqual([
+      [false, true],
+      [true, false],
+      [true, true],
+    ]);
   });
 
   it("refuses results whose rows have an unknown role", async () => {

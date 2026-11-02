@@ -157,9 +157,9 @@ const SUMMARY = {
 // customer with a real return, a demo stand-in's reward still unclaimed, and a claimed reward
 // with a simulated return whose member has since left, so it carries no name.
 const RESULT_ROWS = [
-  { ref: "R1", role: "holdout", rank: 1, display_name: "Priya X.", stand_in: false, payout_status: null, simulated_return: false, real_return: true },
-  { ref: "R2", role: "reward", rank: 2, display_name: "Arjun K.", stand_in: true, payout_status: "UNCLAIMED", simulated_return: false, real_return: false },
-  { ref: "R5", role: "reward", rank: 5, display_name: null, stand_in: false, payout_status: "SUCCESS", simulated_return: true, real_return: false },
+  { ref: "R1", role: "holdout", rank: 1, display_name: "Priya X.", stand_in: false, on_list: true, payout_status: null, simulated_return: false, real_return: true },
+  { ref: "R2", role: "reward", rank: 2, display_name: "Arjun K.", stand_in: true, on_list: true, payout_status: "UNCLAIMED", simulated_return: false, real_return: false },
+  { ref: "R5", role: "reward", rank: 5, display_name: null, stand_in: false, on_list: false, payout_status: "SUCCESS", simulated_return: true, real_return: false },
 ];
 const RESULTS = {
   ok: true as const,
@@ -188,8 +188,8 @@ const VIEW = {
   holdout_share: "0.50",
   total_minor: 200,
   rows: [
-    { ref: "R1", role: "holdout", rank: 1, amount_minor: null, note: null, display_name: "Priya X.", stand_in: false },
-    { ref: "R2", role: "reward", rank: 2, amount_minor: 200, note: "Thank you for shopping with us.", display_name: "Arjun K.", stand_in: true },
+    { ref: "R1", role: "holdout", rank: 1, amount_minor: null, note: null, display_name: "Priya X.", stand_in: false, on_list: true },
+    { ref: "R2", role: "reward", rank: 2, amount_minor: 200, note: "Thank you for shopping with us.", display_name: "Arjun K.", stand_in: true, on_list: true },
   ],
   review_hash: "e".repeat(64),
   review_problem: null,
@@ -607,13 +607,21 @@ describe("finished runs become each route's own response", () => {
     }
   });
 
-  it("results carry every row in camelCase: its customer's name or null, its payout status, its returns and whether it is a demo stand-in", async () => {
+  it("results carry every row in camelCase: its customer's name or null, its payout status, its returns, whether it is a demo stand-in and whether its member is still on the list", async () => {
     const answered = finished("results", RESULTS);
     expect(answered.status).toBe(200);
     expect((await answered.json()).rows).toEqual([
-      { ref: "R1", role: "holdout", rank: 1, displayName: "Priya X.", standIn: false, payoutStatus: null, simulatedReturn: false, realReturn: true },
-      { ref: "R2", role: "reward", rank: 2, displayName: "Arjun K.", standIn: true, payoutStatus: "UNCLAIMED", simulatedReturn: false, realReturn: false },
-      { ref: "R5", role: "reward", rank: 5, displayName: null, standIn: false, payoutStatus: "SUCCESS", simulatedReturn: true, realReturn: false },
+      { ref: "R1", role: "holdout", rank: 1, displayName: "Priya X.", standIn: false, onList: true, payoutStatus: null, simulatedReturn: false, realReturn: true },
+      { ref: "R2", role: "reward", rank: 2, displayName: "Arjun K.", standIn: true, onList: true, payoutStatus: "UNCLAIMED", simulatedReturn: false, realReturn: false },
+      { ref: "R5", role: "reward", rank: 5, displayName: null, standIn: false, onList: false, payoutStatus: "SUCCESS", simulatedReturn: true, realReturn: false },
+    ]);
+  });
+
+  it("a results row for a stand-in who was removed stays standIn and reads off the list, and the row still passes", async () => {
+    const removed = { ...RESULT_ROWS[1], display_name: null, on_list: false };
+    const body = await finished("results", { ...RESULTS, rows: [removed] }).json();
+    expect(body.rows).toEqual([
+      { ref: "R2", role: "reward", rank: 2, displayName: null, standIn: true, onList: false, payoutStatus: "UNCLAIMED", simulatedReturn: false, realReturn: false },
     ]);
   });
 
@@ -628,6 +636,9 @@ describe("finished runs become each route's own response", () => {
     ["a status carrying markup", { rows: [{ ...reward, payout_status: "SUCCESS<script>" }] }],
     ["the stand-in flag as text", { rows: [{ ...reward, stand_in: "true" }] }],
     ["no stand-in flag", { rows: [{ ...reward, stand_in: undefined }] }],
+    ["no on-list flag", { rows: [{ ...reward, on_list: undefined }] }],
+    ["the on-list flag as text", { rows: [{ ...reward, on_list: "true" }] }],
+    ["a name on a row whose member is gone", { rows: [{ ...reward, on_list: false }] }],
     ["a held-back row with a payout status", { rows: [{ ...RESULT_ROWS[0], payout_status: "SUCCESS" }] }],
     ["no display name", { rows: [{ ...reward, display_name: undefined }] }],
     ["an email for a name", { rows: [{ ...reward, display_name: "maya@shop.example" }] }],
@@ -644,22 +655,47 @@ describe("finished runs become each route's own response", () => {
     expect(await response.text()).not.toMatch(/maya|ITEM1|0b6c2f8e|script/i);
   });
 
-  it("a campaign view's rows carry the customer's name and the stand-in flag, and a row without either or with an extra key is refused", async () => {
+  it("a campaign view's rows carry the customer's name, the stand-in flag and the on-list flag, and a row missing one or with an extra key is refused", async () => {
     expect((await finished("view_campaign", VIEW).json()).rows).toEqual([
-      { ref: "R1", role: "holdout", rank: 1, amountMinor: null, note: null, displayName: "Priya X.", standIn: false },
-      { ref: "R2", role: "reward", rank: 2, amountMinor: 200, note: "Thank you for shopping with us.", displayName: "Arjun K.", standIn: true },
+      { ref: "R1", role: "holdout", rank: 1, amountMinor: null, note: null, displayName: "Priya X.", standIn: false, onList: true },
+      { ref: "R2", role: "reward", rank: 2, amountMinor: 200, note: "Thank you for shopping with us.", displayName: "Arjun K.", standIn: true, onList: true },
     ]);
     const row = VIEW.rows[1];
-    for (const changed of [{ ...row, stand_in: undefined }, { ...row, stand_in: 1 }, { ...row, member_id: CAMPAIGN }, { ...row, display_name: undefined }]) {
+    for (const changed of [
+      { ...row, stand_in: undefined },
+      { ...row, stand_in: 1 },
+      { ...row, on_list: undefined },
+      { ...row, on_list: "true" },
+      { ...row, member_id: CAMPAIGN },
+      { ...row, display_name: undefined },
+    ]) {
       expect(finished("view_campaign", { ...VIEW, rows: [changed] }).status, JSON.stringify(changed)).toBe(500);
     }
   });
 
-  it("a view row whose member left carries a null name", async () => {
-    const left = { ...VIEW.rows[1], display_name: null };
-    expect((await finished("view_campaign", { ...VIEW, rows: [left] }).json()).rows).toEqual([
-      { ref: "R2", role: "reward", rank: 2, amountMinor: 200, note: "Thank you for shopping with us.", displayName: null, standIn: true },
+  it("a view row whose member left carries a null name and reads off the list, whether or not it was a stand-in", async () => {
+    const removedStandIn = { ...VIEW.rows[1], display_name: null, on_list: false };
+    const leftMember = { ...VIEW.rows[1], ref: "R3", rank: 3, display_name: null, stand_in: false, on_list: false };
+    expect((await finished("view_campaign", { ...VIEW, rows: [removedStandIn, leftMember] }).json()).rows).toEqual([
+      { ref: "R2", role: "reward", rank: 2, amountMinor: 200, note: "Thank you for shopping with us.", displayName: null, standIn: true, onList: false },
+      { ref: "R3", role: "reward", rank: 3, amountMinor: 200, note: "Thank you for shopping with us.", displayName: null, standIn: false, onList: false },
     ]);
+  });
+
+  it("a view row or results row off the list with a name is refused with a generic 500, and passes once the name is null (C28)", async () => {
+    const named = { ...VIEW.rows[1], on_list: false };
+    const refusedView = finished("view_campaign", { ...VIEW, rows: [named] });
+    expect(refusedView.status).toBe(500);
+    expect(await refusedView.json()).toEqual({ error: "internal", message: "Something went wrong.", ref: REF });
+    expect(finished("view_campaign", { ...VIEW, rows: [{ ...named, display_name: null }] }).status).toBe(200);
+    expect(finished("view_campaign", { ...VIEW, rows: [{ ...named, stand_in: false }] }).status).toBe(500);
+
+    const namedResult = { ...RESULT_ROWS[1], on_list: false };
+    const refusedResults = finished("results", { ...RESULTS, rows: [namedResult] });
+    expect(refusedResults.status).toBe(500);
+    expect(await refusedResults.json()).toEqual({ error: "internal", message: "Something went wrong.", ref: REF });
+    expect(finished("results", { ...RESULTS, rows: [{ ...namedResult, display_name: null }] }).status).toBe(200);
+    expect(finished("results", { ...RESULTS, rows: [{ ...namedResult, stand_in: false }] }).status).toBe(500);
   });
 
   it.each([

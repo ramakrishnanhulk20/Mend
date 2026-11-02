@@ -12,11 +12,12 @@ type TopBarProps = {
   session: SessionInfo | null;
   ending: boolean;
   onEnd: () => void;
+  onBreakIt?: () => void;
 };
 
-// From lg the step rail takes the middle of the bar. Between lg and xl there is no room left
-// for the console label as well, so it steps aside until xl.
-export function TopBar({ step, session, ending, onEnd }: TopBarProps) {
+// From lg the step rail takes the middle of the bar. With Break it as a sixth item there is no
+// room left for the console label as well below 2xl, so it steps aside until then.
+export function TopBar({ step, session, ending, onEnd, onBreakIt }: TopBarProps) {
   return (
     <header className="sticky top-0 z-40 flex h-16 items-center justify-between whitespace-nowrap border-b border-rule bg-ink/90 px-4 backdrop-blur md:px-10">
       <div className="flex flex-1 items-center gap-4">
@@ -27,8 +28,8 @@ export function TopBar({ step, session, ending, onEnd }: TopBarProps) {
             Mend
           </span>
         </Link>
-        <span aria-hidden="true" className="hidden h-5 w-px bg-rule sm:block lg:hidden xl:block" />
-        <span className="hidden font-mono text-[12px] uppercase tracking-[0.14em] text-bone-dim sm:block lg:hidden xl:block">
+        <span aria-hidden="true" className="hidden h-5 w-px bg-rule sm:block lg:hidden 2xl:block" />
+        <span className="hidden font-mono text-[12px] uppercase tracking-[0.14em] text-bone-dim sm:block lg:hidden 2xl:block">
           Demo console
         </span>
         <span className="rounded-[6px] border border-rule px-2 py-[3px] font-mono text-[10.5px] uppercase tracking-[0.14em] text-bone-faint">
@@ -36,7 +37,7 @@ export function TopBar({ step, session, ending, onEnd }: TopBarProps) {
         </span>
       </div>
 
-      <StepRail step={step} />
+      <StepRail step={step} onBreakIt={onBreakIt} />
 
       <div className="flex flex-1 items-center justify-end gap-4">
         <Link

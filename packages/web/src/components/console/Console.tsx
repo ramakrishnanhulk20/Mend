@@ -1,17 +1,19 @@
 "use client";
 
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { AnimatePresence, motion, MotionConfig } from "motion/react";
 import { useStill } from "@/components/motion/useStill";
 import { ApproveStep } from "./ApproveStep";
 import { createConsoleApi } from "./api";
 import { AskPanel } from "./AskPanel";
+import { BreakItStep } from "./BreakItStep";
 import { PayoutStep } from "./PayoutStep";
 import { PlanStep } from "./PlanStep";
 import { RegularsStep } from "./RegularsStep";
 import { ResultsStep } from "./ResultsStep";
 import { ShopCard } from "./ShopCard";
 import { StartStep } from "./StartStep";
+import { stepFromQuery } from "./steps";
 import { StepProgress, type Step } from "./StepRail";
 import { TopBar, type SessionInfo } from "./TopBar";
 import { EASE, FOCUS_RING } from "./ui";
@@ -29,6 +31,7 @@ const BUILT_STEPS: readonly Step[] = [
   "approve",
   "payout",
   "results",
+  "breakit",
 ];
 
 // Private browsing and blocked storage throw on access, and the console works without it.
@@ -72,6 +75,20 @@ export function Console() {
   const [askRequest, setAskRequest] = useState(0);
   const [askOnScreen, setAskOnScreen] = useState(false);
   const signedIn = session !== null;
+  // The step "Back to the demo" returns to. "start" never counts: with a session open there is nothing to go back to there.
+  const lastJourneyStep = useRef<Step>("regulars");
+  // null until the address bar has been read. A ref, not state, because strict mode runs the mount effect twice and
+  // the first run has already cleared the query by the time the second one looks.
+  const openBreakIt = useRef<boolean | null>(null);
+
+  const goTo = useCallback((next: Step) => {
+    setStep(next);
+    saveStep(next);
+  }, []);
+
+  useEffect(() => {
+    if (step !== "breakit" && step !== "start") lastJourneyStep.current = step;
+  }, [step]);
 
   const forgetEverything = useCallback(() => {
     writeSaved(STEP_KEY, null);
@@ -94,6 +111,12 @@ export function Console() {
   );
 
   useEffect(() => {
+    // A link such as /demo?step=break-it asks for Break it. The query goes at once so a reload does not repeat it.
+    if (openBreakIt.current === null) {
+      openBreakIt.current = stepFromQuery(window.location.search) === "breakit";
+      if (openBreakIt.current) window.history.replaceState(null, "", "/demo");
+    }
+
     let current = true;
     api
       .session()
@@ -104,11 +127,16 @@ export function Console() {
           const saved = readSavedStep() ?? "regulars";
           setSession({ expiresAt: answer.expiresAt });
           setCampaignId(campaign);
-          setStep(
-            NEEDS_CAMPAIGN.includes(saved) && campaign === null
-              ? "plan"
-              : saved,
-          );
+          if (openBreakIt.current) {
+            openBreakIt.current = false;
+            goTo("breakit");
+          } else {
+            setStep(
+              NEEDS_CAMPAIGN.includes(saved) && campaign === null
+                ? "plan"
+                : saved,
+            );
+          }
         }
         setChecked(true);
       })
@@ -118,7 +146,7 @@ export function Console() {
     return () => {
       current = false;
     };
-  }, [api]);
+  }, [api, goTo]);
 
   // The Ask Mend shortcut steps aside while the panel (toggle included) is on screen.
   useEffect(() => {
@@ -133,17 +161,14 @@ export function Console() {
     return () => observer.disconnect();
   }, [signedIn]);
 
-  const goTo = useCallback((next: Step) => {
-    setStep(next);
-    saveStep(next);
-  }, []);
-
   const started = useCallback(
     (expiresAt: string) => {
       setNotice(null);
       setSession({ expiresAt });
       forgetEverything();
-      goTo("regulars");
+      const next: Step = openBreakIt.current ? "breakit" : "regulars";
+      openBreakIt.current = false;
+      goTo(next);
     },
     [forgetEverything, goTo],
   );
@@ -207,6 +232,9 @@ export function Console() {
         <ResultsStep api={api} campaignId={campaignId} onNewPlan={newPlan} onOrder={setOrderId} />
       );
     }
+    if (step === "breakit") {
+      return <BreakItStep api={api} campaignId={campaignId} onBack={() => goTo(lastJourneyStep.current)} />;
+    }
     if (step === "plan" || NEEDS_CAMPAIGN.includes(step)) {
       return <PlanStep api={api} onDrafted={drafted} onReview={toApprove} />;
     }
@@ -222,6 +250,7 @@ export function Console() {
           session={session}
           ending={ending}
           onEnd={endSession}
+          onBreakIt={session !== null ? () => goTo("breakit") : undefined}
         />
         <StepProgress step={step} />
 

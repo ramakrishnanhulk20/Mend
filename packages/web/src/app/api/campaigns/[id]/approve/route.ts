@@ -18,13 +18,18 @@ const BODY_STATUS = { not_json: 415, too_large: 413 } as const;
 const BODY = z.strictObject({ presentedHash: z.string().regex(/^[0-9a-f]{64}$/) });
 
 // The engine found no campaign this session may see, or the call was never sent because
-// two were already running: the shared pool's draw bought nothing, so it goes back (C20).
-// Never throws; a draw that cannot be given back only errs towards refusing.
-async function giveBackUnspent(runId: string, session: string): Promise<void> {
+// two were already running: the shared pool's draw bought nothing, so it goes back (C20);
+// the address's share stays spent, so one address cannot probe unknown ids without end.
+// A presented hash that did not match gives back only the address's share: the shared
+// draw stays spent, so refused approvals across every visitor, and their audit rows, stay
+// bounded. Never throws; a draw that cannot be given back only errs towards refusing.
+async function giveBackUnspent(runId: string, session: string, address: string): Promise<void> {
   try {
     const run = await runSettled(runId);
     const code = run.status === "succeeded" && run.result !== undefined && !run.result.ok ? run.result.error : null;
     if (code === "not_found" || code === TOO_MANY_RUNNING) await returnHit(LIMITS.demoApprovals, GLOBAL, { session });
+    // An attempt that moves no money or approves nothing costs the visitor no allowance; the per-session limit still applies.
+    if (code === "hash_mismatch") await returnHit(LIMITS.demoApprovalsAddress, address);
   } catch (error) {
     writeLog({ kind: "api", route: ROUTE, outcome: "hit_not_returned", exception: error instanceof Error ? error.name : "unknown" });
   }
@@ -40,9 +45,11 @@ async function giveBackUnspent(runId: string, session: string): Promise<void> {
  * are held to 10 an hour per client address and 100 an hour across every visitor, the
  * last 20 of them kept for sessions that have not approved this hour (C20). A demo
  * approval the engine answers not_found for, or never runs, gives its draw on the shared
- * pool back. Answers 409 with hash_mismatch when the campaign changed since it was
- * shown, and with recipient_not_member or voided when a recipient left; 202 with a run
- * id this session alone can poll when the engine is slow.
+ * pool back; one it answers hash_mismatch for gives back its draw on the address's share
+ * and keeps its draws on the shared pool and the per-session count. Answers 409 with
+ * hash_mismatch when the campaign changed since it was shown, and with
+ * recipient_not_member or voided when a recipient left; 202 with a run id this session
+ * alone can poll when the engine is slow.
  */
 export async function POST(request: Request, context: { params: Promise<{ id: string }> }): Promise<Response> {
   const ref = randomUUID();
@@ -63,11 +70,12 @@ export async function POST(request: Request, context: { params: Promise<{ id: st
     if (!body.success) return refuse(ROUTE, ref, 400, "invalid_input", { reason: "schema" });
 
     const demo = principal.role === "demo";
+    const address = clientAddress(request.headers);
     const limits: readonly (readonly [Limit, string, Draw])[] = [
       [LIMITS.approve, principal.sessionId, {}],
       ...(demo
         ? ([
-            [LIMITS.demoApprovalsAddress, clientAddress(request.headers), {}],
+            [LIMITS.demoApprovalsAddress, address, {}],
             [LIMITS.demoApprovals, GLOBAL, { session: principal.sessionId }],
           ] as const)
         : []),
@@ -79,7 +87,7 @@ export async function POST(request: Request, context: { params: Promise<{ id: st
 
     const actor = { role: principal.role, session: principal.sessionId };
     const runId = await runTask(TASK, [id, actor, body.data.presentedHash]);
-    const givenBack = demo ? giveBackUnspent(runId, principal.sessionId) : Promise.resolve();
+    const givenBack = demo ? giveBackUnspent(runId, principal.sessionId, address) : Promise.resolve();
     if (prefersAsync(request)) return await pendingResponse(ROUTE, ref, TASK, runId, principal.sessionId);
     const waited = await waitForRun(runId, WAIT_MS);
     // A finished run's draw is settled before the answer, so a retry finds the pool as it is.

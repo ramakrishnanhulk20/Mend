@@ -6,8 +6,10 @@
 // write, each client address's share of demo sessions, demo approvals, demo submits and
 // simulates, the owner's simulates drawing on no pool demo visitors share, approve and
 // simulate checking their input before any shared pool and giving its hit back on
-// not_found, a session's campaign views (60 an hour, 2 at a time), and the auditors'
-// junk-approval repro. Sessions live in a throwaway Postgres schema; the engine is a
+// not_found, a wrong-fingerprint approval and a submit that sent nothing giving the
+// address's own share back while the session's count keeps them (and the approval's
+// shared draw stays spent), a submit to a malformed id counted nowhere, a session's
+// campaign views (60 an hour, 2 at a time), and the auditors' junk-approval repro. Sessions live in a throwaway Postgres schema; the engine is a
 // fake dev bridge on 127.0.0.1.
 // Does NOT cover: the real engine or PayPal (npm run prove:m7b drives the M7b routes
 // against both; which campaigns a cancel may touch is the engine's own tests), Next.js
@@ -759,17 +761,17 @@ describe("each client address's share", () => {
   });
 });
 
+async function rows(bucket: string, subject?: string): Promise<number> {
+  const { rows: found } = await admin.query<{ n: number }>(
+    "select count(*)::int as n from rate_limit_hits where bucket = $1 and ($2::text is null or subject = $2)",
+    [bucket, subject ?? null],
+  );
+  return found[0].n;
+}
+
 describe("the shared demo pools", () => {
   const UNKNOWN = "11111111-2222-4333-8444-555555555555";
   const POOLS = ["demo_approvals_all", "demo_approvals_address", "simulates_all", "simulate_address"];
-
-  async function rows(bucket: string, subject?: string): Promise<number> {
-    const { rows: found } = await admin.query<{ n: number }>(
-      "select count(*)::int as n from rate_limit_hits where bucket = $1 and ($2::text is null or subject = $2)",
-      [bucket, subject ?? null],
-    );
-    return found[0].n;
-  }
 
   beforeEach(async () => {
     await admin.query("delete from rate_limit_hits where bucket = any($1)", [POOLS]);
@@ -831,6 +833,68 @@ describe("the shared demo pools", () => {
     expect(await rows("simulates_all", demo.sessionId)).toBe(0);
     // Each address's own share stays spent, so one address cannot ask the engine about unknown ids without end.
     expect([await rows("demo_approvals_address", "198.51.100.51"), await rows("simulate_address", "198.51.100.51")]).toEqual([2, 1]);
+  });
+});
+
+describe("an attempt that approves or sends nothing", () => {
+  it("gives back a wrong-fingerprint approval's address draw, also after a 202, and keeps its shared and session draws", async () => {
+    const { POST } = await import("./campaigns/[id]/approve/route");
+    bridge.overrides.approve_campaign = { ok: false, error: "hash_mismatch", ref: ENGINE_REF };
+    const demo = await createSession("demo");
+    const options = { session: demo, address: "198.51.100.60", body: { presentedHash: HASH } };
+    const counts = async () => [await rows("approve", demo.sessionId), await rows("demo_approvals_address", "198.51.100.60"), await rows("demo_approvals_all", demo.sessionId)];
+    const refused = await POST(request("POST", "/x", options), params({ id: CAMPAIGN }));
+    expect(refused.status).toBe(409);
+    expect(await json(refused)).toEqual({ error: "hash_mismatch", message: expect.any(String), ref: ENGINE_REF });
+    expect(await counts()).toEqual([1, 0, 1]);
+
+    bridge.delayMs = 300;
+    const started = await POST(request("POST", "/x", { ...options, prefer: "respond-async" }), params({ id: CAMPAIGN }));
+    expect(started.status).toBe(202);
+    expect(await counts()).toEqual([2, 1, 2]);
+    await vi.waitFor(async () => expect(await counts()).toEqual([2, 0, 2]), { timeout: 3_000 });
+  });
+
+  it("refuses a demo submit to an id of the wrong shape before any count is taken or the engine is asked", async () => {
+    const { POST } = await import("./campaigns/[id]/submit/route");
+    const demo = await createSession("demo");
+    const refused = await POST(request("POST", "/x", { session: demo, address: "198.51.100.67" }), params({ id: "not-a-uuid" }));
+    expect(refused.status).toBe(404);
+    expect(await json(refused)).toMatchObject({ error: "not_found" });
+    expect([await rows("submit", demo.sessionId), await rows("demo_submits_address", "198.51.100.67")]).toEqual([0, 0]);
+    expect(bridge.seen).toEqual([]);
+  });
+
+  it("gives back a demo submit's daily address draw when the engine answers sent false, also after a 202, and still counts it for the session", async () => {
+    const { POST } = await import("./campaigns/[id]/submit/route");
+    bridge.overrides.submit_campaign = { ok: true, campaign_id: CAMPAIGN, status: "draft", sent: false, payout_batch_id: null };
+    const demo = await createSession("demo");
+    const options = { session: demo, address: "198.51.100.61" };
+    const counts = async () => [await rows("submit", demo.sessionId), await rows("demo_submits_address", "198.51.100.61")];
+    const answered = await POST(request("POST", "/x", options), params({ id: CAMPAIGN }));
+    expect(answered.status).toBe(200);
+    expect(await json(answered)).toEqual({ campaignId: CAMPAIGN, status: "draft", sent: false, payoutBatchId: null });
+    expect(await counts()).toEqual([1, 0]);
+
+    bridge.delayMs = 300;
+    const started = await POST(request("POST", "/x", { ...options, prefer: "respond-async" }), params({ id: CAMPAIGN }));
+    expect(started.status).toBe(202);
+    expect(await counts()).toEqual([2, 1]);
+    await vi.waitFor(async () => expect(await counts()).toEqual([2, 0]), { timeout: 3_000 });
+  });
+
+  it.each([
+    ["sent true", ANSWERS.submit_campaign, 200, "198.51.100.62"],
+    ["a not_found refusal", { ok: false, error: "not_found", ref: ENGINE_REF }, 404, "198.51.100.63"],
+    ["a limit_reached refusal", { ok: false, error: "limit_reached", ref: ENGINE_REF }, 429, "198.51.100.64"],
+    ["a busy refusal", { ok: false, error: "busy", ref: ENGINE_REF }, 503, "198.51.100.65"],
+    ["sent false in an answer that breaks its schema", { ok: true, sent: false }, 500, "198.51.100.66"],
+  ])("keeps both of a demo submit's draws when the engine answers %s", async (_label, answer, status, address) => {
+    const { POST } = await import("./campaigns/[id]/submit/route");
+    bridge.overrides.submit_campaign = answer;
+    const demo = await createSession("demo");
+    expect((await POST(request("POST", "/x", { session: demo, address }), params({ id: CAMPAIGN }))).status).toBe(status);
+    expect([await rows("submit", demo.sessionId), await rows("demo_submits_address", address)]).toEqual([1, 1]);
   });
 });
 

@@ -241,9 +241,12 @@ export function Guardrails() {
         ))}
       </div>
 
+      <p className="mt-14 max-w-[52ch] text-[16px] leading-[1.55] text-bone-dim">
+        Every rule above can be tested from your browser, against the live app.
+      </p>
       <a
         href="/demo?step=break-it"
-        className={`group/link mt-14 inline-flex items-center gap-3 font-mono text-[12px] uppercase tracking-[0.14em] text-bone-dim transition-colors duration-150 ease-out hover:text-bone ${FOCUS_RING}`}
+        className={`group/link mt-3 inline-flex items-center gap-3 font-mono text-[12px] uppercase tracking-[0.14em] text-bone-dim transition-colors duration-150 ease-out hover:text-bone ${FOCUS_RING}`}
       >
         <svg width="10" height="10" viewBox="0 0 10 10" fill="none" aria-hidden="true" className="shrink-0">
           <path d="M1.5 1.5l7 7M8.5 1.5l-7 7" className="stroke-accent" strokeWidth="1.5" strokeLinecap="round" />

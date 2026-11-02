@@ -21,6 +21,7 @@ The bar for every important finding was the same: fix it, prove the fix with a t
 | 27 Oct 2026 | Audit by three fresh reviewers: 16 important findings, 15 distinct |
 | 28 Oct 2026 | Audit closed: every finding fixed and proven, live proof 18 of 18 |
 | 29 Oct 2026 | Live proof 19 of 19, with the read-only PayPal keys check added |
+| 2 Nov 2026 | Finishing review: 2 important findings, both fixed (a removed demo stand-in now keeps its label on past campaign rows; the published numbers refreshed); live proof 19 of 19 |
 
 ## Round 1, 26 Oct
 
@@ -87,4 +88,4 @@ The same day, a cancel that PayPal failed on one item answered with a bare error
 
 ## Proof after the fixes
 
-The live proof on 29 Oct 2026, against commit `bdb4139`, passed 19 of 19. It includes the forgery check (an altered copy of a real delivery refused), the database role check (both service roles refused schema and audit log changes), the read-only keys check (PayPal answers 403 to the assistant's token on Payouts) and a secrets sweep across 225 answers and 612 log lines. Later the same day, after the names on rows and the join pages, the engine's tests gave 937 passed and 1 skipped, and the web app's 1166 passed.
+The live proof on 2 Nov 2026, against commit `3cbc985`, passed 19 of 19. It includes the forgery check (an altered copy of a real delivery refused), the database role check (both service roles refused schema and audit log changes), the read-only keys check (PayPal answers 403 to the assistant's token on Payouts) and a secrets sweep across 225 answers and 652 log lines. The same day the engine's tests gave 980 passed and 1 skipped, and the web app's 1216 passed.

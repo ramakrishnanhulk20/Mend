@@ -300,6 +300,7 @@ def test_a_hash_that_is_not_the_one_shown_is_refused_even_after_a_small_edit(con
         with pytest.raises(ApprovalRefused) as refused:
             approve(conn, campaign_id, approver="owner", presented_hash=presented, config=CONFIG)
         assert refused.value.reason == "hash_mismatch"
+    assert audit(conn, "approval_refused") == [{"campaign_id": str(campaign_id), "reason": "hash_mismatch"}] * 2
     approve(conn, campaign_id, approver="owner", presented_hash=review_hash(conn, campaign_id), config=CONFIG)
     with pytest.raises(ApprovalRefused) as refused:
         approve(conn, campaign_id, approver="owner", presented_hash=review_hash(conn, campaign_id), config=CONFIG)

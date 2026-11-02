@@ -27,7 +27,7 @@ from mend_engine.campaigns.drafts import (
     draft_view,
     reward_amounts,
 )
-from mend_engine.campaigns.eligibility import Candidate, quiet_regular_members
+from mend_engine.campaigns.eligibility import Candidate, quiet_regular_members, worth_a_nudge_refs
 from mend_engine.campaigns.scoring import ScoreSet, score_customers
 from mend_engine.config import SANDBOX_API_HOST, Config
 from mend_engine.db.connect import PGDATA
@@ -163,6 +163,23 @@ def test_a_draft_stores_ranked_refs_a_fixed_holdout_and_amounts_under_every_cap(
     assert stored_rows(conn, result.campaign_id) == rows
     second_holdout = {r[1] for r in stored_rows(conn, second.campaign_id) if r[2] == "holdout"}
     assert second_holdout != {r[1] for r in holdout}
+
+
+def test_every_row_records_whether_its_member_was_a_demo_stand_in_when_drafted(conn: psycopg.Connection) -> None:
+    paid = seed_shop(conn)
+    top = worth_a_nudge_refs(score_customers(conn, AS_OF))[0]
+    stand_in = join_member(
+        conn, paypal_email=top.lower() + "@shop.example", paypal_payer_id=None, email_verified=True,
+        shop_name=DEMO_SHOP_NAME, client_id="cid", actor="seed_demo",
+    )
+    people = join(conn, sorted(set(paid) - {top}))
+
+    result = build_draft(conn, CONFIG, SETTINGS)
+
+    flags = dict(conn.execute("select member_id, stand_in from campaign_members where campaign_id = %s", (result.campaign_id,)))
+    assert len(flags) == 20 and flags.pop(stand_in) is True
+    # The 19 people who joined through Log in with PayPal, in both arms, are recorded as not stand-ins.
+    assert set(flags) <= set(people) and set(flags.values()) == {False}
 
 
 def test_the_holdout_is_drawn_before_any_amount_note_or_row_exists(

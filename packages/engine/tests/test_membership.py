@@ -285,6 +285,24 @@ def test_leaving_voids_unsent_campaigns_and_keeps_sent_ones_with_no_member(conn:
     assert match_member_to_customer(conn, leaver) is None
 
 
+def test_a_sent_row_keeps_whether_its_member_was_a_stand_in_after_they_leave(conn: psycopg.Connection) -> None:
+    person = join(conn, "person@shop.example")
+    recorded = join(conn, "c8@shop.example", actor="seed_demo")
+    unrecorded = join(conn, "c9@shop.example", actor="seed_demo")
+    sent = campaign(conn, "draft", person, recorded, unrecorded)
+    # R2 recorded its flag when drafted; R1 and R3 are like rows drafted before the flag existed.
+    conn.execute("update campaign_members set stand_in = true where member_id = %s", (recorded,))
+    for step in ROUTE_FROM_DRAFT["submitted"]:
+        conn.execute("update campaigns set status = %s where campaign_id = %s", (step, sent))
+
+    for member_id in (person, recorded, unrecorded):
+        assert leave_member(conn, member_id).removed
+
+    rows = conn.execute("select ref, member_id, stand_in from campaign_members where campaign_id = %s order by ref", (sent,)).fetchall()
+    assert rows == [("R1", None, False), ("R2", None, True), ("R3", None, True)]
+    assert conn.execute("select count(*) from members").fetchone()[0] == 0
+
+
 def test_the_leave_audit_row_holds_only_the_member_id(conn: psycopg.Connection) -> None:
     leaver = join(conn, "leaver@shop.example", "PAYERLEAVE")
     voided = campaign(conn, "draft", leaver)

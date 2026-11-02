@@ -173,9 +173,12 @@ begin
     $fn$;
 
     -- A campaign's rows may change while it is a draft, awaiting approval or voided.
-    -- From approval on they are frozen. The one change allowed after a batch was
-    -- sent is the foreign key emptying member_id when a member leaves, so the record
-    -- of what was sent survives (C28). Before that, leaving voids the campaign first.
+    -- From approval on they are frozen, with two exceptions. In any status, a row whose
+    -- stand_in was never recorded may record it once, nothing else changing, so the
+    -- migration can fill rows drafted before the column (C23). After a batch was sent,
+    -- member_id may empty when a member leaves, so the record of what was sent
+    -- survives (C28), and that same change may record a missing stand_in. Before
+    -- that, leaving voids the campaign first. A recorded stand_in never changes.
     create or replace function mend_campaign_rows_frozen() returns trigger
     language plpgsql as $fn$
     declare
@@ -184,7 +187,17 @@ begin
     begin
         if tg_op = 'TRUNCATE' then
             raise exception 'campaign_members: truncate refused, it would erase approved and sent campaigns';
-        elsif tg_op = 'INSERT' then
+        end if;
+        -- Checked before the status refusals below, so it holds whatever the status.
+        if tg_op = 'UPDATE' then
+            if old.stand_in is null and new.stand_in is not null
+               and (new.campaign_id, new.ref, new.role, new.rank, new.score, new.amount_minor, new.note, new.member_id)
+                   is not distinct from
+                   (old.campaign_id, old.ref, old.role, old.rank, old.score, old.amount_minor, old.note, old.member_id) then
+                return new;
+            end if;
+        end if;
+        if tg_op = 'INSERT' then
             involved := array[new.campaign_id];
         elsif tg_op = 'DELETE' then
             involved := array[old.campaign_id];
@@ -203,7 +216,8 @@ begin
             if tg_op = 'UPDATE' and old.member_id is not null and new.member_id is null
                and (new.campaign_id, new.ref, new.role, new.rank, new.score, new.amount_minor, new.note)
                    is not distinct from
-                   (old.campaign_id, old.ref, old.role, old.rank, old.score, old.amount_minor, old.note) then
+                   (old.campaign_id, old.ref, old.role, old.rank, old.score, old.amount_minor, old.note)
+               and (old.stand_in is null or new.stand_in is not distinct from old.stand_in) then
                 return new;
             end if;
             raise exception 'campaign_members: % refused, the campaign has been sent and its rows are frozen', lower(tg_op);
@@ -452,3 +466,8 @@ create table if not exists claude_usage (
     output_tokens bigint not null default 0,
     primary key (day, subject)
 );
+
+-- Whether the row's member was a demo stand-in when drafted (C23); null means not recorded (a row drafted before 2 Nov whose member was already gone).
+alter table campaign_members add column if not exists stand_in boolean;
+-- Records it on rows from before the column whose member is still here; a no-op once done.
+update campaign_members cm set stand_in = (m.source = 'seed') from members m where m.member_id = cm.member_id and cm.stand_in is null;

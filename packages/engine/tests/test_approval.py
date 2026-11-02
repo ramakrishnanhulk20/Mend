@@ -86,7 +86,10 @@ def members(conn: psycopg.Connection, count: int = 3, paid: int = 1000) -> list[
 
 
 def draft(conn: psycopg.Connection, ids: list[uuid.UUID], amounts: list[int], budget: int = 1000) -> uuid.UUID:
-    """A draft paying amounts to the first members in ids and holding the last one back."""
+    """A draft paying amounts to the first members in ids and holding the last one back.
+
+    Each row records stand_in false, as build_draft does for members who joined through Log in with PayPal.
+    """
     campaign_id = conn.execute(
         "insert into campaigns (shop_name, goal_text, as_of, budget_minor, per_recipient_minor, holdout_share, status) "
         "values (%s, 'goal', '2026-10-16', %s, 300, 0.5, 'draft') returning campaign_id",
@@ -95,7 +98,7 @@ def draft(conn: psycopg.Connection, ids: list[uuid.UUID], amounts: list[int], bu
     for rank, member_id in enumerate(ids, start=1):
         paid = rank <= len(amounts)
         conn.execute(
-            "insert into campaign_members values (%s, %s, %s, %s, %s, 0.1, %s, %s)",
+            "insert into campaign_members values (%s, %s, %s, %s, %s, 0.1, %s, %s, false)",
             (campaign_id, f"R{rank}", member_id, "reward" if paid else "holdout", rank,
              amounts[rank - 1] if paid else None, NOTE if paid else None),
         )

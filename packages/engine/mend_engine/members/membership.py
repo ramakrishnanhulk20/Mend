@@ -200,8 +200,12 @@ def leave_member(conn: psycopg.Connection, member_id: uuid.UUID) -> LeaveResult:
     Voids every campaign in draft, awaiting_approval or approved that includes the
     member (status voided, void_reason "a member left") and removes the member's
     rows from those campaigns. Deletes the member row; rows in campaigns already
-    past approval keep their place with member_id set to null. Writes one audit_log
-    row holding only the member id, and one per voided campaign.
+    past approval keep their place with member_id set to null. Before a row loses
+    its member_id it records stand_in, whether the member is a demo stand-in
+    (members.source 'seed'), in the same update that empties member_id, unless the
+    row recorded it already, so a stand-in's row never reads as a person who joined
+    (C23). Writes one audit_log row holding only the member id, and one per voided
+    campaign.
 
     Leaving twice is harmless: the second call returns removed=False. Raises
     ValueError if member_id is not a uuid.UUID.
@@ -226,7 +230,8 @@ def _remove(conn: psycopg.Connection, member_id: uuid.UUID, reason: str) -> tupl
     """Void every unsent campaign holding a member already locked by the caller, then delete the member.
 
     Runs inside the caller's transaction and writes no audit row. Rows in campaigns
-    already past approval keep their place with member_id set to null by the foreign key.
+    already past approval keep their place: one update empties their member_id and
+    records a missing stand_in from the member's source, as leave_member says.
     """
     voided = tuple(
         row[0]
@@ -239,6 +244,13 @@ def _remove(conn: psycopg.Connection, member_id: uuid.UUID, reason: str) -> tupl
         )
     )
     conn.execute("delete from campaign_members where member_id = %s and campaign_id = any(%s)", (member_id, list(voided)))
+    # Done here, not by the foreign key's set null, which would empty member_id with the
+    # stand-in flag unrecorded; the frozen-rows guard allows exactly this one change on a sent row.
+    conn.execute(
+        "update campaign_members cm set stand_in = coalesce(cm.stand_in, m.source = %s), member_id = null "
+        "from members m where m.member_id = cm.member_id and cm.member_id = %s",
+        (SOURCE_SEED, member_id),
+    )
     conn.execute("delete from members where member_id = %s", (member_id,))
     return voided
 

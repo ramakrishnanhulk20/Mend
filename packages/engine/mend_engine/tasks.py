@@ -65,7 +65,15 @@ from mend_engine.campaigns.eligibility import (
     worth_a_nudge_refs,
 )
 from mend_engine.campaigns.reconcile import reconcile as reconcile_campaigns
-from mend_engine.campaigns.results import ArmResults, PayoutStanding, RowStanding, campaign_results, display_names, stand_in_refs
+from mend_engine.campaigns.results import (
+    ArmResults,
+    PayoutStanding,
+    RowStanding,
+    campaign_results,
+    display_names,
+    on_list_refs,
+    stand_in_refs,
+)
 from mend_engine.campaigns.scoring import SHOP_ZONE, ScoreSet, score_customers
 from mend_engine.campaigns import spend
 from mend_engine.campaigns.spend import (
@@ -302,11 +310,14 @@ def draft_campaign(settings: object, actor: object) -> dict:
 def view_campaign(campaign_id: object, actor: object) -> dict:
     """The campaign as its creator (or the owner) may see it: settings, rows and the hash to approve.
 
-    Rows carry ref, role, rank, amount_minor, note, display_name and stand_in only:
-    no email, member id or customer ref (C12, C15). display_name is the shop's
+    Rows carry ref, role, rank, amount_minor, note, display_name, stand_in and on_list
+    only: no email, member id or customer ref (C12, C15). display_name is the shop's
     synthetic name for the row's customer, the one quiet_regulars shows, or None once
-    its member left (results.display_names). stand_in is True for a row whose member the
-    demo seed script joined (results.stand_in_refs). review_hash is the hash
+    its member left (results.display_names). stand_in is True for a row recorded as a
+    demo stand-in when it was drafted, still True after its member left
+    (results.stand_in_refs). on_list is True while the row still has its member, false
+    once the row's member left or was removed, and it never says who
+    (results.on_list_refs). review_hash is the hash
     approve_campaign needs back, or None when the campaign is not open or cannot be
     approved as it stands (review_problem then names the fixed reason).
     """
@@ -319,8 +330,12 @@ def view_campaign(campaign_id: object, actor: object) -> dict:
             (cid,),
         ).fetchone()
         stand_ins = stand_in_refs(conn, cid)
+        on_list = on_list_refs(conn, cid)
         names = display_names(conn, cid)
-        rows = [{**row, "display_name": names.get(row["ref"]), "stand_in": row["ref"] in stand_ins} for row in draft_view(conn, cid)]
+        rows = [
+            {**row, "display_name": names.get(row["ref"]), "stand_in": row["ref"] in stand_ins, "on_list": row["ref"] in on_list}
+            for row in draft_view(conn, cid)
+        ]
         hash_shown: str | None = None
         problem: str | None = None
         if status in OPEN_STATUSES:
@@ -458,10 +473,12 @@ def results(campaign_id: object, actor: object) -> dict:
     pending_minor and unclaimed_return_by (UTC ISO 8601 text, or None). rows holds
     every rewarded and held-back row in rank order (campaigns.results.RowStanding):
     ref, role, rank, display_name (the shop's synthetic name for the customer, as
-    quiet_regulars shows it, or None once the row's member left), stand_in,
-    payout_status, simulated_return and real_return, read from Mend's ledger and
-    records with no PayPal call, and never an email, member id, customer ref, payer
-    id, payout item id or receiver (C12, C15).
+    quiet_regulars shows it, or None once the row's member left), stand_in (recorded
+    when the row was drafted and kept after its member left), on_list (true while the
+    row still has its member, false once the row's member left or was removed, and it
+    never says who), payout_status, simulated_return and real_return, read from
+    Mend's ledger and records with no PayPal call, and never an email, member id,
+    customer ref, payer id, payout item id or receiver (C12, C15).
     """
 
     def work(config: Config, conn: psycopg.Connection) -> dict:
@@ -590,10 +607,11 @@ def quiet_regulars(actor: object, limit: object) -> dict:
     purchase_days, days_silent, score (expected purchases over the next 13 weeks,
     rounded to 4 places), paid_net_minor (paid to as_of net of refunds, USD cents),
     member (a verified member's email matches, so they could be thanked) and stand_in
-    (that member is a demo stand-in the seed script joined, members.source 'seed',
-    the rule results.stand_in_refs uses; always False when member is False), so a
-    stand-in is never shown as a person who joined (C23). Never an email, member id
-    or customer ref (C12, C15).
+    (that member is a demo stand-in the seed script joined, read live from
+    members.source 'seed', the value build_draft copies onto each campaign row's
+    stand_in flag, which results.stand_in_refs reads from the row alone; always False
+    when member is False), so a stand-in is never shown as a person who joined (C23).
+    Never an email, member id or customer ref (C12, C15).
 
     total counts every quiet regular by the campaign rule, shown or not, the same
     count shop_summary gives as quiet_regulars. worth_a_nudge counts those whose score
@@ -1273,8 +1291,10 @@ def _paid_in_last_year(conn: psycopg.Connection, as_of: date, refs: list[str]) -
 def _member_refs(conn: psycopg.Connection) -> dict[str, bool]:
     """Customer refs a verified member on an accepted consent wording is matched to, by the one email normaliser, as eligibility matches them.
 
-    Each ref maps to whether its member is a demo stand-in (members.source 'seed',
-    results.stand_in_refs' rule).
+    Each ref maps to whether its member is a demo stand-in, read live from
+    members.source 'seed'. That is the value build_draft copies onto a campaign row's
+    stand_in flag; results.stand_in_refs reads the flag from the row, so a past row
+    keeps it after the member leaves.
     """
     refs = customer_refs_by_email(conn)
     matched: dict[str, bool] = {}
@@ -1319,6 +1339,7 @@ def _row(row: RowStanding) -> dict:
         "rank": row.rank,
         "display_name": row.display_name,
         "stand_in": row.stand_in,
+        "on_list": row.on_list,
         "payout_status": row.payout_status,
         "simulated_return": row.simulated_return,
         "real_return": row.real_return,

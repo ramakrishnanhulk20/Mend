@@ -4,6 +4,7 @@
 # two seeds running at once against one database are not exercised.
 import json
 import random
+import secrets
 import uuid
 from collections.abc import Iterator
 from dataclasses import replace
@@ -17,7 +18,7 @@ import pytest
 from psycopg import sql
 from psycopg.types.json import Jsonb
 
-from mend_engine import prove_m4a, seed_demo, store_facts
+from mend_engine import prove_m4a, seed_demo, store_facts, tasks
 from mend_engine.campaigns.eligibility import (
     LIKELY_BACK,
     LIKELY_BACK_FROM,
@@ -207,6 +208,13 @@ def seed_up_to_the_receiver(conn: psycopg.Connection, config: Config):
     return scores
 
 
+def owner_actor(conn: psycopg.Connection) -> dict:
+    """A live owner session, as the console's sign-in records one."""
+    session = secrets.token_hex(32)
+    conn.execute("insert into sessions (session_id, role, expires_at) values (%s, 'owner', now() + interval '1 day')", (session,))
+    return {"role": "owner", "session": session}
+
+
 def audit_rows(conn: psycopg.Connection) -> int:
     return conn.execute("select count(*) from audit_log").fetchone()[0]
 
@@ -352,7 +360,7 @@ def test_moving_first_is_refused_and_changes_nothing_when_a_member_matches_rank_
 
 
 def test_a_database_seeded_under_the_most_at_risk_rule_is_repaired_by_seeding_again(
-    seeded: tuple, capsys: pytest.CaptureFixture[str]
+    seeded: tuple, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
 ) -> None:
     conn, config, stand = seeded
     assert seed_demo.run(config) is True
@@ -391,6 +399,12 @@ def test_a_database_seeded_under_the_most_at_risk_rule_is_repaired_by_seeding_ag
         (sent,),
     ).fetchall()
     assert kept == [("submitted", "R1", None, 100)]
+    # The sent row's stand-in left, and the row still says stand-in, not a person who joined (C23).
+    monkeypatch.setattr(tasks, "_load_config", lambda: config)
+    owner = owner_actor(conn)
+    view, found = tasks.view_campaign(str(sent), owner), tasks.results(str(sent), owner)
+    assert [(row["ref"], row["stand_in"], row["on_list"]) for row in view["rows"]] == [("R1", True, False)]
+    assert [(row["ref"], row["stand_in"], row["on_list"]) for row in found["rows"]] == [("R1", True, False)]
     stand_ins = [email for (email,) in conn.execute("select paypal_email from members where source = 'seed' and member_id <> %s", (receiver,))]
     assert sorted(stand_ins) == sorted(synthetic_email(ref) for ref in group[1:41])
     assert conn.execute("select count(*) from members").fetchone()[0] == 41

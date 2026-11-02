@@ -180,14 +180,26 @@ def worth_a_nudge_refs(scores: ScoreSet) -> list[str]:
     """
     if not scores.converged:
         raise ValueError("the model did not converge, so nobody can be ranked")
-    worth = [
-        ref
-        for ref, score in scores.scores.items()
-        if scores.purchase_days[ref] >= REGULAR_MIN_DAYS
+    worth = [ref for ref in scores.scores if _quiet_regular_worth_a_nudge(scores, ref)]
+    return sorted(worth, key=lambda ref: _spend_order(scores, ref))
+
+
+def _quiet_regular_worth_a_nudge(scores: ScoreSet, ref: str) -> bool:
+    """The one rule for who a nudge is for: scored, bought on 3 or more days, silent 60 or more days, and forecast_group WORTH_A_NUDGE.
+
+    A ref with no score is False. A score forecast_group refuses raises ValueError.
+    """
+    return (
+        ref in scores.scores
+        and scores.purchase_days[ref] >= REGULAR_MIN_DAYS
         and scores.days_silent[ref] >= SILENT_MIN_DAYS
-        and forecast_group(score) == WORTH_A_NUDGE
-    ]
-    return sorted(worth, key=lambda ref: nudge_order(scores.paid_minor[ref], ref))
+        and forecast_group(scores.scores[ref]) == WORTH_A_NUDGE
+    )
+
+
+def _spend_order(scores: ScoreSet, ref: str) -> tuple[int, str]:
+    """nudge_order on what ref paid to as_of net of refunds (scores.paid_minor), so the list and the draft rank alike."""
+    return nudge_order(scores.paid_minor[ref], ref)
 
 
 def quiet_regular_members(
@@ -232,11 +244,7 @@ def quiet_regular_members(
         if member_id in held:
             continue
         ref = refs.get(normalise_email(email))
-        if ref is None or ref not in scores.scores:
-            continue
-        if scores.purchase_days[ref] < REGULAR_MIN_DAYS or scores.days_silent[ref] < SILENT_MIN_DAYS:
-            continue
-        if forecast_group(scores.scores[ref]) != WORTH_A_NUDGE:
+        if ref is None or not _quiet_regular_worth_a_nudge(scores, ref):
             continue
         regulars.append((member_id, normalise_email(email), ref))
     paid = net_of_later_refunds(conn, scores, [ref for _member_id, _email, ref in regulars])
@@ -247,7 +255,8 @@ def quiet_regular_members(
         if room < 1:
             continue
         candidates.append(Candidate(member_id, ref, scores.scores[ref], room))
-    candidates.sort(key=lambda c: nudge_order(scores.paid_minor.get(c.customer_ref, 0), c.customer_ref))
+    # Every candidate here has room >= 1, so its ref is in scores.paid_minor (net_of_later_refunds counts a missing one as 0).
+    candidates.sort(key=lambda c: _spend_order(scores, c.customer_ref))
     return candidates
 
 

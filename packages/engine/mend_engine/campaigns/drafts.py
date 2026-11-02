@@ -25,6 +25,7 @@ from mend_engine.campaigns.scoring import score_customers
 from mend_engine.campaigns.spend import CapExceeded, check_daily_cap, database_now
 from mend_engine.config import Config
 from mend_engine.members.consent import DEMO_SHOP_NAME, consent_text_for
+from mend_engine.members.membership import SOURCE_SEED
 from mend_engine.money import MoneyError, to_decimal_string
 
 # The note rule validate_snapshot applies to every payout note, so a note accepted
@@ -43,8 +44,8 @@ _INSERT_CAMPAIGN = (
     "values (%s, %s, %s, %s, %s, %s, 'draft') returning campaign_id"
 )
 _INSERT_ROW = (
-    "insert into campaign_members (campaign_id, ref, member_id, role, rank, score, amount_minor, note) "
-    "values (%s, %s, %s, %s, %s, %s, %s, %s)"
+    "insert into campaign_members (campaign_id, ref, member_id, role, rank, score, amount_minor, note, stand_in) "
+    "values (%s, %s, %s, %s, %s, %s, %s, %s, %s)"
 )
 _INSERT_AUDIT = "insert into audit_log (actor, action, detail) values (%s, %s, %s)"
 
@@ -122,7 +123,9 @@ def build_draft(
     reward_amounts() and the code-owned thank-you note, and writes the campaign
     (status 'draft'), one row per candidate with refs "R1", "R2", ... in rank order,
     and one audit_log row, all in one transaction. Holdout rows carry no amount and
-    no note.
+    no note. Every row, reward and holdout, records stand_in: whether its member is a
+    demo stand-in (members.source 'seed') as the row is written, kept on the row so it
+    survives the member leaving (C23).
 
     Raises DraftRefused, with nothing stored, for: a budget above
     config.campaign_cap_minor; a per-recipient amount above config.item_cap_minor;
@@ -175,10 +178,13 @@ def build_draft(
         # Key-share locks hold every member row in place until this commits. A
         # member who left after the list was read is missing here, so the draft is
         # refused rather than stored with someone who withdrew consent (C28).
-        present = conn.execute(
-            "select member_id from members where member_id = any(%s) for key share", (member_ids,)
-        ).fetchall()
-        if len(present) != len(member_ids):
+        stand_in = dict(
+            conn.execute(
+                "select member_id, source = %s from members where member_id = any(%s) for key share",
+                (SOURCE_SEED, member_ids),
+            ).fetchall()
+        )
+        if len(stand_in) != len(member_ids):
             raise DraftRefused("member_left", "a member left while the draft was being built; build it again")
         campaign_id = conn.execute(
             _INSERT_CAMPAIGN,
@@ -192,7 +198,7 @@ def build_draft(
             ),
         ).fetchone()[0]
         with conn.cursor() as cur:
-            cur.executemany(_INSERT_ROW, [(campaign_id, *row) for row in rows])
+            cur.executemany(_INSERT_ROW, [(campaign_id, *row, stand_in[row[1]]) for row in rows])
         conn.execute(
             _INSERT_AUDIT,
             (

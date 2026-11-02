@@ -35,7 +35,7 @@ from mend_engine.campaigns.approval import frozen_snapshot
 from mend_engine.campaigns.attribution import attribution_window
 from mend_engine.campaigns.spend import database_now
 from mend_engine.events.payout_status import UNREADABLE, effective
-from mend_engine.members.membership import SOURCE_SEED, customer_refs_by_email
+from mend_engine.members.membership import customer_refs_by_email
 from mend_engine.paypal.payouts import BatchSnapshot, normalise_email
 
 MIN_PER_ARM = 30
@@ -103,9 +103,10 @@ class RowStanding:
     it; None for a held-back row, whatever the ledger holds under its ref, and for a
     reward with no item in the ledger yet; UNKNOWN, the ledger's word for a status it
     cannot read, for an item stored twice or under a status that is not 1 to 32
-    capital letters and underscores. stand_in is stand_in_refs' rule. simulated_return
-    and real_return say whether a simulated or a real purchase is attributed to the
-    row, kept apart as in ArmResults.
+    capital letters and underscores. stand_in is stand_in_refs' rule. on_list is
+    on_list_refs' rule: False once the row's member left or was removed, and it never
+    says who. simulated_return and real_return say whether a simulated or a real
+    purchase is attributed to the row, kept apart as in ArmResults.
     """
 
     ref: str
@@ -113,6 +114,7 @@ class RowStanding:
     rank: int
     display_name: str | None
     stand_in: bool
+    on_list: bool
     payout_status: str | None
     simulated_return: bool
     real_return: bool
@@ -221,17 +223,29 @@ def campaign_results(conn: psycopg.Connection, campaign_id: uuid.UUID) -> Campai
 
 
 def stand_in_refs(conn: psycopg.Connection, campaign_id: uuid.UUID) -> frozenset[str]:
-    """Refs of the campaign's rows whose member the demo seed script joined (members.source 'seed'), whom no person agreed to be.
+    """Refs of the campaign's rows recorded as a demo stand-in (campaign_members.stand_in true), whom no person agreed to be.
 
-    A row whose member left has no member and is not one of them: only people who
-    joined can leave, never a stand-in (tasks.leave).
+    The flag is written on the row when it is drafted, from members.source 'seed',
+    and kept when its member leaves or is removed, so a stand-in stays a stand-in on
+    every past row (C23). It is read from the row alone, never from members, and says
+    only "stand-in or not", never who (C28). A row whose flag was never recorded (null:
+    drafted before 2 Nov, its member already gone) is not counted.
+    """
+    return frozenset(
+        ref for (ref,) in conn.execute("select ref from campaign_members where campaign_id = %s and stand_in", (campaign_id,))
+    )
+
+
+def on_list_refs(conn: psycopg.Connection, campaign_id: uuid.UUID) -> frozenset[str]:
+    """Refs of the campaign's rows that still have their member (member_id not null).
+
+    A row past approval loses its member when they leave or are removed, and is then
+    left out. This says only that the member is gone, never who they were (C28).
     """
     return frozenset(
         ref
         for (ref,) in conn.execute(
-            "select cm.ref from campaign_members cm join members m on m.member_id = cm.member_id "
-            "where cm.campaign_id = %s and m.source = %s",
-            (campaign_id, SOURCE_SEED),
+            "select ref from campaign_members where campaign_id = %s and member_id is not null", (campaign_id,)
         )
     )
 
@@ -261,6 +275,7 @@ def display_names(conn: psycopg.Connection, campaign_id: uuid.UUID) -> dict[str,
 def _row_standings(conn: psycopg.Connection, campaign_id: uuid.UUID) -> tuple[RowStanding, ...]:
     """Every row of the campaign in rank order, as RowStanding says."""
     stand_ins = stand_in_refs(conn, campaign_id)
+    on_list = on_list_refs(conn, campaign_id)
     names = display_names(conn, campaign_id)
     # A payout item's sender_item_id is its row's ref (approval.current_snapshot).
     ledger: dict[str, list[str]] = {}
@@ -281,6 +296,7 @@ def _row_standings(conn: psycopg.Connection, campaign_id: uuid.UUID) -> tuple[Ro
             rank=rank,
             display_name=names.get(ref),
             stand_in=ref in stand_ins,
+            on_list=ref in on_list,
             payout_status=_shown_status(ledger.get(ref, [])) if role == "reward" else None,
             simulated_return=(ref, True) in returned,
             real_return=(ref, False) in returned,

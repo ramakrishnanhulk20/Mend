@@ -447,7 +447,7 @@ def test_a_demo_actor_approves_and_submits_under_demo_caps(conn: psycopg.Connect
     campaign_id = tasks.draft_campaign(DEMO_SETTINGS, demo)["campaign_id"]
     view = tasks.view_campaign(campaign_id, demo)
     assert view["ok"] and view["status"] == "draft" and len(view["rows"]) == 10
-    assert all(set(row) == {"ref", "role", "rank", "amount_minor", "note", "display_name", "stand_in"} for row in view["rows"])
+    assert all(set(row) == {"ref", "role", "rank", "amount_minor", "note", "display_name", "stand_in", "on_list"} for row in view["rows"])
     assert "@" not in json.dumps(view["rows"])
 
     approval = tasks.approve_campaign(campaign_id, demo, view["review_hash"])
@@ -669,6 +669,8 @@ def test_each_row_shows_its_payout_its_returns_and_whether_it_is_a_stand_in_and_
     stand_in, joined = rewards[0], rewards[1]
     member_of = "(select member_id from campaign_members where campaign_id = %s and ref = %s)"
     conn.execute(f"update members set source = 'seed' where member_id = {member_of}", (cid, stand_in))
+    # A draft records the flag from members.source as it writes the row, so this member, made a stand-in after, is recorded too.
+    conn.execute("update campaign_members set stand_in = true where campaign_id = %s and ref = %s", (cid, stand_in))
     conn.execute(f"update members set paypal_payer_id = 'PAYERX7K2M9QZ' where member_id = {member_of}", (cid, joined))
 
     view = tasks.view_campaign(campaign_id, demo)
@@ -696,7 +698,7 @@ def test_each_row_shows_its_payout_its_returns_and_whether_it_is_a_stand_in_and_
     assert found["ok"] is True and found["rows"] == [
         {
             "ref": ref, "role": roles[ref], "rank": int(ref[1:]), "display_name": "Maya R.", "stand_in": ref == stand_in,
-            "payout_status": shown.get(ref), "simulated_return": ref == joined, "real_return": ref == holdouts[0],
+            "on_list": True, "payout_status": shown.get(ref), "simulated_return": ref == joined, "real_return": ref == holdouts[0],
         }
         for ref in ordered
     ]
@@ -727,8 +729,11 @@ def test_each_row_carries_the_name_the_quiet_regulars_list_shows_for_its_custome
 
     view = tasks.view_campaign(campaign_id, demo)
     assert [(row["ref"], row["display_name"]) for row in view["rows"]] == list(expected.items())
+    assert all(row["on_list"] is True for row in view["rows"])
     assert tasks.approve_campaign(campaign_id, demo, view["review_hash"])["ok"] is True
-    assert [(row["ref"], row["display_name"]) for row in tasks.results(campaign_id, demo)["rows"]] == list(expected.items())
+    found = tasks.results(campaign_id, demo)
+    assert [(row["ref"], row["display_name"]) for row in found["rows"]] == list(expected.items())
+    assert all(row["on_list"] is True for row in found["rows"])
     assert tasks.submit_campaign(campaign_id, demo)["sent"] is True
     sender_batch_id = conn.execute("select sender_batch_id from payout_batches where campaign_id = %s", (campaign_id,)).fetchone()[0]
     conn.execute("insert into payout_items values ('ITEM1', %s, %s, 'UNCLAIMED', 25, now())", (sender_batch_id, gone[0]))
@@ -741,6 +746,9 @@ def test_each_row_carries_the_name_the_quiet_regulars_list_shows_for_its_custome
     still = {**expected, gone[0]: None}
     assert [(row["ref"], row["display_name"]) for row in view["rows"]] == list(still.items())
     assert [(row["ref"], row["display_name"]) for row in found["rows"]] == list(still.items())
+    # The row says its member is gone, and nothing else about them.
+    assert [(row["ref"], row["on_list"]) for row in view["rows"]] == [(ref, ref != gone[0]) for ref in ordered]
+    assert [(row["ref"], row["on_list"]) for row in found["rows"]] == [(ref, ref != gone[0]) for ref in ordered]
     text = json.dumps(view) + json.dumps(found)
     assert json.dumps(expected[gone[0]]) not in text
     assert "@" not in text and "PAYERX7K2M9QZ" not in text and "ITEM1" not in text and not re.search(r"C1[0-9]{3}", text)

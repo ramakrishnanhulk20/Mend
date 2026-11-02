@@ -283,6 +283,7 @@ Everything here runs on the PayPal sandbox: real Payouts batches and real PayPal
 6. Step 5 compares the paid group with the held-back group and gives the verdict, which for a five-person demo group is "too early to tell". Press **Simulate a return purchase**: Mend buys from the shop with PayPal's sandbox test card for the customer you pick, and the return is counted for their group as simulated.
 7. Press **Take back** (the button shows the amount) to cancel the unclaimed cashback. PayPal returns it to the shop, and the results show how much came back. If you leave it, mend-jobs takes it back on its own once it has waited 10 minutes.
 8. Ask Mend in the side panel, for example "How many quiet regulars does my shop have right now?". It answers from live data and says which tools it used.
+9. Choose **06 Break it** at the end of the step rail and press **Run every attack**. Each card sends a real request from your browser and shows what came back: a goal asking Claude for USD 5,000 clamped to USD 10, a draft over the caps refused by the engine, a changed fingerprint refused, an unapproved send that sends nothing, a fake PayPal webhook refused, and six more. [We tried to break it](https://mend-web.onrender.com/docs/security/try-to-break-it) lists the test behind each one.
 
 ### The proof we run
 

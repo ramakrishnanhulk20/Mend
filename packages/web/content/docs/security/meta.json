@@ -1,4 +1,4 @@
 {
   "title": "Security",
-  "pages": ["overview", "threat-model", "reviews"]
+  "pages": ["overview", "threat-model", "try-to-break-it", "reviews"]
 }

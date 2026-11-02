@@ -49,13 +49,6 @@ const PAGE_HEADERS: Readonly<Record<string, string>> = {
   "cache-control": "no-store",
 };
 
-/**
- * True only for a script that asked for JSON: Accept names application/json and does not
- * also name text/html. A browser's navigation, a wildcard, an empty or a missing Accept
- * all mean a person, who is sent to the result page instead. Each media type is compared
- * lowercased with its parameters dropped; q-values are not weighed. Used by this route
- * and the callback, so both tell a person from a script the same way.
- */
 const ESCAPES: Readonly<Record<string, string>> = { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" };
 
 /** value with the five characters that can end an HTML text run or a quoted attribute replaced by their entities. */

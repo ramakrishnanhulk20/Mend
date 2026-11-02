@@ -406,7 +406,7 @@ async function runNoToken({ fetchFn }: AttackContext): Promise<AttackResult> {
   return refusalResult(await readError(response), sent, (status, code) => status === 403 && code === "csrf_refused");
 }
 
-const GUARD_COST = "Costs nothing but a rate-limit tick.";
+const GUARD_COST = "Costs nothing.";
 const DRAFT_COST = "Uses one Claude call and one of this session's 5 drafts a day.";
 
 export const ATTACKS: readonly Attack[] = [
@@ -465,7 +465,7 @@ export const ATTACKS: readonly Attack[] = [
     id: "twice",
     group: "Money",
     title: "Send the same campaign twice",
-    tries: "Send the campaign you already sent in step 4 again.",
+    tries: "After you send a campaign in step 4, send that same campaign again.",
     stoppedBy: "Each campaign has one PayPal batch. Sending it again finds that batch and sends nothing new.",
     needs: "sent-campaign",
     costNote: "Sends nothing and costs no daily send allowance.",
@@ -477,7 +477,7 @@ export const ATTACKS: readonly Attack[] = [
     title: "Slip an email address to Claude",
     tries: `Ask for a plan with the goal: "${EMAIL_GOAL}"`,
     stoppedBy:
-      "Mend replaces any email address in a goal with [email removed] before Claude reads it, and the line to Claude refuses any request that still holds one, so the address never reaches Claude and no plan can pay it.",
+      "Mend replaces any email address in a goal with [email removed] before Claude reads it, and Mend's connection to Claude refuses any request that still holds one, so the address never reaches Claude and no plan can pay it.",
     needs: "nothing",
     costNote: DRAFT_COST,
     run: runEmailToClaude,
@@ -489,7 +489,7 @@ export const ATTACKS: readonly Attack[] = [
     tries: `Ask Mend: "${ASK_MESSAGE}"`,
     stoppedBy: "Claude's tools only read and draft. None of them approves or sends, so all it can do is explain.",
     needs: "nothing",
-    costNote: "Uses one Claude call.",
+    costNote: "Uses at least one Claude call.",
     run: runAskToPay,
   },
   {
@@ -505,9 +505,10 @@ export const ATTACKS: readonly Attack[] = [
   {
     id: "other-campaign",
     group: "Web",
-    title: "Open another visitor's campaign",
-    tries: "Ask for a campaign that does not belong to this session.",
-    stoppedBy: "Every campaign route checks your session. Someone else's campaign answers exactly like one that does not exist.",
+    title: "Open a campaign that is not yours",
+    tries: "Ask for a campaign id this session does not own.",
+    stoppedBy:
+      "Every campaign route checks your session, and answers the same 404 whether the id belongs to another visitor or to no one, so it never reveals which ids exist.",
     needs: "nothing",
     costNote: GUARD_COST,
     run: runOtherCampaign,
@@ -545,8 +546,8 @@ export function summarise(attackResult: AttackResult): string {
   const { status, code } = attackResult.exchange;
   switch (attackResult.outcome) {
     case "held":
-      if (code !== null) return `Refused: ${status} ${code}`;
-      return status >= 400 ? `Refused: ${status}` : `Held: ${status}`;
+      if (code !== null) return `Held: refused with ${status} ${code}`;
+      return status >= 400 ? `Held: refused with ${status}` : `Held: ${status}`;
     case "not-held":
       return `Not refused: ${status}`;
     case "limited":

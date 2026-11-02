@@ -205,6 +205,9 @@ export function Console() {
   const toPayout = useCallback(() => goTo("payout"), [goTo]);
   const toResults = useCallback(() => goTo("results"), [goTo]);
 
+  // The rail has the Break it item from lg up and the phone progress line has the button below it. Both need a session to open it in.
+  const toBreakIt = session !== null ? () => goTo("breakit") : undefined;
+
   function renderStep() {
     if (step === "regulars") return <RegularsStep api={api} onPlan={toPlan} />;
     if (step === "approve" && campaignId !== null) {
@@ -233,7 +236,14 @@ export function Console() {
       );
     }
     if (step === "breakit") {
-      return <BreakItStep api={api} campaignId={campaignId} onBack={() => goTo(lastJourneyStep.current)} />;
+      return (
+        <BreakItStep
+          api={api}
+          campaignId={campaignId}
+          sessionKey={session?.expiresAt ?? null}
+          onBack={() => goTo(lastJourneyStep.current)}
+        />
+      );
     }
     if (step === "plan" || NEEDS_CAMPAIGN.includes(step)) {
       return <PlanStep api={api} onDrafted={drafted} onReview={toApprove} />;
@@ -250,9 +260,9 @@ export function Console() {
           session={session}
           ending={ending}
           onEnd={endSession}
-          onBreakIt={session !== null ? () => goTo("breakit") : undefined}
+          onBreakIt={toBreakIt}
         />
-        <StepProgress step={step} />
+        <StepProgress step={step} onBreakIt={toBreakIt} />
 
         <div className="mx-auto max-w-[1440px] px-4 py-10 md:px-10">
           <div className="flex flex-col gap-6 lg:grid lg:grid-cols-12 lg:gap-10">
@@ -283,7 +293,7 @@ export function Console() {
         </div>
 
         <AnimatePresence>
-          {session !== null && !askOnScreen && (
+          {session !== null && step !== "breakit" && !askOnScreen && (
             <motion.button
               key="ask-shortcut"
               type="button"

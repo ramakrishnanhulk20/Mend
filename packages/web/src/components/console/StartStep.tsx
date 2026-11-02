@@ -18,7 +18,7 @@ const HAPPENS = [
     title: "See if it worked",
     line: "Simulate a customer coming back and compare the paid group with the held-back group.",
   },
-  { title: "Try to break it", line: "Run real attacks against Mend and watch each one refused." },
+  { title: "Try to break it", line: "Run real attacks against Mend and watch each one stopped." },
 ] as const;
 
 function openingFailure(error: unknown): string {

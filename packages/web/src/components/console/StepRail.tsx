@@ -2,7 +2,7 @@
 
 import { motion } from "motion/react";
 import { useStill } from "@/components/motion/useStill";
-import { EASE, FOCUS_RING, StitchedThread } from "./ui";
+import { EASE, FOCUS_RING, StitchedThread, TextButton } from "./ui";
 
 // TopBar and ShopCard are outside this work order and still import these two from here.
 export { FOCUS_RING, TextButton } from "./ui";
@@ -127,8 +127,11 @@ export function StepRail({ step, onBreakIt }: StepRailProps) {
   );
 }
 
-/** The phone version of the rail: one line and a thin track. Nothing shows before step one. */
-export function StepProgress({ step }: { step: Step }) {
+/**
+ * The phone version of the rail: one line and a thin track. Nothing shows before step one.
+ * With onBreakIt it also carries the Break it button, since the rail itself is hidden below lg.
+ */
+export function StepProgress({ step, onBreakIt }: { step: Step; onBreakIt?: () => void }) {
   const still = useStill();
   if (step === "breakit") {
     return (
@@ -144,9 +147,18 @@ export function StepProgress({ step }: { step: Step }) {
 
   return (
     <div className="mx-auto max-w-[1440px] px-4 pt-4 md:px-10 lg:hidden">
-      <p className="font-mono text-[12px] text-bone-dim">
-        Step {number} of {total} &middot; {RAIL_STEPS[index].label}
-      </p>
+      <div className="flex items-center">
+        <p className="font-mono text-[12px] text-bone-dim">
+          Step {number} of {total} &middot; {RAIL_STEPS[index].label}
+        </p>
+        {onBreakIt && (
+          <div className="ml-auto">
+            <TextButton mono onClick={onBreakIt}>
+              06 Break it
+            </TextButton>
+          </div>
+        )}
+      </div>
       <div className="mt-2 h-[2px] bg-bone/10">
         <motion.div
           className="h-full bg-bone/60"

@@ -10,7 +10,7 @@
     "region": "virginia",
     "postgres": "18",
     "diskSizeGB": 1,
-    "schemaSha256": "c3df4e87610c89d8e0b501acc119b3c6debaf37482880031c8a8af18171df974",
+    "schemaSha256": "bac6d2a368647dc68e76f6d27e42189b9514fce7eab4137b82e67ebf2004cdf9",
     "roles": {
       "web": "mend_web",
       "engine": "mend_engine",

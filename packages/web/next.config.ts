@@ -1,7 +1,7 @@
 import { createMDX } from "fumadocs-mdx/next";
 import type { NextConfig } from "next";
 
-// Lets the lab page show the live site's real numbers on a machine with no engine running.
+// Lets the dev server show the live site's real numbers on a machine with no engine running.
 // Only the dev server reads it, and only an https address with no path counts, so a typo
 // or a production build can never send visitors' requests somewhere else.
 function devSummaryOrigin(): string | null {

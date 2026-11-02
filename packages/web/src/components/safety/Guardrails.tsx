@@ -3,6 +3,7 @@
 import { useEffect, useId, useRef, useState } from "react";
 import { motion, useInView } from "motion/react";
 import { useStill } from "@/components/motion/useStill";
+import { FOCUS_RING, UNDERLINE_DRAW } from "@/components/console/ui";
 
 const EASE = [0.22, 1, 0.36, 1] as const;
 
@@ -239,6 +240,19 @@ export function Guardrails() {
           </motion.div>
         ))}
       </div>
+
+      <a
+        href="/demo?step=break-it"
+        className={`group/link mt-14 inline-flex items-center gap-3 font-mono text-[12px] uppercase tracking-[0.14em] text-bone-dim transition-colors duration-150 ease-out hover:text-bone ${FOCUS_RING}`}
+      >
+        <svg width="10" height="10" viewBox="0 0 10 10" fill="none" aria-hidden="true" className="shrink-0">
+          <path d="M1.5 1.5l7 7M8.5 1.5l-7 7" className="stroke-accent" strokeWidth="1.5" strokeLinecap="round" />
+        </svg>
+        <span className="relative">
+          Try to break it yourself
+          <span aria-hidden="true" className={`${UNDERLINE_DRAW} group-hover/link:scale-x-100`} />
+        </span>
+      </a>
     </section>
   );
 }

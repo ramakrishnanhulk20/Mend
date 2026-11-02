@@ -335,9 +335,9 @@ export function Hero({ live = null }: { live?: HeroLive | null }) {
                   <span className="absolute inset-0 rounded-full bg-accent" />
                 </span>
                 <span className="min-w-0 truncate">
-                  Live: {formatCount(live.quietRegulars)} regulars went quiet
+                  Live: {formatCount(live.quietRegulars)} quiet regulars
                   <span className="hidden md:inline">
-                    {" "}&middot; {formatUsdCompact(live.paid12mMinor)} paid last year
+                    {" "}&middot; {formatUsdCompact(live.paid12mMinor)} spent last year
                   </span>
                 </span>
               </motion.span>

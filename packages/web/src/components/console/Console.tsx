@@ -215,7 +215,8 @@ export function Console() {
 
   return (
     <MotionConfig reducedMotion="user">
-      <div className="min-h-svh bg-ink text-bone">
+      {/* Below lg the Ask Mend shortcut floats over the bottom corner, so the page ends far enough down to clear it. */}
+      <div className="min-h-svh bg-ink pb-20 text-bone lg:pb-0">
         <TopBar
           step={step}
           session={session}

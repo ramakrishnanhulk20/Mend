@@ -11,9 +11,10 @@ Mend was built and tested on Windows 11. The macOS and Linux commands below foll
 
 - Node.js 26 and Python 3.12. The live site runs Node 26.7.0 and Python 3.12.10.
 - A PayPal developer account at https://developer.paypal.com. In the sandbox you need:
-  - A US business account, and an app linked to it with Payouts and Log in with PayPal ticked. This app sends the cashback. PayPal funds new sandbox business accounts with test money.
-  - Optional: a second app on the same business account with Payouts not ticked. The assistant's four PayPal reads use it. Without it they use the first app's keys.
-  - A personal account. Its email is the test receiver: the one demo customer whose cashback can really be claimed.
+  - A US business account: in the Developer Dashboard go to **Testing Tools**, **Sandbox Accounts**, **Create account**, and pick **Business** and **United States**. PayPal funds new sandbox business accounts with test money.
+  - An app linked to it: **Apps & Credentials**, **Sandbox**, **Create App**, type **Merchant**, and pick that business account. On the app's page, under **Features** (some PayPal pages say **Other features**), tick **Payouts** and **Log in with PayPal**. This app sends the cashback.
+  - Optional: a second app on the same business account, made the same way with **Payouts** not ticked. The assistant's four PayPal reads use it. It must be a different app from the first, or the web app refuses to start. Without it they use the first app's keys.
+  - A personal account: **Sandbox Accounts**, **Create account**, **Personal**. Its email is the test receiver: the one demo customer whose cashback can really be claimed.
 - An Anthropic API key with prepaid credit, from https://platform.claude.com under Settings, API Keys (credit under Billing). `dev:console` will not start without it.
 
 ## Set up
@@ -134,4 +135,4 @@ cd ../web
 npx vitest run
 ```
 
-The engine tests need no network; both suites start the local Postgres themselves. On 2 Nov 2026 the engine suite gave 980 passed and 1 skipped, and the web suite 1216 passed in 33 files. In a fresh clone 3 benchmark tests skip until `python -m mend_engine.prove_model` has downloaded the CDNOW sample once.
+The engine tests need no network; both suites start the local Postgres themselves. On 3 Nov 2026, in a fresh clone, the engine suite gave 980 passed and 1 skipped, and the web suite 1372 passed in 36 files. In a fresh clone 3 benchmark tests skip until `python -m mend_engine.prove_model` has downloaded the CDNOW sample once.

@@ -276,11 +276,11 @@ The parts, every PayPal call and who makes it are in [ARCHITECTURE.md](ARCHITECT
 Everything here runs on the PayPal sandbox: real Payouts batches and real PayPal webhooks, with test money. No sign-up and no PayPal login.
 
 1. Open https://mend-web.onrender.com/demo and press **Start the demo**. A demo session opens for this browser.
-2. Step 1 shows how many regulars went quiet and lists the ones worth a nudge, biggest spenders first. Rows marked as stand-ins are demo customers the seed script joined, not people. Press **Ask Claude for a plan**.
-3. Step 2: pick a suggestion such as "Win back my best lapsed regulars with 10 dollars", or type your own goal with an amount. Claude's plan shows the budget, the reward per customer, the share held back, how many customers were considered, and anything Claude adjusted to fit the demo caps. Press **Review the plan**.
-4. Step 3 shows every reward with its note and every held-back customer as a dotted thread. Optionally press **Have Claude write the notes** for one personal note per customer from their own past items. Press **Approve this exact plan**: Mend seals the plan and shows its fingerprint. Press **Send it with PayPal**.
-5. Step 4: press **Send with PayPal**. Mend sends one Payouts batch and shows PayPal's batch id. Watch the threads: each one is stitched as PayPal confirms that customer's payment, usually within about a minute. The first customer in the list is the one real sandbox account, so when the random draw pays it, PayPal marks its reward claimed. The stand-ins have no PayPal account, so PayPal holds their cashback as unclaimed. Press **See the results**.
-6. Step 5 compares the paid group with the held-back group and gives the verdict, which for a five-person demo group is "too early to tell". Press **Simulate a return purchase**: Mend buys from the shop with PayPal's sandbox test card for the customer you pick, and the return is counted for their group as simulated.
+2. Screen 01 Regulars shows how many regulars went quiet and lists the ones worth a nudge, biggest spenders first. Rows marked as stand-ins are demo customers the seed script joined, not people. Press **Ask Claude for a plan**.
+3. On 02 Plan, pick a suggestion such as "Win back my best lapsed regulars with 10 dollars", or type your own goal with an amount. Claude's plan shows the budget, the reward per customer, the share held back, how many customers were considered, and anything Claude adjusted to fit the demo caps. Press **Review the plan**.
+4. 03 Approve shows every reward with its note and every held-back customer as a dotted thread. Optionally press **Have Claude write the notes** for one personal note per customer from their own past items. Press **Approve this exact plan**: Mend seals the plan and shows its fingerprint. Press **Review the payout**.
+5. On 04 Payout, press **Send with PayPal**. Mend sends one Payouts batch and shows PayPal's batch id. Watch the threads: each one is stitched as PayPal confirms that customer's payment, usually within about a minute. The first customer in the list is the one real sandbox account, so when the random draw pays it, PayPal marks its reward claimed. The stand-ins have no PayPal account, so PayPal holds their cashback as unclaimed. Press **See the results**.
+6. 05 Results compares the paid group with the held-back group and gives the verdict, which for a five-person demo group is "too early to tell". Press **Simulate a return purchase**: Mend buys from the shop with PayPal's sandbox test card for the customer you pick, and the return is counted for their group as simulated.
 7. Press **Take back** (the button shows the amount) to cancel the unclaimed cashback. PayPal returns it to the shop, and the results show how much came back. If you leave it, mend-jobs takes it back on its own once it has waited 10 minutes.
 8. Ask Mend in the side panel, for example "How many quiet regulars does my shop have right now?". It answers from live data and says which tools it used.
 9. Choose **06 Break it** at the end of the step rail and press **Run every attack**. Each card sends a real request from your browser and shows what came back: a goal asking Claude for USD 5,000 clamped to USD 10, a draft over the caps refused by the engine, a changed fingerprint refused, an unapproved send that sends nothing, a fake PayPal webhook refused, and six more. [We tried to break it](https://mend-web.onrender.com/docs/security/try-to-break-it) lists the test behind each one.
@@ -322,10 +322,11 @@ Mend runs on one machine with `npm run dev:console`: a local Postgres, the engin
 
 - Node.js 26 (Render runs 26.7.0) and Python 3.12.
 - A PayPal developer account (https://developer.paypal.com). In the sandbox:
-  - A US business account and an app linked to it, with Payouts and Log in with PayPal ticked. This app sends the cashback.
-  - Optional: a second app on the same business account with Payouts not ticked. The assistant's PayPal reads use it. Without it they use the first app.
-  - A personal account. Its email is the test receiver: the one demo customer whose cashback can really be claimed.
-- An Anthropic API key with prepaid credit (https://platform.claude.com, Settings, API Keys; credit under Billing). The local console will not start without it.
+  - A US business account: in the Developer Dashboard go to **Testing Tools**, **Sandbox Accounts**, **Create account**, and pick **Business** and **United States**. PayPal funds new sandbox business accounts with test money.
+  - An app linked to it: **Apps & Credentials**, **Sandbox**, **Create App**, type **Merchant**, and pick that business account. On the app's page, under **Features** (some PayPal pages say **Other features**), tick **Payouts** and **Log in with PayPal**. This app sends the cashback.
+  - Optional: a second app on the same business account, made the same way with **Payouts** not ticked. The assistant's PayPal reads use it. It must be a different app from the first, or the web app refuses to start. Without it the reads use the first app.
+  - A personal account: **Sandbox Accounts**, **Create account**, **Personal**. Its email is the test receiver: the one demo customer whose cashback can really be claimed.
+- An Anthropic API key with prepaid credit (https://platform.claude.com, Settings, API Keys; credit under Billing). The local console will not start without it. A demo campaign with personal notes uses 6 Claude Haiku 5.5 calls (see What it costs).
 - On Windows, Git Bash (it comes with Git for Windows): the commands below are Bash.
 
 ### Steps
@@ -355,7 +356,7 @@ The settings in `.env`:
 |---|---|---|
 | `PAYPAL_CLIENT_ID`, `PAYPAL_CLIENT_SECRET` | The sandbox app that sends payouts | developer.paypal.com, Apps & Credentials, Sandbox, your app |
 | `PAYPAL_ENV` | Must be `sandbox`; Mend refuses anything else | Already set in `.env.example` |
-| `PAYPAL_READ_CLIENT_ID`, `PAYPAL_READ_CLIENT_SECRET` | Optional: the second app, without Payouts | The same page, your second app |
+| `PAYPAL_READ_CLIENT_ID`, `PAYPAL_READ_CLIENT_SECRET` | Optional: the second app, without Payouts. It must be a different app from the first, or the web app refuses to start | The same page, your second app |
 | `MEND_TEST_RECEIVER` | The sandbox personal account's email | developer.paypal.com, Sandbox, Accounts |
 | `ANTHROPIC_API_KEY` | Claude, for plans, notes and the assistant. Required: the console will not start without it | platform.claude.com, Settings, API Keys |
 | `MEND_PAYOUT_ITEM_CAP_MINOR`, `MEND_CAMPAIGN_CAP_MINOR`, `MEND_DAILY_CAP_MINOR` | The owner's hard caps in US cents (USD 10 a customer, 100 a campaign, 200 a day); the engine will not start without them. Demo visitors get tighter limits on top: USD 2 a customer, 10 a campaign, 50 a day across all visitors | Keep the values in `.env.example` |
@@ -397,18 +398,18 @@ Every route a visitor's browser calls. Each state-changing POST needs an `Origin
 
 ## Tests
 
-Run on 2 Nov 2026:
+Run on 3 Nov 2026 in a fresh clone of commit `696af10`:
 
 ```text
 packages/engine$ .venv/Scripts/python.exe -m pytest -q -p no:cacheprovider
 980 passed, 1 skipped
 
 packages/web$ npx vitest run
- Test Files  33 passed (33)
-      Tests  1216 passed (1216)
+ Test Files  36 passed (36)
+      Tests  1372 passed (1372)
 ```
 
-The engine tests need no network; they start a local Postgres. In a fresh clone 3 benchmark tests skip (977 passed, 4 skipped) until `python -m mend_engine.prove_model` has downloaded the CDNOW sample once. The live proof, `node scripts/deploy/render.mjs prove`, passed 19 of 19 on the same day (above).
+Run each suite from its own folder: the engine tests from `packages/engine` with the virtualenv active (`.venv/bin/python` on macOS and Linux), the web tests from `packages/web`. The engine suite takes about three minutes and the web suite under one. The engine tests need no network; they start a local Postgres. In a fresh clone 3 benchmark tests skip (977 passed, 4 skipped) until `python -m mend_engine.prove_model` has downloaded the CDNOW sample once. The live proof, `node scripts/deploy/render.mjs prove`, passed 19 of 19 on 2 Nov (above).
 
 ## What it costs
 

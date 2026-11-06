@@ -287,7 +287,7 @@ Everything here runs on the PayPal sandbox: real Payouts batches and real PayPal
 
 ### The proof we run
 
-`node scripts/deploy/render.mjs prove` checks the live deployment end to end. It needs our Render API key, so judges read its output instead of running it. The last run, on 3 Nov 2026 against mend-web on commit `266a592` (mend-engine and mend-jobs on `392915a`), passed 19 of 19:
+`node scripts/deploy/render.mjs prove` checks the live deployment end to end. It needs our Render API key, so judges read its output instead of running it. The last run, on 6 Nov 2026 against mend-web on commit `ea689f4` (mend-engine and mend-jobs on `392915a`), passed 19 of 19:
 
 ```text
 PASS  health: https://mend-web.onrender.com/api/health says ok
@@ -298,17 +298,17 @@ PASS  database role: mend_engine is refused a trigger change, an audit_log updat
 PASS  private: mend-engine has no public URL and does not resolve on public DNS
 PASS  journey plan: a demo visitor asked "bring back my quiet regulars, 50 dollars"; Claude read it; 5 rewarded at 200 cents (1000 in total), 5 held back
 PASS  journey notes: Claude wrote 5 personal notes, 0 fell back to the shop's template
-PASS  journey payout: viewed with its hash, approved with that hash and submitted; PayPal holds batch 2LYREFKMN2EW8
+PASS  journey payout: viewed with its hash, approved with that hash and submitted; PayPal holds batch E8FAF9MDPJ95A
 PASS  read keys: the read-only app's token carries 27 scopes, none for payouts, and PayPal answers 403 to a payout batch read
-PASS  delivery: PayPal's batch webhook was verified and stored once, processed 1 s after it arrived; the test receiver's item was SUCCESS 46 s after submit
+PASS  delivery: PayPal's batch webhook was verified and stored once, processed 1 s after it arrived; the test receiver's item was SUCCESS 50 s after submit
 PASS  cancel: the 4 unclaimed rewards were cancelled, returnedMinor 800, stillUnclaimed 0, incomplete false
 PASS  demo pool: the campaign counted 1000 cents toward the demo pool before the cancel and 200 after
 PASS  forgery: an altered copy of that delivery was refused by the signature check (400); a replay was answered 200 with nothing stored
-PASS  simulate: a return purchase (PayPal order 7JG9984258171423F, COMPLETED) was attributed to the rewarded group as simulated; verdict: too early to tell
+PASS  simulate: a return purchase (PayPal order 3AR23776V6505213N, COMPLETED) was attributed to the rewarded group as simulated; verdict: too early to tell
 PASS  agent: asked "How many quiet regulars does my shop have right now?", it used quiet_regulars and answered 1357
-PASS  jobs: mend-jobs last ran successfully at 2026-11-03T06:05:23Z and the purge is on record in audit_log
+PASS  jobs: mend-jobs last ran successfully at 2026-11-06T05:35:19Z and the purge is on record in audit_log
 PASS  idempotent: `up` would change nothing
-PASS  secrets: no secret value or key shape in the output, render-state.json, 239 answers from mend-web or 454 log lines
+PASS  secrets: no secret value or key shape in the output, render-state.json, 239 answers from mend-web or 445 log lines
 D2 RESULT: PASS
 ```
 
@@ -350,7 +350,7 @@ npm ci
 npm run dev:console
 ```
 
-The settings in `.env`:
+The settings in `.env`. `dev:console` will not start without `PAYPAL_CLIENT_ID`, `PAYPAL_CLIENT_SECRET`, `MEND_TEST_RECEIVER` and `ANTHROPIC_API_KEY`:
 
 | Setting | What it is | Where to get it |
 |---|---|---|
@@ -358,7 +358,7 @@ The settings in `.env`:
 | `PAYPAL_ENV` | Must be `sandbox`; Mend refuses anything else | Already set in `.env.example` |
 | `PAYPAL_READ_CLIENT_ID`, `PAYPAL_READ_CLIENT_SECRET` | Optional: the second app, without Payouts. It must be a different app from the first, or the web app refuses to start | The same page, your second app |
 | `MEND_TEST_RECEIVER` | The sandbox personal account's email | developer.paypal.com, Sandbox, Accounts |
-| `ANTHROPIC_API_KEY` | Claude, for plans, notes and the assistant. Required: the console will not start without it | platform.claude.com, Settings, API Keys |
+| `ANTHROPIC_API_KEY` | Claude, for plans, notes and the assistant | platform.claude.com, Settings, API Keys |
 | `MEND_PAYOUT_ITEM_CAP_MINOR`, `MEND_CAMPAIGN_CAP_MINOR`, `MEND_DAILY_CAP_MINOR` | The owner's hard caps in US cents (USD 10 a customer, 100 a campaign, 200 a day); the engine will not start without them. Demo visitors get tighter limits on top: USD 2 a customer, 10 a campaign, 50 a day across all visitors | Keep the values in `.env.example` |
 | `MEND_BALANCE_FLOOR_MINOR` | US cents every payout must leave in the shop's balance | Leave empty for 25000 (USD 250) |
 | `MEND_DEV` | Local development | Keep `1` |
@@ -372,7 +372,7 @@ Payouts here are real sandbox payouts from your sandbox business account, with P
 
 ## API
 
-Every route a visitor's browser calls. Each state-changing POST needs an `Origin` equal to the site's own and the `x-mend-csrf` header from `GET /api/session`. A route that waits on the engine may answer `202 {status: "running", runId}`; the browser then polls `GET /api/runs/<runId>`. Limits and shapes are on the [API docs page](https://mend-web.onrender.com/docs/developers/api).
+Every route the demo and the join pages call. `GET /api/health` and `GET /api/search` (docs search) also exist. Each state-changing POST needs an `Origin` equal to the site's own and the `x-mend-csrf` header from `GET /api/session`. A route that waits on the engine may answer `202 {status: "running", runId}`; the browser then polls `GET /api/runs/<runId>`. Limits and shapes are on the [API docs page](https://mend-web.onrender.com/docs/developers/api).
 
 | Method | Path | What it does |
 |---|---|---|
@@ -398,18 +398,18 @@ Every route a visitor's browser calls. Each state-changing POST needs an `Origin
 
 ## Tests
 
-Run on 3 Nov 2026 in a fresh clone of commit `696af10`:
+Run on 6 Nov 2026 in a fresh clone of commit `883abfe`:
 
 ```text
 packages/engine$ .venv/Scripts/python.exe -m pytest -q -p no:cacheprovider
-980 passed, 1 skipped
+977 passed, 4 skipped
 
 packages/web$ npx vitest run
  Test Files  36 passed (36)
-      Tests  1372 passed (1372)
+      Tests  1370 passed (1370)
 ```
 
-Run each suite from its own folder: the engine tests from `packages/engine` with the virtualenv active (`.venv/bin/python` on macOS and Linux), the web tests from `packages/web`. The engine suite takes about three minutes and the web suite under one. The engine tests need no network; they start a local Postgres. In a fresh clone 3 benchmark tests skip (977 passed, 4 skipped) until `python -m mend_engine.prove_model` has downloaded the CDNOW sample once. The live proof, `node scripts/deploy/render.mjs prove`, passed 19 of 19 on 3 Nov (above).
+Run each suite from its own folder: the engine tests from `packages/engine` with the virtualenv active (`.venv/bin/python` on macOS and Linux), the web tests from `packages/web`. The engine suite takes about five minutes and the web suite under one. The engine tests need no network; they start a local Postgres. Those 3 extra engine skips are benchmark tests. They pass (980 passed, 1 skipped) once `python -m mend_engine.prove_model`, run from `packages/engine` with the virtualenv active and no keys needed, has downloaded the CDNOW sample once. The live proof, `node scripts/deploy/render.mjs prove`, passed 19 of 19 on 6 Nov (above).
 
 ## What it costs
 

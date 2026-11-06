@@ -135,4 +135,4 @@ cd ../web
 npx vitest run
 ```
 
-The engine tests need no network; both suites start the local Postgres themselves. On 3 Nov 2026, in a fresh clone, the engine suite gave 980 passed and 1 skipped, and the web suite 1372 passed in 36 files. In a fresh clone 3 benchmark tests skip until `python -m mend_engine.prove_model` has downloaded the CDNOW sample once.
+The engine tests need no network; both suites start the local Postgres themselves. On 6 Nov 2026, in a fresh clone, the engine suite gave 977 passed and 4 skipped, and the web suite 1370 passed in 36 files. Three of those engine skips are benchmark tests, which pass once `python -m mend_engine.prove_model` (run from `packages/engine` with the virtualenv active, no keys needed) has downloaded the CDNOW sample once.

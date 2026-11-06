@@ -432,6 +432,7 @@ packages/
     mend_engine/
     tests/
 scripts/deploy/        render.mjs: build, check and prove the Render setup
+art/world/             Blender scripts behind the film, the clay scenes and the icons
 docs/security/         threat-model.md
 ARCHITECTURE.md
 LICENSE
@@ -442,6 +443,7 @@ LICENSE
 | Layer | What |
 |---|---|
 | Web | Next.js 16.4.2, React 19.3.1, TypeScript 6.0.3, Tailwind CSS 4.3.3, motion 14.7.1, Lenis 1.3.27, zod 4.6.7, node-postgres 8.23.1 |
+| Art | Blender 5.2.3 (Cycles), every model and animation written as Python in `art/world/`; no stock art |
 | Docs | Fumadocs (fumadocs-ui 16.17.9, fumadocs-core 16.17.9, fumadocs-mdx 15.4.10) serves the `/docs` route from `packages/web/content/docs` |
 | Diagrams | Mermaid 12.2.0, drawn in the browser |
 | AI | Claude Haiku 5.5 (`claude-haiku-5-5`) through `@anthropic-ai/sdk` 1.3.0 |

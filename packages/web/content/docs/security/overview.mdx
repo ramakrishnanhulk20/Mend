@@ -32,7 +32,7 @@ Mend moves money, holds customers' details and runs a public demo where anyone c
 - One database role per service. Neither the engine's nor the web app's role can change the schema or a trigger, and the audit log only accepts new rows.
 - A private engine. The only code that moves money runs on a service with no public address, behind a token, and no service holds a Render API key.
 - One permission table. Every console route and assistant tool asks the same table whether the caller's role may act, and anything not listed is refused. The public join pages and the webhook have their own rules instead.
-- Rendered output cannot run. Every string an attacker can influence renders as text, and the Content-Security-Policy blocks inline script and framing of the site.
+- Rendered output cannot run. Every string an attacker can influence renders as text, and the Content-Security-Policy blocks framing of the site and any inline script that lacks the page's one-time nonce. Styles may be inline.
 - Errors tell an attacker nothing. Callers get a short code and a reference; details stay in the server log, with secrets removed.
 - A shared demo stays usable. Every pool an anonymous visitor can draw on has a per-address share, so one network cannot use up the demo for everyone.
 

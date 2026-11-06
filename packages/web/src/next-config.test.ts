@@ -9,6 +9,10 @@ import { getPathMatch } from "next/dist/shared/lib/router/utils/path-match";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import config from "../next.config";
 
+function sourceMatcher(source: string) {
+  return getPathMatch(source, { strict: true, removeUnnamedParams: true, regexModifier: (regex) => modifyRouteRegex(regex) });
+}
+
 afterEach(() => {
   vi.unstubAllEnvs();
 });
@@ -58,18 +62,32 @@ describe("next.config.ts wrapped by Fumadocs", () => {
 describe("next.config.ts", () => {
   it("sends Strict-Transport-Security and X-Content-Type-Options nosniff on every answer", async () => {
     const rules = (await config.headers?.()) ?? [];
-    expect(rules).toEqual([
-      {
-        source: "/:path*",
-        headers: [
-          { key: "Strict-Transport-Security", value: "max-age=31536000; includeSubDomains" },
-          { key: "X-Content-Type-Options", value: "nosniff" },
-        ],
-      },
-    ]);
-    const matches = getPathMatch(rules[0].source, { strict: true, removeUnnamedParams: true, regexModifier: (regex) => modifyRouteRegex(regex) });
+    expect(rules[0]).toEqual({
+      source: "/:path*",
+      headers: [
+        { key: "Strict-Transport-Security", value: "max-age=31536000; includeSubDomains" },
+        { key: "X-Content-Type-Options", value: "nosniff" },
+      ],
+    });
+    const matches = sourceMatcher(rules[0].source);
     for (const pathname of ["/", "/docs", "/api/webhooks/paypal", "/api/join/paypal/start", "/api/campaigns/0b6c2f8e-6a4e-4c1b-9d2a-7e5f1a3b9c4d/approve"]) {
       expect(matches(pathname), pathname).not.toBe(false);
+    }
+  });
+
+  it("caches the world assets for a day, and nothing else", async () => {
+    const rules = (await config.headers?.()) ?? [];
+    expect(rules).toHaveLength(2);
+    expect(rules[1]).toEqual({
+      source: "/world/:path*",
+      headers: [{ key: "Cache-Control", value: "public, max-age=86400" }],
+    });
+    const matches = sourceMatcher(rules[1].source);
+    for (const pathname of ["/world/film/loop.mp4", "/world/film/first-phone.jpg", "/world/how-1.jpg", "/world/icons/plan.webp"]) {
+      expect(matches(pathname), pathname).not.toBe(false);
+    }
+    for (const pathname of ["/", "/demo", "/docs", "/api/webhooks/paypal", "/worldly"]) {
+      expect(matches(pathname), pathname).toBe(false);
     }
   });
 });

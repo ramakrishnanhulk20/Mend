@@ -53,7 +53,7 @@ Item names, goals, chat messages and PayPal answers can all carry text written b
 - Untrusted text enters the prompt as delimited data, and the system prompt says it is never an instruction. Safety does not depend on either.
 - Every rule in "What Claude cannot do" holds whatever Claude outputs.
 - Notes must pass a character rule before they can reach PayPal: no links, emails, long digit runs, markup, PayPal or Venmo. A failing note is replaced by the shop's template.
-- Replies are rendered as plain text, with no images, frames or HTML, and the site's Content-Security-Policy blocks inline script and limits images and connections to the site's own origin and named hosts.
+- Replies are rendered as plain text, with no images, frames or HTML, and the site's Content-Security-Policy blocks inline script that lacks the page's one-time nonce and limits connections to the site's own origin and images to that origin and inline data. Styles may be inline.
 - There is no phrase blocklist anywhere.
 
 ## The evaluation sets

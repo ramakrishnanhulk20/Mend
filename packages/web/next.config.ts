@@ -35,6 +35,12 @@ const nextConfig: NextConfig = {
           { key: "X-Content-Type-Options", value: "nosniff" },
         ],
       },
+      // A day in the visitor's browser: a return visit does not pull the film again from the
+      // process that takes webhooks, and a file replaced under the same name still arrives soon.
+      {
+        source: "/world/:path*",
+        headers: [{ key: "Cache-Control", value: "public, max-age=86400" }],
+      },
     ];
   },
   async rewrites() {

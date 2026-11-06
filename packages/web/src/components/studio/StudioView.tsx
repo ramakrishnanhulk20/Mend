@@ -1,12 +1,12 @@
 "use client";
 
-import { AgStudioAiModule, enableStudioDevValidations, type AgPanelConfig, type AgReportState, type AgStudioApi, type AgStudioApiReadyEvent, type AgStudioLocaleText, type AgStudioMode } from "ag-studio";
+import { AgStudioAiModule, enableStudioDevValidations, type AgReportState, type AgStudioApi, type AgStudioApiReadyEvent, type AgStudioLocaleText, type AgStudioMode } from "ag-studio";
 import { AgStudio, AgStudioProvider } from "ag-studio-react";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { useShopSummary } from "../live/useShopSummary";
-import { mendTeam, READ_TOOL_DISPLAY } from "./agents";
+import { mendTeam } from "./agents";
 import type { DashboardData } from "./dashboard-data";
-import { dashboardLayout, withTexts, type ReportTexts } from "./dashboard-report";
+import { dashboardLayout, dashboardPanels, toolWords, TOOL_NAMES, withTexts, type ReportTexts } from "./dashboard-report";
 import { dashboardTheme } from "./studio-theme";
 import { mendWidgets, type MendRegistry } from "./widgets";
 
@@ -14,8 +14,8 @@ if (process.env.NODE_ENV !== "production") enableStudioDevValidations();
 
 const MODULES = [AgStudioAiModule];
 const FILL = { width: "100%", height: "100%" };
-// Studio's types list the AI panel for edit mode only, but its panel code accepts it in view mode. A panel set that names only one mode leaves the other with no panels at all. In edit mode the AI panel steps aside so the page keeps the width it has in view mode.
-const DASHBOARD_PANELS = { view: { left: ["ai"], right: [] }, edit: { left: [], right: ["edit", "data"] } } as unknown as AgPanelConfig;
+// Every step in the chat panel reads in plain words. A tool with no entry here would show its own name.
+const TOOL_DISPLAY = Object.fromEntries(TOOL_NAMES.map((name) => [name, { label: ({ args }: { readonly args: Readonly<Record<string, unknown>> }) => ({ text: toolWords(name, args) }) }]));
 const PANEL_WORDS: AgStudioLocaleText = { panelTitleAi: "Mend analyst", aiMessageInputPlaceholder: "Ask the Mend analyst..." };
 
 /** What the owner's dashboard hands Studio. The report is read once at start; the other fields can change while it runs. */
@@ -32,6 +32,7 @@ export type DashboardStudio = {
 export default function StudioView({ licenseKey, dashboard }: { readonly licenseKey: string; readonly dashboard: DashboardStudio }) {
   const { data, report, narrow, mode, selectedPageId, texts } = dashboard;
   const [layout] = useState(() => dashboardLayout(narrow));
+  const [panels] = useState(() => dashboardPanels(narrow));
   // The first view of the dashboard is its widgets, on every screen size. The panel opens from its own control.
   const [initialState] = useState<AgReportState<MendRegistry>>(() => ({ ...report, panels: { ...report.panels, ai: { collapsed: true } } }));
   const api = useRef<AgStudioApi<MendRegistry> | null>(null);
@@ -71,9 +72,9 @@ export default function StudioView({ licenseKey, dashboard }: { readonly license
         widgets={mendWidgets}
         initialState={initialState}
         layout={layout}
-        panels={DASHBOARD_PANELS}
+        panels={panels}
         ai={team.setup}
-        aiToolDisplay={READ_TOOL_DISPLAY}
+        aiToolDisplay={TOOL_DISPLAY}
         localeText={PANEL_WORDS}
         theme={dashboardTheme}
         loadThemeGoogleFonts={false}

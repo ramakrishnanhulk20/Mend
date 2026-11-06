@@ -16,6 +16,8 @@ const BUSY_RETRY_DEFAULT_SECONDS = 5;
 const BUSY_RETRY_MAX_SECONDS = 30;
 const SHOW_SECONDS_AFTER = 2;
 const NARROW_QUERY = "(max-width: 859px)";
+// What Studio does in edit mode: a plain drag moves a widget into a free spot, a drag held with Alt swaps two, and the edges resize.
+const EDIT_HINT = "Drag a widget to move it into an empty spot. Hold Alt (Option on a Mac) while you drop it on another widget to swap them. Drag an edge to resize.";
 // A campaign in either of these will not change again, so the page stops asking.
 const FINAL_STATUSES = ["completed", "voided"];
 
@@ -103,11 +105,12 @@ type StageProps = {
   narrow: boolean;
   editing: boolean;
   texts: ReportTexts;
+  horizonWeeks: number | undefined;
 };
 
 // Remounted when the width crosses the phone line, because Studio reads its report only at start.
-function Stage({ licenseKey, data, page, narrow, editing, texts }: StageProps) {
-  const [report] = useState(() => dashboardReport({ selected: page, narrow, source: texts.source }));
+function Stage({ licenseKey, data, page, narrow, editing, texts, horizonWeeks }: StageProps) {
+  const [report] = useState(() => dashboardReport({ selected: page, narrow, source: texts.source, horizonWeeks }));
   return (
     <StudioView
       licenseKey={licenseKey}
@@ -198,6 +201,8 @@ export function DashboardStep({ api, campaignId, licenseKey, onPlan, onBack }: D
 
   const source = shown?.inputs.summary?.backtest?.source ?? null;
   const texts = useMemo<ReportTexts>(() => ({ source }), [source]);
+  // The stage is only drawn once the summary has loaded, so the chart titles it is built with already know this.
+  const horizonWeeks = shown?.inputs.summary?.backtest?.bands?.horizonWeeks;
 
   const failed = shop.state === "unavailable" ? { text: "The dashboard didn't load.", canRetry: true } : load.kind === "failed" ? load : null;
   const empty = page === "campaign" && (shown?.inputs.results ?? null) === null;
@@ -254,6 +259,9 @@ export function DashboardStep({ api, campaignId, licenseKey, onPlan, onBack }: D
         )}
       </header>
 
+      {shown !== null && failed === null && narrow && <p className="mb-3 text-[14px] leading-[1.5] text-ink-dim">Open this page on a computer to use the Mend analyst.</p>}
+      {shown !== null && failed === null && editingNow && <p className="mb-3 text-[14px] leading-[1.5] text-ink-dim">{EDIT_HINT}</p>}
+
       {failed !== null ? (
         <NoticePanel action={failed.canRetry ? <TextButton onClick={retry}>Try again</TextButton> : undefined}>{failed.text}</NoticePanel>
       ) : shown === null ? (
@@ -267,7 +275,7 @@ export function DashboardStep({ api, campaignId, licenseKey, onPlan, onBack }: D
               aria-hidden={empty}
               inert={empty}
             >
-              <Stage key={narrow ? "narrow" : "wide"} licenseKey={licenseKey} data={shown.data} page={page} narrow={narrow} editing={editingNow} texts={texts} />
+              <Stage key={narrow ? "narrow" : "wide"} licenseKey={licenseKey} data={shown.data} page={page} narrow={narrow} editing={editingNow} texts={texts} horizonWeeks={horizonWeeks} />
             </div>
             {empty && (
               <div className="absolute inset-0 grid place-items-center">

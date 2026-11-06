@@ -1,4 +1,4 @@
-import type { AgPageLayoutState, AgPageState, AgReportState, AgWidgetState } from "ag-studio";
+import type { AgPageLayoutState, AgPageState, AgPanelConfig, AgReportState, AgWidgetState } from "ag-studio";
 import type { MendRegistry, ThreadsWidgetState, VerdictWidgetState } from "./widgets";
 
 // The dashboard's pages and widgets. To add a widget, add one entry to a page's list below: its
@@ -17,7 +17,7 @@ export const PAGES: readonly { readonly id: PageId; readonly label: string }[] =
 
 export const COLUMNS = 24;
 const ROW_HEIGHT = 28;
-// The page's floor on a phone. A 375px screen leaves about 305px beside the collapsed AI strip, so 320 would cut the right edge off.
+// The page's floor on a phone. The narrowest phones are 320px wide and the patch keeps about 24px of that for its own edge, so a floor of 320 would cut the right edge off.
 const PHONE_MIN_WIDTH = 280;
 const DISPLAY_FONT = "var(--font-fraunces)";
 const KPI_SIZE = 38;
@@ -72,11 +72,20 @@ export const THREADS_MAPPING: ThreadsWidgetState["dataMapping"] = {
   amount: [field("campaign_customers.amount_usd", "sum")],
 };
 
-// A donut with its category names beside the slices: the legend runs out of room in a narrow widget and pages itself.
+// A donut with its state names in a legend under it and each slice's count on the slice. Names beside the slices collided on a thin slice.
 const NAMED_SLICES = {
-  theme: { common: { legend: { enabled: false } } },
-  custom: { pieDataLabel: { enabled: true, category: true, position: "outside" as const, format: "value" as const } },
+  theme: { common: { legend: { enabled: true, position: "bottom" as const } } },
+  custom: { pieDataLabel: { enabled: true, category: false, position: "outside" as const, format: "value" as const } },
 };
+const axisTitle = (text: string) => ({ title: { enabled: true, text } });
+
+/** A bar or column chart's look: the axes that are named, and the figure on each bar when asked for. */
+function barStyle({ category, value, figures = false }: { readonly category?: string; readonly value?: string; readonly figures?: boolean }) {
+  return {
+    ...(figures ? { theme: { bar: { series: { label: { enabled: true, placement: "outside-end", color: "#123B3F" } } } } } : {}),
+    custom: { ...(category === undefined ? {} : { categoryAxis: axisTitle(category) }), ...(value === undefined ? {} : { valueAxis: axisTitle(value) }) },
+  };
+}
 // Titles wrap rather than cut off, so every title reads in full whatever the width.
 const title = (text: string) => ({ enabled: true, text, wrapping: true });
 
@@ -128,6 +137,8 @@ export type ReportOptions = {
   readonly narrow: boolean;
   /** Where the proof's numbers were measured, from the shop summary. Null while it is not known. */
   readonly source: string | null;
+  /** How many weeks ahead the forecast looks, from the shop summary. Left out when the summary does not say. */
+  readonly horizonWeeks?: number | undefined;
 };
 
 const PROOF_NOTE = "Tested on a real shop's history. Every bar is read live from Mend's database.";
@@ -205,7 +216,7 @@ function shopPage(options: ReportOptions): PageSpec {
       {
         id: "forecast",
         kind: "chart",
-        wide: place(0, 4, 10, 10),
+        wide: place(0, 4, 8, 10),
         widget: {
           type: "bar-chart-stacked",
           dataMapping: {
@@ -213,13 +224,13 @@ function shopPage(options: ReportOptions): PageSpec {
             valueKey: [field("forecast_groups.customers", "sum")],
             legendKey: [field("forecast_groups.sort_order")],
           },
-          format: { title: title("Quiet regulars by forecast group"), crossFilter: "none" },
+          format: { title: title("Quiet regulars by forecast group"), crossFilter: "none", style: barStyle({ value: "Quiet regulars" }) },
         },
       },
       {
         id: "payable",
         kind: "chart",
-        wide: place(10, 4, 6, 10),
+        wide: place(8, 4, 8, 10),
         widget: {
           type: "donut-chart",
           dataMapping: { categoryKey: [field("regulars.list_status")], valueKey: [field("regulars.id", "count")] },
@@ -238,7 +249,11 @@ function shopPage(options: ReportOptions): PageSpec {
             valueKey: [field("regulars.expected_orders", "sum")],
             legendKey: [field("regulars.list_status")],
           },
-          format: { title: title(`Silent days against expected orders, top ${LIST_SIZE}`), crossFilter: "filter" },
+          format: {
+            title: title(`Silent days against expected orders, top ${LIST_SIZE}`),
+            crossFilter: "filter",
+            style: { custom: { categoryAxis: axisTitle("Days silent"), valueAxis: axisTitle(options.horizonWeeks === undefined ? "Expected orders" : `Expected orders in the next ${options.horizonWeeks} weeks`) } },
+          },
         },
       },
       {
@@ -273,7 +288,7 @@ function proofPage(options: ReportOptions): PageSpec {
             valueKey: [field("proof_groups.share", "sum")],
             legendKey: [field("proof_groups.sort_order")],
           },
-          format: { title: title("Quiet regulars who came back on their own"), crossFilter: "none" },
+          format: { title: title("Quiet regulars who came back on their own"), crossFilter: "none", style: barStyle({ value: "Share who came back (%)", figures: true }) },
         },
       },
       {
@@ -283,7 +298,11 @@ function proofPage(options: ReportOptions): PageSpec {
         widget: {
           type: "column-chart-grouped",
           dataMapping: { categoryKey: [field("proof_deciles.decile")], valueKey: [field("proof_deciles.returned_share", "sum")] },
-          format: { title: title("Who came back, by forecast group"), crossFilter: "none" },
+          format: {
+            title: title("Who came back, by forecast group"),
+            crossFilter: "none",
+            style: barStyle({ category: "Forecast group: 1 least at risk, 10 most at risk", value: "Share who bought again (%)" }),
+          },
         },
       },
       textWidget("proof-note", PROOF_NOTE, place(0, 13, 24, 4), options.narrow ? 15 : 18, sourceLine(options.source)),
@@ -347,6 +366,78 @@ export function dashboardLayout(narrow: boolean): Partial<AgPageLayoutState> {
     widgetBorderColor: STITCH,
     ...(narrow ? { minWidth: PHONE_MIN_WIDTH } : {}),
   };
+}
+
+/**
+ * The panels Studio shows. Studio's types list the AI panel for edit mode only, but its panel code accepts it in view mode, and a
+ * panel set that names only one mode leaves the other with no panels at all. In edit mode the AI panel steps aside so the page keeps
+ * the width it has in view mode. On a phone no panel is named at all, so the widgets get the whole width and not even a strip is left.
+ */
+export function dashboardPanels(narrow: boolean): AgPanelConfig {
+  return { view: { left: narrow ? [] : ["ai"], right: [] }, edit: { left: [], right: ["edit", "data"] } } as unknown as AgPanelConfig;
+}
+
+/** The names the chat panel shows for the agents a hand-off can go to. */
+const AGENT_NAMES: Readonly<Record<string, string>> = {
+  mend_analyst: "Asking the Mend analyst",
+  planning: "Planning the layout",
+  data: "Reading the numbers",
+  page: "Placing a widget",
+  widget: "Setting up the widget",
+};
+
+const TOOL_WORDS: Readonly<Record<string, string>> = {
+  complete_task: "Done",
+  read_campaign_result: "Reading the result",
+  read_forecast_groups: "Reading the forecast groups",
+  read_money: "Reading the money",
+  view_schema: "Reading the dashboard",
+  view_report: "Reading the dashboard",
+  view_page: "Reading the dashboard",
+  view_widget: "Reading the dashboard",
+  execute_query: "Reading the numbers",
+  add_widget: "Adding a widget",
+  configure_widget: "Setting up the widget",
+};
+
+const OTHER_WORDS = "Working on the dashboard";
+
+/** Studio's other tools, which all read as the general line. rename_thread is left out: Studio already hides it. */
+const OTHER_TOOLS = [
+  "position_widget",
+  "remove_widget",
+  "create_expression",
+  "update_expression",
+  "delete_expression",
+  "add_page_filter",
+  "remove_page_filter",
+  "add_widget_filter",
+  "remove_widget_filter",
+  "view_plan",
+  "create_plan",
+  "update_plan",
+  "clear_plan",
+];
+
+/** Every tool name the chat panel can show a step for, so each one gets plain words and none shows its own name. */
+export const TOOL_NAMES: readonly string[] = [...Object.keys(TOOL_WORDS), "delegate_to", ...OTHER_TOOLS];
+
+// Claude puts the agent's id inside type, or beside it, and the id may not have streamed in yet.
+function delegateTarget(args: Readonly<Record<string, unknown>>): string | undefined {
+  const { type, id } = args;
+  if (typeof type === "string") return type;
+  if (typeof type === "object" && type !== null && typeof (type as { id?: unknown }).id === "string") return (type as { id: string }).id;
+  return typeof id === "string" ? id : undefined;
+}
+
+/** The line a step shows in the chat panel. It never carries the tool's own name or any of its arguments. */
+export function toolWords(name: string, args: Readonly<Record<string, unknown>>): string {
+  if (name === "delegate_to") {
+    const target = delegateTarget(args);
+    const agent = target === undefined ? undefined : AGENT_NAMES[target];
+    return agent ?? OTHER_WORDS;
+  }
+  return TOOL_WORDS[name] ?? OTHER_WORDS;
 }
 
 /** The words that change as data arrives, by widget id. Everything else on the pages is fixed. */

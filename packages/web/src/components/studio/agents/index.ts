@@ -2,9 +2,9 @@ import { createAiHarness, directLlmRunner, type AgAiHarnessSetup, type AgAiPromp
 import { studioAdapter } from "../studio-adapter";
 import { analystAgent } from "./analyst";
 import { leadAgent, MEND_LEAD } from "./lead";
-import { analystTools, narrowed, READ_TOOL_DISPLAY, type PageFacts } from "./tools";
+import { analystTools, narrowed, type PageFacts } from "./tools";
 
-export { READ_TOOL_DISPLAY, type PageFacts };
+export { type PageFacts };
 
 export const PROMPT_STARTERS: readonly AgAiPromptStarter[] = [
   { label: "Did this campaign work?", prompt: "Did this campaign work?" },

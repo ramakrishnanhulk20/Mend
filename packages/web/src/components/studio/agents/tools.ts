@@ -176,13 +176,4 @@ export function narrowed(tool: AgAiTool, api: Pick<AgStudioApi, "getState">): Ag
   return JSON.stringify(type).includes("chart") ? asPlainChart(tool) : tool;
 }
 
-type LabelParams = { readonly result?: { readonly success: boolean } };
 
-const step = (running: string, done: string) => ({ label: ({ result }: LabelParams) => ({ text: result === undefined ? running : done }) });
-
-/** How each read looks in the chat panel. */
-export const READ_TOOL_DISPLAY = {
-  read_campaign_result: step("Reading the campaign result", "Read the campaign result"),
-  read_forecast_groups: step("Reading the forecast groups", "Read the forecast groups"),
-  read_money: step("Reading where the money is", "Read where the money is"),
-};

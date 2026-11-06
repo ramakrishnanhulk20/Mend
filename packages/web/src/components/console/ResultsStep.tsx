@@ -2,6 +2,7 @@
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { formatDay } from "@/components/live/summary";
+import { verdictTitle, windowNote } from "@/components/studio/widgets/verdict-words";
 import { ApiError, type CampaignView, type Cancelled, type ConsoleApi, type Results } from "./api";
 import { CampaignThreads } from "./CampaignThreads";
 import { formatPercent, formatUsd, plural, utcDay } from "./money";
@@ -11,15 +12,6 @@ import { FOCUS_RING, Figure, LoomLine, NoticePanel, PRIMARY_BUTTON, SECONDARY_BU
 const REFRESH_EVERY_MS = 20_000;
 
 const LABEL = "font-mono text-[12px] uppercase tracking-[0.14em] text-ink-dim";
-
-function capitalised(text: string): string {
-  return text.charAt(0).toUpperCase() + text.slice(1);
-}
-
-function verdictTitle(verdict: string): string {
-  const text = capitalised(verdict.trim());
-  return text.endsWith(".") ? text : `${text}.`;
-}
 
 type Load =
   | { kind: "loading" }
@@ -102,9 +94,11 @@ type ResultsStepProps = {
   onNewPlan: () => void;
   /** Told the id of each PayPal order a simulated purchase creates, so the Ask panel can offer to look it up. */
   onOrder: (orderId: string) => void;
+  /** Opens the dashboard. Without it the button is left out. */
+  onDashboard?: () => void;
 };
 
-export function ResultsStep({ api, campaignId, onNewPlan, onOrder }: ResultsStepProps) {
+export function ResultsStep({ api, campaignId, onNewPlan, onOrder, onDashboard }: ResultsStepProps) {
   const [load, setLoad] = useState<Load>({ kind: "loading" });
   const [attempt, setAttempt] = useState(0);
   const [pick, setPick] = useState<string | null>(null);
@@ -210,21 +204,19 @@ export function ResultsStep({ api, campaignId, onNewPlan, onOrder }: ResultsStep
               that started when the cashback was sent. It gives a verdict only when both groups are big enough to tell. A
               five-person demo group never is, and Mend says so instead of guessing.
             </p>
-            <p className="mt-2 font-mono text-[12px] text-ink-dim">
-              {results.windowStartsAt !== null && results.windowEndsAt !== null && (
-                <>
-                  Window {formatDay(utcDay(results.windowStartsAt))} to {formatDay(utcDay(results.windowEndsAt))} &middot;{" "}
-                  {results.windowOpen ? "open" : "closed"}
-                </>
-              )}
-              {results.pValue !== null && <> &middot; p = {results.pValue.toFixed(2)}</>}
-            </p>
+            <p className="mt-2 font-mono text-[12px] text-ink-dim">{windowNote(results)}</p>
           </StepHeader>
 
           <div className="grid grid-cols-1 gap-6 md:grid-cols-2 lg:grid-cols-1 xl:grid-cols-2">
             <ArmPanel title="Paid" arm={results.rewarded} />
             <ArmPanel title="Held back" arm={results.holdout} />
           </div>
+
+          {onDashboard && (
+            <button type="button" onClick={onDashboard} className={`${SECONDARY_BUTTON} mt-6 h-12 px-5 text-[15px] ${FOCUS_RING}`}>
+              Open the dashboard
+            </button>
+          )}
 
           <div className="mt-6">
             <CampaignThreads rows={view.rows} mode="sealed" statuses={statuses} />

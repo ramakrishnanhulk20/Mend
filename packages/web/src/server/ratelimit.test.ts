@@ -1,6 +1,6 @@
 // Covers which address a request is counted against, its short tag, the counting itself
 // against a real Postgres schema, including concurrent requests, each shared demo pool's
-// last 20% kept for sessions that have not drawn, a hit given back, each bucket swept
+// last part kept for sessions that have not drawn, a hit given back, each bucket swept
 // at its own window, the one audit row each window's first refusal leaves and the cap of
 // 20 such rows per bucket a minute, and, from the real constants, how long 50 addresses
 // can hold a shared pool closed. Does NOT cover: Render's proxy really appending the
@@ -220,7 +220,7 @@ describe("takeHit", () => {
     expect(await poolHits("demo_approvals_all")).toBe(100);
   });
 
-  it("keeps each shared demo pool's last 20% for sessions that have not drawn on it in the window", async () => {
+  it("keeps a shared demo pool's last part for sessions that have not drawn on it in the window", async () => {
     const pool = LIMITS.demoApprovals;
     const open = pool.max - pool.keptForNewSessions;
     await admin.query("insert into rate_limit_hits (bucket, subject) select $1, 'drawn-' || (n % 8) from generate_series(1, $2) as n", [pool.bucket, open - 2]);
@@ -238,6 +238,19 @@ describe("takeHit", () => {
     // One window on, every draw has aged out and a session that drew before may draw again.
     await admin.query("update rate_limit_hits set at = at - make_interval(secs => $1)", [pool.windowMs / 1000 + 1]);
     expect((await takeHit(pool, GLOBAL, { session: "drawn-1" })).allowed).toBe(true);
+  });
+
+  it("lets a fresh session finish a 10 call dashboard question with the pool at its keep line, and no more", async () => {
+    const pool = LIMITS.claudeStudioAll;
+    const line = pool.max - pool.keptForNewSessions;
+    await admin.query("insert into rate_limit_hits (bucket, subject) select $1, 'drawn-' || (n % 8) from generate_series(1, $2) as n", [pool.bucket, line]);
+    expect((await takeHit(pool, GLOBAL, { session: "drawn-1" })).allowed).toBe(false);
+    expect((await takeHit(pool, GLOBAL)).allowed).toBe(false);
+    for (let n = 0; n < 10; n += 1) expect((await takeHit(pool, GLOBAL, { session: "fresh-question" })).allowed).toBe(true);
+    expect((await takeHit(pool, GLOBAL, { session: "fresh-question" })).allowed).toBe(false);
+    for (let n = 0; n < 10; n += 1) expect((await takeHit(pool, GLOBAL, { session: "fresh-second" })).allowed).toBe(true);
+    expect((await takeHit(pool, GLOBAL, { session: "fresh-third" })).allowed).toBe(false);
+    expect(await poolHits(pool.bucket)).toBe(pool.max);
   });
 
   it("gives a hit back: the pool draw a session made leaves the count, as if it was never taken", async () => {
@@ -261,10 +274,11 @@ describe("takeHit", () => {
     expect((await takeHit(LIMITS.cancelUnclaimed, "another-session")).allowed).toBe(true);
   });
 
-  it("gives each client address its own share of the demo: 4 demo sessions an hour and 10 a day, 80 demo Claude calls a day, 10 demo approvals and 10 simulates an hour", () => {
+  it("gives each client address its own share of the demo: 4 demo sessions an hour and 10 a day, 80 demo Claude calls and 60 dashboard calls a day, 10 demo approvals and 10 simulates an hour", () => {
     expect(LIMITS.demoSession).toEqual({ bucket: "demo_session", max: 4, windowMs: HOUR_MS, per: "address" });
     expect(LIMITS.demoSessionDay).toEqual({ bucket: "demo_session_day", max: 10, windowMs: DAY_MS, per: "address" });
     expect(LIMITS.claudeDemoAddress).toEqual({ bucket: "claude_demo_address", max: 80, windowMs: DAY_MS, per: "address" });
+    expect(LIMITS.claudeStudioAddress).toEqual({ bucket: "claude_studio_address", max: 60, windowMs: DAY_MS, per: "address" });
     expect(LIMITS.demoApprovalsAddress).toEqual({ bucket: "demo_approvals_address", max: 10, windowMs: HOUR_MS, per: "address" });
     expect(LIMITS.simulateAddress).toEqual({ bucket: "simulate_address", max: 10, windowMs: HOUR_MS, per: "address" });
   });
@@ -272,6 +286,11 @@ describe("takeHit", () => {
   it("lets 50 addresses hold no shared pool closed for longer than its window, at most an hour, and lets no one address close one alone", () => {
     const ATTACKERS = 50;
     expect(LIMITS.claudeDemoAll).toEqual({ bucket: "claude_demo_all", max: 50, windowMs: HOUR_MS, per: "all", keptForNewSessions: 10 });
+    expect(LIMITS.claudeStudioAll).toEqual({ bucket: "claude_studio_all", max: 120, windowMs: HOUR_MS, per: "all", keptForNewSessions: 20, keptDraws: 10 });
+    expect(LIMITS.claudeStudioSession).toEqual({ bucket: "claude_studio_session", max: 30, windowMs: DAY_MS, per: "session" });
+    expect(LIMITS.claudeStudioSessionHour).toEqual({ bucket: "claude_studio_session_hour", max: 24, windowMs: HOUR_MS, per: "session" });
+    expect(LIMITS.demoApprovals).toEqual({ bucket: "demo_approvals_all", max: 100, windowMs: HOUR_MS, per: "all", keptForNewSessions: 20 });
+    expect(LIMITS.simulates).toEqual({ bucket: "simulates_all", max: 100, windowMs: HOUR_MS, per: "all", keptForNewSessions: 20 });
     expect([LIMITS.claudeDemoSession.max, LIMITS.claudeDemoAddress.max]).toEqual([40, 80]);
     expect(LIMITS.demoSubmitsAddress).toEqual({ bucket: "demo_submits_address", max: 4, windowMs: DAY_MS, per: "address" });
     // 1000 is the engine's DEMO_CAMPAIGN_CAP_MINOR and 5000 its DEMO_DAILY_CAP_MINOR (tasks.py),
@@ -283,20 +302,22 @@ describe("takeHit", () => {
     const liveSessions = LIMITS.demoSessionDay.max;
     const demoPools: readonly (readonly [Limit, Limit & { readonly keptForNewSessions: number }])[] = [
       [LIMITS.claudeDemoAddress, LIMITS.claudeDemoAll],
+      [LIMITS.claudeStudioAddress, LIMITS.claudeStudioAll],
       [LIMITS.demoApprovalsAddress, LIMITS.demoApprovals],
       [LIMITS.simulateAddress, LIMITS.simulates],
     ];
     for (const [share, pool] of demoPools) {
       expect([share.per, pool.per], pool.bucket).toEqual(["address", "all"]);
-      expect(pool.keptForNewSessions, pool.bucket).toBe(pool.max / 5);
+      expect(pool.keptForNewSessions, pool.bucket).toBeGreaterThanOrEqual(liveSessions);
       // One address's draws in one window of the pool: its share over that window, and past
-      // the pool's open part only one draw per live session that had not drawn yet.
+      // the pool's open part only the kept draws of each live session.
       const shareInWindow = share.max * Math.ceil(pool.windowMs / share.windowMs);
-      const oneAddress = Math.min(shareInWindow, pool.max - pool.keptForNewSessions + liveSessions - 1);
+      const keptDraws = pool.keptDraws ?? 1;
+      const oneAddress = Math.min(shareInWindow, pool.max - pool.keptForNewSessions + liveSessions * keptDraws - 1);
       expect(oneAddress, pool.bucket).toBeLessThan(pool.max);
       // Fifty addresses together can fill it, but each draw counts only inside the pool's
       // window, so the longest it stays closed after their last draw is that window.
-      const fiftyAddresses = Math.min(ATTACKERS * shareInWindow, pool.max - pool.keptForNewSessions + ATTACKERS * liveSessions);
+      const fiftyAddresses = Math.min(ATTACKERS * shareInWindow, pool.max - pool.keptForNewSessions + ATTACKERS * liveSessions * keptDraws);
       expect(fiftyAddresses, pool.bucket).toBeGreaterThanOrEqual(pool.max);
       expect(pool.windowMs, pool.bucket).toBeLessThanOrEqual(HOUR_MS);
     }

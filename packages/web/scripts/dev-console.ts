@@ -42,7 +42,7 @@ const PYTHON = path.join(ENGINE_DIR, ".venv", process.platform === "win32" ? "Sc
 const SCHEMA = "console_dev";
 const DEFAULT_PORT = 3001;
 const REQUIRED = ["PAYPAL_CLIENT_ID", "PAYPAL_CLIENT_SECRET", "ANTHROPIC_API_KEY", "MEND_TEST_RECEIVER"] as const;
-const PASSED_WHEN_SET = ["PAYPAL_READ_CLIENT_ID", "PAYPAL_READ_CLIENT_SECRET", "MEND_OWNER_PASSWORD"] as const;
+const PASSED_WHEN_SET = ["PAYPAL_READ_CLIENT_ID", "PAYPAL_READ_CLIENT_SECRET", "MEND_OWNER_PASSWORD", "AG_STUDIO_LICENSE_KEY"] as const;
 // The web config needs a webhook id to load. No webhook reaches this machine; the jobs read PayPal instead.
 const UNUSED_WEBHOOK_ID = "CONSOLEDEVNOWEBHOOK";
 const JOBS_EVERY_MS = 30_000;

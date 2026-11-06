@@ -7,6 +7,7 @@ import { ApproveStep } from "./ApproveStep";
 import { createConsoleApi } from "./api";
 import { AskPanel } from "./AskPanel";
 import { BreakItStep } from "./BreakItStep";
+import { DashboardStep } from "./DashboardStep";
 import { PayoutStep } from "./PayoutStep";
 import { PlanStep } from "./PlanStep";
 import { RegularsStep } from "./RegularsStep";
@@ -14,7 +15,7 @@ import { ResultsStep } from "./ResultsStep";
 import { ShopCard } from "./ShopCard";
 import { StartStep } from "./StartStep";
 import { stepFromQuery } from "./steps";
-import { StepProgress, type Step } from "./StepRail";
+import { OpenDashboardContext, StepProgress, type Step } from "./StepRail";
 import { TopBar, type SessionInfo } from "./TopBar";
 import { EASE, FOCUS_RING } from "./ui";
 
@@ -32,6 +33,7 @@ const BUILT_STEPS: readonly Step[] = [
   "payout",
   "results",
   "breakit",
+  "dashboard",
 ];
 
 // Private browsing and blocked storage throw on access, and the console works without it.
@@ -61,7 +63,18 @@ function saveStep(step: Step) {
   if (BUILT_STEPS.includes(step)) writeSaved(STEP_KEY, step);
 }
 
-export function Console() {
+// Below lg the aside steps aside (contents) so the shop card sits first and the Ask panel last, under the step.
+// From lg up it scrolls inside itself when shop card and a long chat are taller than the screen, so the box to type in is never out of reach.
+// The padding with the matching negative margin leaves room inside the scroll box for the patches' shadows.
+const ASIDE =
+  "contents lg:-mx-6 lg:-mb-[56px] lg:-mt-6 lg:block lg:order-last lg:sticky lg:top-[72px] lg:max-h-[calc(100svh-5.5rem)] lg:self-start lg:overflow-y-auto lg:px-6 lg:pb-[56px] lg:pt-6 lg:[scrollbar-color:var(--color-ink-faint)_transparent] lg:[scrollbar-width:thin]";
+
+type ConsoleProps = {
+  /** Studio's licence key, read on the server. Empty runs Studio unlicensed, which only the trial watermark notices. */
+  studioLicenseKey?: string;
+};
+
+export function Console({ studioLicenseKey = "" }: ConsoleProps) {
   const still = useStill();
   const [checked, setChecked] = useState(false);
   const [step, setStep] = useState<Step>("start");
@@ -76,6 +89,7 @@ export function Console() {
   const [askOnScreen, setAskOnScreen] = useState(false);
   const signedIn = session !== null;
   // The step "Back to the demo" returns to. "start" never counts: with a session open there is nothing to go back to there.
+  // Break it and the dashboard are side trips, so neither counts either.
   const lastJourneyStep = useRef<Step>("regulars");
   // null until the address bar has been read. A ref, not state, because strict mode runs the mount effect twice and
   // the first run has already cleared the query by the time the second one looks.
@@ -87,7 +101,7 @@ export function Console() {
   }, []);
 
   useEffect(() => {
-    if (step !== "breakit" && step !== "start") lastJourneyStep.current = step;
+    if (step !== "breakit" && step !== "dashboard" && step !== "start") lastJourneyStep.current = step;
   }, [step]);
 
   const forgetEverything = useCallback(() => {
@@ -207,6 +221,7 @@ export function Console() {
 
   // The rail has the Break it item from lg up and the phone progress line has the button below it. Both need a session to open it in.
   const toBreakIt = session !== null ? () => goTo("breakit") : undefined;
+  const toDashboard = session !== null ? () => goTo("dashboard") : undefined;
 
   function renderStep() {
     if (step === "regulars") return <RegularsStep api={api} onPlan={toPlan} />;
@@ -232,7 +247,24 @@ export function Console() {
     }
     if (step === "results" && campaignId !== null) {
       return (
-        <ResultsStep api={api} campaignId={campaignId} onNewPlan={newPlan} onOrder={setOrderId} />
+        <ResultsStep
+          api={api}
+          campaignId={campaignId}
+          onNewPlan={newPlan}
+          onOrder={setOrderId}
+          onDashboard={toDashboard}
+        />
+      );
+    }
+    if (step === "dashboard") {
+      return (
+        <DashboardStep
+          api={api}
+          campaignId={campaignId}
+          licenseKey={studioLicenseKey}
+          onPlan={toPlan}
+          onBack={() => goTo(lastJourneyStep.current)}
+        />
       );
     }
     if (step === "breakit") {
@@ -251,25 +283,28 @@ export function Console() {
     return <StartStep api={api} notice={notice} onStarted={started} />;
   }
 
+  // The dashboard needs the whole width, so the shop card and the Ask panel step aside there. Hiding the
+  // aside instead of removing it keeps the Ask panel's conversation for when the visitor comes back.
+  const fullWidth = step === "dashboard";
+
   return (
     <MotionConfig reducedMotion="user">
       {/* Below lg the Ask Mend shortcut floats over the bottom corner, so the page ends far enough down to clear it. */}
       <div className="min-h-svh bg-paper pb-20 text-ink lg:pb-0">
-        <TopBar
-          step={step}
-          session={session}
-          ending={ending}
-          onEnd={endSession}
-          onBreakIt={toBreakIt}
-        />
-        <StepProgress step={step} onBreakIt={toBreakIt} />
+        <OpenDashboardContext.Provider value={toDashboard}>
+          <TopBar
+            step={step}
+            session={session}
+            ending={ending}
+            onEnd={endSession}
+            onBreakIt={toBreakIt}
+          />
+        </OpenDashboardContext.Provider>
+        <StepProgress step={step} onBreakIt={toBreakIt} onDashboard={toDashboard} />
 
         <div className="mx-auto max-w-[1440px] px-4 pb-10 pt-7 md:px-8">
-          <div className="flex flex-col gap-6 lg:grid lg:grid-cols-[minmax(0,1fr)_340px] lg:gap-8">
-            {/* Below lg the aside steps aside (contents) so the shop card sits first and the Ask panel last, under the step.
-                From lg up it scrolls inside itself when shop card and a long chat are taller than the screen, so the box to type in is never out of reach.
-                The padding with the matching negative margin leaves room inside the scroll box for the patches' shadows. */}
-            <aside className="contents lg:-mx-6 lg:-mb-[56px] lg:-mt-6 lg:block lg:order-last lg:sticky lg:top-[72px] lg:max-h-[calc(100svh-5.5rem)] lg:self-start lg:overflow-y-auto lg:px-6 lg:pb-[56px] lg:pt-6 lg:[scrollbar-color:var(--color-ink-faint)_transparent] lg:[scrollbar-width:thin]">
+          <div className={`flex flex-col gap-6 lg:grid lg:gap-8 ${fullWidth ? "lg:grid-cols-1" : "lg:grid-cols-[minmax(0,1fr)_340px]"}`}>
+            <aside className={fullWidth ? "hidden" : ASIDE}>
               <ShopCard />
               {session !== null && <AskPanel api={api} orderId={orderId} openRequest={askRequest} />}
             </aside>
@@ -294,7 +329,7 @@ export function Console() {
         </div>
 
         <AnimatePresence>
-          {session !== null && step !== "breakit" && !askOnScreen && (
+          {session !== null && step !== "breakit" && step !== "dashboard" && !askOnScreen && (
             <motion.button
               key="ask-shortcut"
               type="button"

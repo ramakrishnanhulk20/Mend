@@ -14,14 +14,27 @@
  * one is used up; and after the answer logs its token counts and stop reason, never its
  * content, and adds its tokens to every budget it counts on.
  *
+ * Purpose "studio", the dashboard's agents, runs that same middleware but takes every call
+ * hit on counts of its own (a session's hour and day, an address's day, one pool), so a
+ * chat on the dashboard can never use up the calls the plan, the notes and Ask Mend need.
+ * Its tokens count on the same rows as every demo call, so total spend keeps one ceiling,
+ * and it stops early at STUDIO_TOKEN_STOPS, which leaves the rest of each budget for plans
+ * and notes. An owner's calls are the same for every purpose.
+ *
  * Covers: a bug elsewhere putting an email or a secret into a prompt, a loop spending
  * the key's credit, a visitor sending a few huge prompts inside the call caps, a base
  * URL changed by the environment. Does not cover personal data that is not an email
- * address (names never enter a prompt by design: notes.ts and agent.ts build every
- * prompt from listed fields), or what the model says back, which every caller treats as
+ * address: goal.ts, notes.ts and agent.ts build every prompt from listed fields that hold
+ * no customer name, but purpose "studio" is C15's one exception. The dashboard's tables
+ * hold a customer's display name and the data agent's execute_query can put it in a
+ * prompt. That name is shop_customers.display_name, which identities.py generates from a
+ * hash of the customer's reference: a made-up first name and initial, such as "Maya R.",
+ * never a real person's name, even on a row for a member who really joined. Nor does
+ * this cover what the model says back, which every caller treats as
  * untrusted text. A budget is checked before a call and charged after it, so calls
  * already in flight when a budget fills each finish: one visitor can go over by what
- * its own concurrent calls use, which the call caps bound.
+ * its own concurrent calls use, which the call caps bound. Dashboard turns run one at a
+ * time per session (studio-agent.ts), so a session goes over its stop by at most one call.
  */
 import Anthropic, { type Middleware } from "@anthropic-ai/sdk";
 import { database } from "./db";
@@ -50,7 +63,7 @@ const EMAILS = new RegExp(EMAIL.source, "g");
 const FORMAT_CHARACTERS = /\p{Cf}/gu;
 const CONTROLS_BUT_NEWLINE_AND_TAB = /(?![\n\t])\p{Cc}/gu;
 
-export type Purpose = "goal" | "note" | "agent";
+export type Purpose = "goal" | "note" | "agent" | "studio";
 /** Why the calls of one request stopped early. */
 export type Stop = "limit_reached" | "claude_token_cap" | "outbound_refused" | "timed_out";
 /** What went wrong with a Claude call, as a fixed code a route can answer with. */
@@ -68,6 +81,9 @@ export const FAILURE_MESSAGES: Readonly<Record<Failure | "no_key", string>> = {
   unavailable: "The AI service is not reachable right now. Try again shortly.",
   unreadable: "The AI service gave an answer Mend could not read.",
 };
+
+/** What a person reads when the dashboard's agents reach one of their own limits: only their share is gone, so it says what still works. */
+export const STUDIO_SHARE_USED = "The analyst has used its share for now. Try again later. Plans, notes and Ask Mend still work.";
 
 /** A call refused by the middleware before anything was sent. */
 export class ClaudeStopped extends Error {
@@ -183,19 +199,24 @@ export class ClaudeSession {
  */
 export const TOKEN_BUDGETS = { demoSession: 200_000, demoAddress: 400_000, demoAll: 5_000_000, owner: 2_000_000 } as const;
 
+/** Where "studio" calls stop on each of the same rows, leaving the rest of each of TOKEN_BUDGETS for plans and notes: 50,000, 100,000 and 1,500,000. */
+export const STUDIO_TOKEN_STOPS = { session: 150_000, address: 300_000, all: 3_500_000 } as const;
+
 type TokenBudget = { readonly name: string; readonly subject: string; readonly tokens: number };
 
 const UTC_TODAY = "(now() at time zone 'utc')::date";
 
 // claude_usage holds the session and address tags (ratelimit.ts), never the session id
 // or the address itself. The prefixes keep the two kinds of tag apart.
-function tokenBudgets(session: ClaudeSession): readonly TokenBudget[] {
+function tokenBudgets(session: ClaudeSession, purpose: Purpose): readonly TokenBudget[] {
   const { principal } = session;
   if (principal.role !== "demo") return [{ name: "owner", subject: "owner", tokens: TOKEN_BUDGETS.owner }];
+  const studio = purpose === "studio";
+  const prefix = studio ? "studio" : "demo";
   return [
-    { name: "demo_session", subject: `session:${sessionTag(principal.sessionId)}`, tokens: TOKEN_BUDGETS.demoSession },
-    { name: "demo_address", subject: `address:${addressTag(session.address)}`, tokens: TOKEN_BUDGETS.demoAddress },
-    { name: "demo_all", subject: "demo_all", tokens: TOKEN_BUDGETS.demoAll },
+    { name: `${prefix}_session`, subject: `session:${sessionTag(principal.sessionId)}`, tokens: studio ? STUDIO_TOKEN_STOPS.session : TOKEN_BUDGETS.demoSession },
+    { name: `${prefix}_address`, subject: `address:${addressTag(session.address)}`, tokens: studio ? STUDIO_TOKEN_STOPS.address : TOKEN_BUDGETS.demoAddress },
+    { name: `${prefix}_all`, subject: "demo_all", tokens: studio ? STUDIO_TOKEN_STOPS.all : TOKEN_BUDGETS.demoAll },
   ];
 }
 
@@ -228,24 +249,35 @@ async function addTokens(budgets: readonly TokenBudget[], input: number, output:
 
 type Refused = { readonly why: Stop; readonly reason: string };
 
+/** The call caps one call counts against, narrowest first. */
+function callCaps(session: ClaudeSession, purpose: Purpose): readonly (readonly [Limit, string])[] {
+  const { principal } = session;
+  if (principal.role !== "demo") return [[LIMITS.claudeOwner, GLOBAL]];
+  if (purpose === "studio") {
+    return [
+      [LIMITS.claudeStudioSessionHour, principal.sessionId],
+      [LIMITS.claudeStudioSession, principal.sessionId],
+      [LIMITS.claudeStudioAddress, session.address],
+      [LIMITS.claudeStudioAll, GLOBAL],
+    ];
+  }
+  return [
+    [LIMITS.claudeDemoSession, principal.sessionId],
+    [LIMITS.claudeDemoAddress, session.address],
+    [LIMITS.claudeDemoAll, GLOBAL],
+  ];
+}
+
 // The token budgets are read first, so a refused call takes no hit on the call caps.
 // Demo calls then count against the session, against its client address, and against
-// every demo session together; the owner's against one shared owner count. Each call
-// cap is a rolling 24 hours. The address is counted before the global cap, so one
+// every demo session together, with "studio" calls on counts of their own; the owner's
+// against one shared owner count. The address is counted before the global cap, so one
 // address stopped there never fills the count every other visitor needs.
-async function spendOneCall(session: ClaudeSession, budgets: readonly TokenBudget[]): Promise<Refused | null> {
+async function spendOneCall(session: ClaudeSession, budgets: readonly TokenBudget[], purpose: Purpose): Promise<Refused | null> {
   const reached = await reachedBudget(budgets);
   if (reached !== null) return { why: "claude_token_cap", reason: `tokens_${reached.name}` };
   const { principal } = session;
-  const caps: readonly (readonly [Limit, string])[] =
-    principal.role === "demo"
-      ? [
-          [LIMITS.claudeDemoSession, principal.sessionId],
-          [LIMITS.claudeDemoAddress, session.address],
-          [LIMITS.claudeDemoAll, GLOBAL],
-        ]
-      : [[LIMITS.claudeOwner, GLOBAL]];
-  for (const [limit, subject] of caps) {
+  for (const [limit, subject] of callCaps(session, purpose)) {
     // The session lets a shared pool keep its last share for visitors who have not drawn on it yet.
     const hit = await takeHit(limit, subject, { session: principal.sessionId });
     if (!hit.allowed) return { why: "limit_reached", reason: limit.bucket };
@@ -281,8 +313,8 @@ function guard(session: ClaudeSession, purpose: Purpose, label: string | null): 
     if (typeof request.body !== "string") throw refusal("outbound_refused", "body_shape");
     const problem = outboundProblem(request.body);
     if (problem !== null) throw refusal("outbound_refused", problem);
-    const budgets = tokenBudgets(session);
-    const refused = await spendOneCall(session, budgets);
+    const budgets = tokenBudgets(session, purpose);
+    const refused = await spendOneCall(session, budgets, purpose);
     if (refused !== null) throw refusal(refused.why, refused.reason);
     session.calls += 1;
 
@@ -368,11 +400,12 @@ export function failureOf(error: unknown, session: ClaudeSession): Failure {
 /**
  * A refusal whose message says plainly what happened with the AI part (6n, C20): the
  * error code, one of the code-owned messages above, and the correlation id. The detail
- * stays in the log (C26).
+ * stays in the log (C26). purpose "studio" reads STUDIO_SHARE_USED for its two limits.
  */
-export function aiRefusal(route: string, ref: string, status: number, error: Failure | "no_key", detail: Readonly<Record<string, unknown>> = {}): Response {
+export function aiRefusal(route: string, ref: string, status: number, error: Failure | "no_key", detail: Readonly<Record<string, unknown>> = {}, purpose: Purpose | null = null): Response {
   writeLog({ kind: "api", route, ref, status, outcome: "refused", error, ...detail });
-  return reply(status, { error, message: FAILURE_MESSAGES[error], ref });
+  const ownShare = purpose === "studio" && (error === "limit_reached" || error === "claude_token_cap");
+  return reply(status, { error, message: ownShare ? STUDIO_SHARE_USED : FAILURE_MESSAGES[error], ref });
 }
 
 /** The HTTP status for a Claude failure a route cannot work around. */

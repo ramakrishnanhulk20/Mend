@@ -19,6 +19,8 @@
   },
   "dependencies": {
     "@anthropic-ai/sdk": "1.3.0",
+    "ag-studio": "3.0.0",
+    "ag-studio-react": "3.0.0",
     "fumadocs-core": "16.17.9",
     "fumadocs-mdx": "15.4.10",
     "fumadocs-ui": "16.17.9",

@@ -3,6 +3,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { motion } from "motion/react";
 import { useStill } from "@/components/motion/useStill";
+import { SENT_STATUSES } from "@/components/studio/dashboard-data";
 import { ApiError, type CampaignView, type ConsoleApi, type Results } from "./api";
 import { CampaignThreads } from "./CampaignThreads";
 import { formatUsd, plural } from "./money";
@@ -25,9 +26,6 @@ const SLOW_POLL_MS = 20_000;
 const FAST_POLL_UNTIL_MS = 120_000;
 const STOP_POLLING_AFTER_MS = 15 * 60_000;
 const COPIED_FOR_MS = 1_500;
-
-// The campaign statuses that mean the batch has already gone to PayPal and is being paid.
-const SENT_STATUSES = ["submitted", "completed"];
 
 const DAILY_BUDGET_LINE = "The demo has paid out its daily budget across all visitors. Try again tomorrow.";
 

@@ -42,9 +42,11 @@ export type Per = "address" | "session" | "all";
 /**
  * A count of max requests in a sliding window. keptForNewSessions, on a pool shared by
  * every demo visitor: the last that many of max are kept for sessions that have not drawn
- * on the pool in the current window.
+ * on the pool in the current window. keptDraws: how many draws a session may make before it
+ * stops counting as new, 1 when unset. A pool whose work comes in steps sets it to one whole
+ * job, so a visitor let in at the keep line can finish instead of stopping after one step.
  */
-export type Limit = { readonly bucket: string; readonly max: number; readonly windowMs: number; readonly per: Per; readonly keptForNewSessions?: number };
+export type Limit = { readonly bucket: string; readonly max: number; readonly windowMs: number; readonly per: Per; readonly keptForNewSessions?: number; readonly keptDraws?: number };
 
 const MINUTE_MS = 60 * 1000;
 const HOUR_MS = 60 * MINUTE_MS;
@@ -53,12 +55,13 @@ const DAY_MS = 24 * HOUR_MS;
 // Per-session limits count against a session id this server issued, per-address ones
 // against clientAddress. The "all" limits count every caller together (subject GLOBAL),
 // the global caps C20 asks for on demo Claude calls, demo approvals and simulates; the
-// engine's demo pool caps demo spending on top. Each shared demo pool keeps its last 20%
-// for sessions that have not drawn on it in the window, and has a per-address share, so
-// no one address can close a whole pool, and no pool counts over more than an hour, so a
-// pool many addresses fill opens again within the hour (ratelimit.test.ts checks both
-// from these numbers). Where a route takes several, the narrowest is taken first, so a
-// caller stopped there never fills a wider count.
+// engine's demo pool caps demo spending on top. Each shared demo pool keeps its last part
+// for sessions that have not drawn on it in the window, at least one draw for every session
+// an address can hold open, and has a per-address share, so no one address can close a
+// whole pool, and no pool counts over more than an hour, so a pool many addresses fill
+// opens again within the hour (ratelimit.test.ts checks both from these numbers). Where a
+// route takes several, the narrowest is taken first, so a caller stopped there never fills
+// a wider count.
 export const LIMITS = {
   signIn: { bucket: "sign_in", max: 10, windowMs: 15 * 60 * 1000, per: "address" },
   // Each demo session opens a fresh set of per-session counts, so the number one address
@@ -93,6 +96,14 @@ export const LIMITS = {
   claudeDemoSession: { bucket: "claude_demo_session", max: 40, windowMs: DAY_MS, per: "session" },
   claudeDemoAddress: { bucket: "claude_demo_address", max: 80, windowMs: DAY_MS, per: "address" },
   claudeDemoAll: { bucket: "claude_demo_all", max: 50, windowMs: HOUR_MS, per: "all", keptForNewSessions: 10 },
+  // One dashboard question takes 4 to 10 calls, so the dashboard's agents draw on counts of
+  // their own at every level, and a visitor chatting with them can never stop the next one
+  // drafting a plan. keptDraws is one whole question, so a visitor let in at the keep line
+  // gets an answer rather than being refused on the second round.
+  claudeStudioSession: { bucket: "claude_studio_session", max: 30, windowMs: DAY_MS, per: "session" },
+  claudeStudioSessionHour: { bucket: "claude_studio_session_hour", max: 24, windowMs: HOUR_MS, per: "session" },
+  claudeStudioAddress: { bucket: "claude_studio_address", max: 60, windowMs: DAY_MS, per: "address" },
+  claudeStudioAll: { bucket: "claude_studio_all", max: 120, windowMs: HOUR_MS, per: "all", keptForNewSessions: 20, keptDraws: 10 },
   claudeOwner: { bucket: "claude_owner", max: 2000, windowMs: DAY_MS, per: "all" },
 } as const satisfies Record<string, Limit>;
 
@@ -231,14 +242,14 @@ async function countHit(limit: Limit, subject: string, session: string | null): 
   const counted = [limit.bucket, pooled, subject, limit.windowMs / 1000];
   return underLock(limit.bucket, lockSubject, async (client) => {
     await sweep(client);
-    const { rows } = await client.query<{ n: number; drawn: boolean }>(
-      `select count(*)::int as n, coalesce(bool_or(subject = $5), false) as drawn from rate_limit_hits where ${COUNTED}`,
+    const { rows } = await client.query<{ n: number; drawn: number }>(
+      `select count(*)::int as n, (count(*) filter (where subject = $5))::int as drawn from rate_limit_hits where ${COUNTED}`,
       [...counted, session ?? GLOBAL],
     );
     const { n, drawn } = rows[0];
     const kept = limit.keptForNewSessions ?? 0;
-    // A caller naming no session cannot show it has not drawn, so the kept part is closed to it.
-    const closedAt = kept > 0 && (session === null || drawn) ? limit.max - kept : limit.max;
+    // A caller naming no session cannot show it is new, so the kept part is closed to it.
+    const closedAt = kept > 0 && (session === null || drawn >= (limit.keptDraws ?? 1)) ? limit.max - kept : limit.max;
     if (n >= closedAt) {
       // The refusal lifts once enough of the oldest counted rows age out to bring n below closedAt.
       const { rows: waits } = await client.query<{ wait: number | null }>(
@@ -331,8 +342,8 @@ export async function recordMemoryRefusal(hit: { readonly limit: Limit; readonly
  * counted, so the refusal lifts once enough counted requests age out, and
  * retryAfterSeconds says when. For a pool every caller shares (per "all", subject
  * GLOBAL), draw.session names the session drawing: once the pool holds max minus
- * keptForNewSessions, only a session with no draw on it in the window may take one of
- * the kept part, and a call naming no session may not. The first refusal in each window
+ * keptForNewSessions, only a session with fewer than keptDraws draws on it in the window
+ * may take one of the kept part, and a call naming no session may not. The first refusal in each window
  * for this bucket and subject is written to the audit log after the count's own
  * connection is released; that write never changes the answer.
  */

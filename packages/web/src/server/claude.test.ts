@@ -4,9 +4,10 @@
 // address the engine's receiver rule accepts, as the engine itself judges them), the
 // secret refusal (the listed settings and every setting whose name says it is secret,
 // with the minimum length the log scrubber and the audit rule share), one hit on each
-// call cap per HTTP call including each tool-runner round, the token budgets per demo
-// session, demo address, all demo traffic and the owner, each call's usage added in one
-// statement, error codes, and token logging without content. Does NOT cover:
+// call cap per HTTP call including each tool-runner round, the dashboard's "studio" calls
+// on their own session, address and pool counts with their own stops on the shared token rows, the token
+// budgets per demo session, demo address, all demo traffic and the owner, each call's usage
+// added in one statement, error codes, and token logging without content. Does NOT cover:
 // the real API (npm run prove:m6), the call caps counted in Postgres (ratelimit.test.ts),
 // or the prompts each caller builds (goal, notes and agent tests).
 import { spawn, spawnSync } from "node:child_process";
@@ -21,7 +22,7 @@ import { z } from "zod";
 import { ENGINE_DIR, SCHEMA_PATH, type DevDatabase } from "../../scripts/dev-database";
 import type { SignedIn } from "./permissions";
 
-const state = vi.hoisted(() => ({ hits: [] as { bucket: string; subject: string }[], refuse: null as string | null }));
+const state = vi.hoisted(() => ({ hits: [] as { bucket: string; subject: string }[], refuse: null as string | string[] | null }));
 
 vi.mock("./ratelimit", async (importOriginal) => {
   const actual = await importOriginal<typeof import("./ratelimit")>();
@@ -29,12 +30,12 @@ vi.mock("./ratelimit", async (importOriginal) => {
     ...actual,
     takeHit: vi.fn(async (limit: { bucket: string }, subject: string) => {
       state.hits.push({ bucket: limit.bucket, subject });
-      return limit.bucket === state.refuse ? { allowed: false, retryAfterSeconds: 60 } : { allowed: true };
+      return [state.refuse].flat().includes(limit.bucket) ? { allowed: false, retryAfterSeconds: 60 } : { allowed: true };
     }),
   };
 });
 
-const { ClaudeKeyMissing, ClaudeSession, ClaudeStopped, FAILURE_MESSAGES, MODEL, claudeClient, failureOf, failureStatus, hasClaudeKey, outboundProblem, plainText, withoutEmails } =
+const { ClaudeKeyMissing, ClaudeSession, ClaudeStopped, FAILURE_MESSAGES, MODEL, STUDIO_TOKEN_STOPS, TOKEN_BUDGETS, claudeClient, failureOf, failureStatus, hasClaudeKey, outboundProblem, plainText, withoutEmails } =
   await import("./claude");
 const { MIN_SECRET_CHARS, scrubbed } = await import("./permissions");
 const { secretValues } = await import("./secrets");
@@ -102,6 +103,16 @@ function visitor(): SignedIn {
 function ask(session: InstanceType<typeof ClaudeSession>, content = "hi") {
   return claudeClient(session, "goal").messages.create({ model: MODEL, max_tokens: 100, messages: [{ role: "user", content }] });
 }
+
+function askStudio(session: InstanceType<typeof ClaudeSession>) {
+  return claudeClient(session, "studio").messages.create({ model: MODEL, max_tokens: 100, messages: [{ role: "user", content: "hi" }] });
+}
+
+const refusal = (call: Promise<unknown>) =>
+  call.then(
+    () => null,
+    (caught: unknown) => caught,
+  );
 
 /** What ask() settles to: the error a refused call throws, or null for an answered one. */
 async function outcome(session: InstanceType<typeof ClaudeSession>): Promise<unknown> {
@@ -228,6 +239,142 @@ describe("a Claude call", () => {
     expect(sent).toEqual([]);
     expect(session.calls).toBe(0);
     expect(logged.join("")).toContain(`"reason":"${bucket}"`);
+  });
+});
+
+describe("a call from the dashboard's agents", () => {
+  it("counts on its own hour, day, address and pool counts, and never on a claude_demo count", async () => {
+    answers.push(() => message([{ type: "text", text: "ok" }]));
+    const session = new ClaudeSession(DEMO, REF, 5_000, ADDRESS);
+    await askStudio(session);
+    session.close();
+    expect(state.hits).toEqual([
+      { bucket: "claude_studio_session_hour", subject: DEMO.sessionId },
+      { bucket: "claude_studio_session", subject: DEMO.sessionId },
+      { bucket: "claude_studio_address", subject: ADDRESS },
+      { bucket: "claude_studio_all", subject: "all" },
+    ]);
+  });
+
+  it("goes through the same middleware: an email in the body is refused before anything is sent or counted", async () => {
+    const session = new ClaudeSession(DEMO, REF, 5_000, ADDRESS);
+    const call = claudeClient(session, "studio").messages.create({ model: MODEL, max_tokens: 100, messages: [{ role: "user", content: "write to maya@shop.example" }] });
+    await expect(call).rejects.toBeInstanceOf(ClaudeStopped);
+    session.close();
+    expect(sent).toEqual([]);
+    expect(state.hits).toEqual([]);
+  });
+
+  it.each(["claude_studio_session_hour", "claude_studio_session", "claude_studio_address", "claude_studio_all"])("is refused without being sent once %s is used up", async (bucket) => {
+    state.refuse = bucket;
+    const session = new ClaudeSession(DEMO, REF, 5_000, ADDRESS);
+    const error = await refusal(askStudio(session));
+    session.close();
+    expect(failureOf(error, session)).toBe("limit_reached");
+    expect(sent).toEqual([]);
+    expect(logged.join("")).toContain(`"reason":"${bucket}"`);
+  });
+
+  it.each(["claude_demo_session", "claude_demo_address", "claude_demo_all"])("still goes through when %s is used up", async (bucket) => {
+    state.refuse = bucket;
+    answers.push(() => message([{ type: "text", text: "ok" }]));
+    const session = new ClaudeSession(DEMO, REF, 5_000, ADDRESS);
+    expect(await refusal(askStudio(session))).toBeNull();
+    session.close();
+  });
+
+  it.each(["claude_studio_session_hour", "claude_studio_session", "claude_studio_address", "claude_studio_all"])("leaves a plan call free when %s is used up", async (bucket) => {
+    state.refuse = bucket;
+    answers.push(() => message([{ type: "text", text: "ok" }]));
+    const session = new ClaudeSession(DEMO, REF, 5_000, ADDRESS);
+    expect(await outcome(session)).toBeNull();
+    session.close();
+    expect(state.hits.map((hit) => hit.bucket)).toEqual(["claude_demo_session", "claude_demo_address", "claude_demo_all"]);
+  });
+
+  it("holds an owner to the one owner cap, as for every other purpose", async () => {
+    answers.push(() => message([{ type: "text", text: "ok" }]));
+    const session = new ClaudeSession(OWNER, REF, 5_000, ADDRESS);
+    await askStudio(session);
+    session.close();
+    expect(state.hits).toEqual([{ bucket: "claude_owner", subject: "all" }]);
+  });
+
+  it("stops at 150,000 of a session's tokens with the honest token message, while a plan call in that session still passes up to 200,000", async () => {
+    expect([STUDIO_TOKEN_STOPS.session, TOKEN_BUDGETS.demoSession]).toEqual([150_000, 200_000]);
+    const person = visitor();
+    const subject = `session:${sessionTag(person.sessionId)}`;
+    await admin.query(`insert into claude_usage (day, subject, input_tokens, output_tokens) values (${TODAY}, $1, 149999, 0)`, [subject]);
+    answers.push(() => message([{ type: "text", text: "ok" }], "end_turn", { input_tokens: 1, output_tokens: 0 }));
+    const under = new ClaudeSession(person, REF, 5_000, ADDRESS);
+    expect(await refusal(askStudio(under))).toBeNull();
+    under.close();
+
+    const studio = new ClaudeSession(person, REF, 5_000, ADDRESS);
+    const stopped = await refusal(askStudio(studio));
+    studio.close();
+    expect(failureOf(stopped, studio)).toBe("claude_token_cap");
+    expect(FAILURE_MESSAGES.claude_token_cap).toContain("Planning from the form");
+    expect(logged.join("")).toContain('"reason":"tokens_studio_session"');
+    expect(sent).toHaveLength(1);
+
+    answers.push(() => message([{ type: "text", text: "ok" }]));
+    const plan = new ClaudeSession(person, REF, 5_000, ADDRESS);
+    expect(await outcome(plan)).toBeNull();
+    plan.close();
+
+    await admin.query(`update claude_usage set input_tokens = 200000, output_tokens = 0 where day = ${TODAY} and subject = $1`, [subject]);
+    const spent = new ClaudeSession(person, REF, 5_000, ADDRESS);
+    expect(failureOf(await outcome(spent), spent)).toBe("claude_token_cap");
+    spent.close();
+  });
+
+  it("is refused at each of its three token stops, while a plan call passes with every studio bucket full and tokens at all three", async () => {
+    expect(STUDIO_TOKEN_STOPS).toEqual({ session: 150_000, address: 300_000, all: 3_500_000 });
+    expect([TOKEN_BUDGETS.demoSession - STUDIO_TOKEN_STOPS.session, TOKEN_BUDGETS.demoAddress - STUDIO_TOKEN_STOPS.address, TOKEN_BUDGETS.demoAll - STUDIO_TOKEN_STOPS.all]).toEqual([50_000, 100_000, 1_500_000]);
+    const person = visitor();
+    const stops = [
+      ["studio_session", `session:${sessionTag(person.sessionId)}`, STUDIO_TOKEN_STOPS.session],
+      ["studio_address", `address:${addressTag(ADDRESS)}`, STUDIO_TOKEN_STOPS.address],
+      ["studio_all", "demo_all", STUDIO_TOKEN_STOPS.all],
+    ] as const;
+    const reach = (subject: string, used: number) => admin.query(`insert into claude_usage (day, subject, input_tokens, output_tokens) values (${TODAY}, $1, $2, 0)`, [subject, used]);
+    for (const [name, subject, used] of stops) {
+      await admin.query("delete from claude_usage");
+      await reach(subject, used);
+      const studio = new ClaudeSession(person, REF, 5_000, ADDRESS);
+      const stopped = await refusal(askStudio(studio));
+      studio.close();
+      expect(failureOf(stopped, studio)).toBe("claude_token_cap");
+      expect(logged.join("")).toContain(`"reason":"tokens_${name}"`);
+    }
+    expect(sent).toEqual([]);
+
+    await admin.query("delete from claude_usage");
+    for (const [, subject, used] of stops) await reach(subject, used);
+    state.refuse = ["claude_studio_session_hour", "claude_studio_session", "claude_studio_address", "claude_studio_all"];
+    state.hits = [];
+    answers.push(() => message([{ type: "text", text: "ok" }]));
+    const plan = new ClaudeSession(person, REF, 5_000, ADDRESS);
+    expect(await outcome(plan)).toBeNull();
+    plan.close();
+    expect(state.hits.map((hit) => hit.bucket)).toEqual(["claude_demo_session", "claude_demo_address", "claude_demo_all"]);
+  });
+
+  it("adds its tokens to the same budgets as a plan call, so total spend keeps one ceiling", async () => {
+    const person = visitor();
+    answers.push(() => message([{ type: "text", text: "ok" }], "end_turn", { input_tokens: 40, output_tokens: 2 }));
+    const studio = new ClaudeSession(person, REF, 5_000, ADDRESS);
+    await askStudio(studio);
+    studio.close();
+    answers.push(() => message([{ type: "text", text: "ok" }], "end_turn", { input_tokens: 40, output_tokens: 2 }));
+    const plan = new ClaudeSession(person, REF, 5_000, ADDRESS);
+    await ask(plan);
+    plan.close();
+    const { rows } = await admin.query<{ subject: string; used: string }>("select subject, (input_tokens + output_tokens)::text as used from claude_usage order by subject");
+    expect(rows).toEqual(
+      [`address:${addressTag(ADDRESS)}`, "demo_all", `session:${sessionTag(person.sessionId)}`].sort().map((subject) => ({ subject, used: "84" })),
+    );
   });
 });
 

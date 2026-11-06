@@ -70,7 +70,7 @@ const DATABASE = {
 };
 // Never on any service: Render keys are account-wide, and the rest are local development settings.
 const NEVER_ON_RENDER = ["RENDER_API_KEY", "MEND_DEV", "MEND_TEST_RECEIVER", "MEND_BRIDGE_URL", "MEND_BRIDGE_TOKEN", "MEND_WORKFLOW_SLUG", "MEND_DEV_REFRESH_AFTER_SECONDS"];
-const WEB_ONLY = ["MEND_OWNER_PASSWORD", "ANTHROPIC_API_KEY", "MEND_CSRF_SECRET", "PAYPAL_READ_CLIENT_ID", "PAYPAL_READ_CLIENT_SECRET"];
+const WEB_ONLY = ["MEND_OWNER_PASSWORD", "ANTHROPIC_API_KEY", "MEND_CSRF_SECRET", "PAYPAL_READ_CLIENT_ID", "PAYPAL_READ_CLIENT_SECRET", "AG_STUDIO_LICENSE_KEY"];
 const SERVICES = {
   web: {
     key: "web",
@@ -996,6 +996,8 @@ function desiredEnv(spec, values) {
       ANTHROPIC_API_KEY: settings.ANTHROPIC_API_KEY,
       MEND_ENGINE_TOKEN: engineToken,
     };
+    // Optional, and a browser key by design: AG Studio reads it in the page, so it is not a secret here.
+    if (settings.AG_STUDIO_LICENSE_KEY) env.AG_STUDIO_LICENSE_KEY = settings.AG_STUDIO_LICENSE_KEY;
     // Both come from what Render reports (C24), so they join once the services exist.
     if (origin) env.MEND_BASE_URL = origin.origin;
     if (engineUrl) env.MEND_ENGINE_URL = engineUrl;

@@ -20,9 +20,9 @@ export const RAIL_STEPS = [
 type RailState = "done" | "active" | "future";
 
 const LABEL_COLOR: Record<RailState, string> = {
-  done: "text-bone-dim",
-  active: "text-bone",
-  future: "text-bone-faint",
+  done: "text-ink-dim",
+  active: "text-ink",
+  future: "text-ink-faint",
 };
 
 function railState(index: number, active: number): RailState {
@@ -66,7 +66,7 @@ function RailEntry({
           <motion.span
             aria-hidden="true"
             layoutId="console-step-underline"
-            className="absolute inset-x-0 -bottom-1 h-px bg-bone"
+            className="absolute inset-x-0 -bottom-[5px] h-[3px] rounded-[2px] bg-[repeating-linear-gradient(90deg,var(--color-accent)_0_9px,transparent_9px_15px)]"
             transition={{ duration: still ? 0 : 0.3, ease: EASE }}
           />
         )}
@@ -99,7 +99,7 @@ export function StepRail({ step, onBreakIt }: StepRailProps) {
               aria-current={state === "active" ? "step" : undefined}
               className="flex items-center"
             >
-              {i > 0 && <span aria-hidden="true" className="mx-2 h-px w-4 bg-bone/20 xl:mx-3 xl:w-[28px]" />}
+              {i > 0 && <span aria-hidden="true" className="mx-2 h-0 w-4 border-t-[1.5px] border-dashed border-stitch xl:mx-3 xl:w-[28px]" />}
               <span className={`flex items-center gap-2 ${LABEL_COLOR[state]}`}>
                 <RailEntry state={state} numeral={`0${i + 1}`} label={item.label} still={still} />
               </span>
@@ -107,12 +107,12 @@ export function StepRail({ step, onBreakIt }: StepRailProps) {
           );
         })}
         <li aria-current={breakItState === "active" ? "step" : undefined} className="flex items-center">
-          <span aria-hidden="true" className="mx-2 h-3 w-px bg-rule xl:mx-3" />
+          <span aria-hidden="true" className="mx-2 h-3 w-0 border-l-[1.5px] border-dashed border-stitch xl:mx-3" />
           {onBreakIt ? (
             <button
               type="button"
               onClick={onBreakIt}
-              className={`flex items-center gap-2 transition-colors duration-150 ease-out hover:text-bone ${LABEL_COLOR[breakItState]} ${FOCUS_RING}`}
+              className={`flex items-center gap-2 transition-colors duration-150 ease-out hover:text-ink ${LABEL_COLOR[breakItState]} ${FOCUS_RING}`}
             >
               <RailEntry state={breakItState} numeral="06" label="Break it" still={still} />
             </button>
@@ -136,7 +136,7 @@ export function StepProgress({ step, onBreakIt }: { step: Step; onBreakIt?: () =
   if (step === "breakit") {
     return (
       <div className="mx-auto max-w-[1440px] px-4 pt-4 md:px-10 lg:hidden">
-        <p className="font-mono text-[12px] text-bone-dim">Break it</p>
+        <p className="font-mono text-[12px] text-ink-dim">Break it</p>
       </div>
     );
   }
@@ -148,7 +148,7 @@ export function StepProgress({ step, onBreakIt }: { step: Step; onBreakIt?: () =
   return (
     <div className="mx-auto max-w-[1440px] px-4 pt-4 md:px-10 lg:hidden">
       <div className="flex items-center">
-        <p className="font-mono text-[12px] text-bone-dim">
+        <p className="font-mono text-[12px] text-ink-dim">
           Step {number} of {total} &middot; {RAIL_STEPS[index].label}
         </p>
         {onBreakIt && (
@@ -159,9 +159,9 @@ export function StepProgress({ step, onBreakIt }: { step: Step; onBreakIt?: () =
           </div>
         )}
       </div>
-      <div className="mt-2 h-[2px] bg-bone/10">
+      <div className="mt-2 h-1 rounded-[2px] bg-pale-teal">
         <motion.div
-          className="h-full bg-bone/60"
+          className="h-full rounded-[2px] bg-accent"
           initial={still ? false : { width: `${(index / total) * 100}%` }}
           animate={{ width: `${(number / total) * 100}%` }}
           transition={{ duration: still ? 0 : 0.3, ease: EASE }}

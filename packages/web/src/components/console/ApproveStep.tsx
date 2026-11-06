@@ -12,7 +12,9 @@ import {
   LoomLine,
   NoticePanel,
   PRIMARY_BUTTON,
+  SECONDARY_BUTTON,
   Spinner,
+  StepHeader,
   StitchedThread,
   TextButton,
   useElapsedSeconds,
@@ -134,23 +136,23 @@ function notesFailure(error: unknown): string {
 
 function PlaceholderRows({ still }: { still: boolean }) {
   return (
-    <ul role="list" aria-hidden="true" className="mt-10 border-t border-rule">
+    <ul role="list" aria-hidden="true" className="patch px-7 py-3">
       {Array.from({ length: PLACEHOLDER_ROWS }, (_, i) => (
-        <li key={i} className="border-b border-rule py-4">
+        <li key={i} className="border-b-[1.5px] border-dashed border-stitch py-4 last:border-b-0">
           <motion.div
-            className="grid grid-cols-[minmax(0,1fr)_auto] items-start gap-x-6 gap-y-3 md:grid-cols-[48px_220px_minmax(0,1fr)_120px] md:gap-y-0"
+            className="grid grid-cols-[minmax(0,1fr)_auto] items-start gap-x-6 gap-y-3 md:grid-cols-[48px_220px_minmax(0,1fr)_120px] md:gap-y-0 lg:grid-cols-[40px_160px_minmax(0,1fr)_96px] lg:gap-x-4 xl:grid-cols-[48px_220px_minmax(0,1fr)_120px] xl:gap-x-6"
             initial={{ opacity: still ? 0.6 : 0.4 }}
             animate={still ? { opacity: 0.6 } : { opacity: [0.4, 0.8, 0.4] }}
             transition={still ? { duration: 0 } : { duration: 1.2, ease: "easeInOut", repeat: Infinity, delay: i * 0.08 }}
           >
-            <span className="h-[10px] w-[24px] rounded-[2px] bg-bone/8 md:col-start-1" />
+            <span className="h-[10px] w-[24px] rounded-[2px] bg-pale-teal md:col-start-1" />
             <span className="col-span-2 row-start-2 md:col-span-1 md:col-start-2 md:row-start-1">
-              <svg viewBox="0 0 220 14" fill="none" className="block h-auto w-full md:h-[14px] md:w-[220px]">
-                <path d="M0 7H220" className="stroke-bone/8" strokeWidth="1.5" strokeLinecap="round" vectorEffect="non-scaling-stroke" />
+              <svg viewBox="0 0 220 14" fill="none" className="block h-auto w-full md:h-[14px] md:w-[220px] lg:w-[160px] xl:w-[220px]">
+                <path d="M0 7H220" className="stroke-pale-teal" strokeWidth="2" strokeLinecap="round" vectorEffect="non-scaling-stroke" />
               </svg>
             </span>
-            <span className="col-span-2 row-start-3 h-[14px] w-48 max-w-full rounded-[2px] bg-bone/8 md:col-span-1 md:col-start-3 md:row-start-1" />
-            <span className="col-start-2 row-start-1 h-[14px] w-16 rounded-[2px] bg-bone/8 md:col-start-4" />
+            <span className="col-span-2 row-start-3 h-[14px] w-48 max-w-full rounded-[2px] bg-pale-teal md:col-span-1 md:col-start-3 md:row-start-1" />
+            <span className="col-start-2 row-start-1 h-[14px] w-16 rounded-[2px] bg-pale-teal md:col-start-4" />
           </motion.div>
         </li>
       ))}
@@ -175,7 +177,7 @@ function TypedFingerprint({ text, still }: { text: string; still: boolean }) {
   }, [still, text]);
 
   return (
-    <p className="mt-2 font-mono text-[12px] text-bone-dim">
+    <p className="mt-2 font-mono text-[12px] text-ink-dim">
       fingerprint <span className="sr-only">{text}</span>
       <span aria-hidden="true">
         {Array.from(text).map((char, i) => (
@@ -202,12 +204,12 @@ function SealPanel({ seal, still, onSend }: { seal: Seal; still: boolean; onSend
   return (
     <motion.div
       ref={panel}
-      className="mt-6 rounded-[8px] border border-rule bg-ink-raised p-6"
+      className="patch mt-6 p-7"
       initial={still ? false : { opacity: 0, y: 12 }}
       animate={{ opacity: 1, y: 0 }}
       transition={{ duration: 0.4, ease: EASE }}
     >
-      <p className="flex items-center gap-3 text-[15px] text-bone">
+      <p className="flex items-center gap-3 text-[15px] text-ink">
         <motion.span
           className="flex"
           initial={still ? false : { scale: 0 }}
@@ -219,7 +221,7 @@ function SealPanel({ seal, still, onSend }: { seal: Seal; still: boolean; onSend
         {clock === null ? "Approved" : `Approved at ${clock}`}
       </p>
       {seal.snapshotHash !== null && <TypedFingerprint text={shortHash(seal.snapshotHash)} still={still} />}
-      <p className="mt-4 max-w-[52ch] text-[14px] leading-[1.5] text-bone-dim">
+      <p className="mt-4 max-w-[52ch] text-[14px] leading-[1.5] text-ink-dim">
         Nothing is sent yet. The next screen lists each payment, and PayPal moves money only when you press Send with
         PayPal there.
       </p>
@@ -353,38 +355,45 @@ export function ApproveStep({ api, campaignId, onNewPlan, onSend }: ApproveStepP
 
   return (
     <section aria-labelledby="approve-title" aria-busy={load.kind === "loading"}>
-      <p className="font-mono text-[12px] uppercase tracking-[0.14em] text-bone-faint">Step 3 &middot; Approve</p>
-
       {view !== null ? (
         <>
-          <h1 id="approve-title" className="poster-title mt-4 text-[40px] text-bone md:text-[56px]" style={{ lineHeight: 0.9 }}>
-            {rewards.length} {rewards.length === 1 ? "gets" : "get"} cashback. {heldBack.length}{" "}
-            {heldBack.length === 1 ? "is" : "are"} held back.
-          </h1>
-          <p className="mt-5 max-w-[60ch] text-[16px] leading-[1.55] text-bone-dim">
-            Read every reward and note. When you approve, Mend freezes this exact plan by its fingerprint, and
-            nothing else can be sent.
-          </p>
+          <StepHeader
+            tint="peach"
+            kicker="Step 3 · Approve"
+            titleId="approve-title"
+            icon="/world/icons/approve.webp"
+            title={
+              <>
+                {rewards.length} {rewards.length === 1 ? "gets" : "get"} cashback. {heldBack.length}{" "}
+                {heldBack.length === 1 ? "is" : "are"} held back.
+              </>
+            }
+          >
+            <p className="mt-5 max-w-[60ch] text-[16px] leading-[1.55] text-ink-dim">
+              Read every reward and note. When you approve, Mend freezes this exact plan by its fingerprint, and
+              nothing else can be sent.
+            </p>
+          </StepHeader>
 
           {open && sealed === null && rewards.length > 0 && notes.kind !== "done" && (
-            <div className="mt-8 rounded-[8px] border border-rule p-5">
+            <div className="patch mb-6 p-7">
               {notesPending ? (
                 <div role="status">
                   <LoomLine />
-                  <p className="mt-4 flex items-center gap-3 text-[14px] leading-[1.5] text-bone-dim">
+                  <p className="mt-4 flex items-center gap-3 text-[14px] leading-[1.5] text-ink-dim">
                     <Spinner />
                     Claude is writing {plural(rewards.length, "note", "notes")}
                   </p>
-                  <p className="mt-2 font-mono text-[12px] tabular-nums text-bone-faint">{notesElapsed} s</p>
+                  <p className="mt-2 font-mono text-[12px] tabular-nums text-ink-faint">{notesElapsed} s</p>
                 </div>
               ) : (
                 <div className="flex flex-wrap items-center justify-between gap-4">
                   <div>
-                    <p className="max-w-[56ch] text-[15px] leading-[1.5] text-bone">
+                    <p className="max-w-[56ch] text-[15px] leading-[1.5] text-ink">
                       These notes are the shop&apos;s template. Claude can write each customer their own.
                     </p>
                     {notes.kind === "failed" && (
-                      <p role="alert" className="mt-2 text-[14px] leading-[1.5] text-bone-dim">
+                      <p role="alert" className="mt-2 text-[14px] leading-[1.5] text-ink-dim">
                         {notes.line}
                       </p>
                     )}
@@ -392,7 +401,7 @@ export function ApproveStep({ api, campaignId, onNewPlan, onSend }: ApproveStepP
                   <button
                     type="button"
                     onClick={() => void writeNotes()}
-                    className={`rounded-[8px] border border-rule px-4 py-[10px] text-[14px] text-bone transition-colors duration-150 ease-out hover:border-bone-faint hover:bg-ink-raised ${FOCUS_RING}`}
+                    className={`${SECONDARY_BUTTON} h-10 px-4 text-[14px] ${FOCUS_RING}`}
                   >
                     Have Claude write the notes
                   </button>
@@ -401,20 +410,20 @@ export function ApproveStep({ api, campaignId, onNewPlan, onSend }: ApproveStepP
             </div>
           )}
           {notes.kind === "done" && (
-            <p role="status" className="mt-8 font-mono text-[12px] leading-[1.5] text-bone-dim">
+            <p role="status" className="mb-6 font-mono text-[12px] leading-[1.5] text-ink-dim">
               {notes.line}
             </p>
           )}
 
-          <div className="mt-10">
+          <div>
             {view.rows.length === 0 ? (
-              <p className="border-t border-rule pt-6 text-[16px] text-bone-dim">This plan has no customers.</p>
+              <p className="patch p-7 text-[16px] text-ink-dim">This plan has no customers.</p>
             ) : (
               <CampaignThreads rows={view.rows} mode={sealed === null ? "review" : "sealed"} />
             )}
           </div>
 
-          <p className="mt-8 text-[15px] leading-[1.5] text-bone">
+          <p className="mt-6 text-[15px] leading-[1.5] text-ink">
             {formatUsd(rewardTotal)} to {plural(rewards.length, "customer", "customers")}. PayPal adds its own fee for each
             payment.
           </p>
@@ -453,7 +462,7 @@ export function ApproveStep({ api, campaignId, onNewPlan, onSend }: ApproveStepP
                 onClick={() => void approve()}
                 disabled={!canApprove}
                 aria-busy={approving}
-                className={`${PRIMARY_BUTTON} mt-6 h-12 gap-2 px-[22px] text-[15px] disabled:translate-y-0 disabled:cursor-default disabled:opacity-50 disabled:hover:translate-y-0 disabled:hover:bg-accent ${FOCUS_RING}`}
+                className={`${PRIMARY_BUTTON} mt-6 h-12 px-[22px] text-[15px] ${FOCUS_RING}`}
               >
                 {approving ? (
                   <>
@@ -471,6 +480,7 @@ export function ApproveStep({ api, campaignId, onNewPlan, onSend }: ApproveStepP
         <>
           {load.kind === "failed" ? (
             <>
+              <p className="font-mono text-[12px] uppercase tracking-[0.14em] text-ink-dim">Step 3 &middot; Approve</p>
               <h1 id="approve-title" className="sr-only">
                 Approve the plan
               </h1>
@@ -478,13 +488,18 @@ export function ApproveStep({ api, campaignId, onNewPlan, onSend }: ApproveStepP
             </>
           ) : (
             <>
-              <h1 id="approve-title" className="poster-title mt-4 text-[40px] text-bone md:text-[56px]" style={{ lineHeight: 0.9 }}>
-                Opening the plan.
-              </h1>
-              <p role="status" className="mt-4 flex items-center gap-3 text-[14px] leading-[1.5] text-bone-dim">
-                <Spinner />
-                Reading the draft
-              </p>
+              <StepHeader
+                tint="peach"
+                kicker="Step 3 · Approve"
+                titleId="approve-title"
+                title="Opening the plan."
+                icon="/world/icons/approve.webp"
+              >
+                <p role="status" className="mt-4 flex items-center gap-3 text-[14px] leading-[1.5] text-ink-dim">
+                  <Spinner />
+                  Reading the draft
+                </p>
+              </StepHeader>
               <PlaceholderRows still={still} />
             </>
           )}

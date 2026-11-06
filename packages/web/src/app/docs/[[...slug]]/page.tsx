@@ -15,11 +15,10 @@ export default async function Page({ params }: DocsPageProps) {
 
   return (
     <DocsPage toc={page.data.toc} full={page.data.full} className="max-w-[calc(760px+4rem)]">
-      {/* Inline line height, because .poster-title sits outside Tailwind's layers and would beat a leading class. */}
-      <DocsTitle className="poster-title text-[44px] text-bone md:text-[56px]" style={{ lineHeight: 0.9 }}>
+      <DocsTitle className="poster-title text-[36px] text-ink md:text-[48px]">
         {page.data.title}
       </DocsTitle>
-      <DocsDescription className="text-[18px] text-bone-dim">{page.data.description}</DocsDescription>
+      <DocsDescription className="text-[18px] text-ink-dim">{page.data.description}</DocsDescription>
       <DocsBody>
         <Body components={getMDXComponents()} />
       </DocsBody>

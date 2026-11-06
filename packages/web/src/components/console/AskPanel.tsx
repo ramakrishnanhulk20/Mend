@@ -5,12 +5,9 @@ import { motion } from "motion/react";
 import { useStill } from "@/components/motion/useStill";
 import { QUESTION_LIMIT, askFailureText, suggestionsFor, toolLabel, trimHistory } from "./agent";
 import { ApiError, type ConsoleApi } from "./api";
-import { EASE, FOCUS_RING, NoticePanel, PRIMARY_BUTTON, Spinner, useElapsedSeconds } from "./ui";
+import { EASE, FOCUS_RING, NoticePanel, PRIMARY_BUTTON, SECONDARY_BUTTON, Spinner, useElapsedSeconds } from "./ui";
 
-const SECONDARY_BUTTON =
-  "inline-flex h-10 items-center justify-center gap-2 rounded-[8px] border border-rule px-4 text-[14px] text-bone transition-colors duration-150 ease-out hover:border-bone-faint hover:bg-ink-raised";
-
-const CAPTION = "font-mono text-[10.5px] uppercase tracking-[0.14em] text-bone-faint";
+const CAPTION = "font-mono text-[12px] uppercase tracking-[0.14em] text-ink-dim";
 
 type Message = {
   id: number;
@@ -24,8 +21,8 @@ type Message = {
 function ThreadGlyph() {
   return (
     <svg width="16" height="8" viewBox="0 0 16 8" fill="none" aria-hidden="true" className="shrink-0">
-      <circle cx="1.5" cy="4" r="1.5" className="fill-bone/40" />
-      <path d="M3 4h13" className="stroke-bone/40" strokeWidth="1.5" strokeLinecap="round" />
+      <circle cx="1.5" cy="4" r="1.5" className="fill-ink/40" />
+      <path d="M3 4h13" className="stroke-ink/40" strokeWidth="1.5" strokeLinecap="round" />
     </svg>
   );
 }
@@ -36,7 +33,7 @@ function ToolChips({ tools }: { tools: string[] }) {
       {tools.map((name, index) => (
         <li key={`${name}-${index}`} className="flex items-center gap-[6px]">
           <ThreadGlyph />
-          <span className="rounded-[6px] border border-rule px-2 py-[2px] font-mono text-[10.5px] text-bone-dim">
+          <span className="rounded-[6px] border border-ink/30 px-2 py-[2px] font-mono text-[12px] text-ink-dim">
             {toolLabel(name)}
           </span>
         </li>
@@ -55,25 +52,25 @@ function Entry({ message, still }: { message: Message; still: boolean }) {
   if (message.role === "owner") {
     return (
       <motion.div className="flex flex-col items-end" {...enter}>
-        <p className="max-w-[85%] whitespace-pre-wrap break-words rounded-[8px] bg-ink px-3 py-2 text-[14px] text-bone-dim [overflow-wrap:anywhere]">
+        <p className="max-w-[85%] whitespace-pre-wrap break-words rounded-[12px] bg-paper px-4 py-[10px] text-[14px] text-ink [overflow-wrap:anywhere]">
           {message.text}
         </p>
-        {message.unanswered && <span className="mt-1 font-mono text-[11px] text-bone-faint">not answered</span>}
+        {message.unanswered && <span className="mt-1 font-mono text-[12px] text-ink-dim">not answered</span>}
       </motion.div>
     );
   }
 
   return (
-    <motion.div {...enter}>
+    <motion.div className="rounded-[12px] bg-paper-raised px-4 py-[14px]" {...enter}>
       <p className={CAPTION}>Claude</p>
-      <p className="mt-1 whitespace-pre-wrap break-words text-[14px] leading-[1.55] text-bone [overflow-wrap:anywhere]">
+      <p className="mt-1 whitespace-pre-wrap break-words text-[14px] leading-[1.55] text-ink [overflow-wrap:anywhere]">
         {message.text}
       </p>
       {message.tools.length > 0 && <ToolChips tools={message.tools} />}
       {message.stopped === "tool_limit" && (
-        <p className="mt-2 text-[12px] text-bone-faint">Claude stopped after using its tools.</p>
+        <p className="mt-2 text-[12px] text-ink-dim">Claude stopped after using its tools.</p>
       )}
-      {message.stopped === "declined" && <p className="mt-2 text-[12px] text-bone-faint">Claude declined this one.</p>}
+      {message.stopped === "declined" && <p className="mt-2 text-[12px] text-ink-dim">Claude declined this one.</p>}
     </motion.div>
   );
 }
@@ -191,7 +188,7 @@ export function AskPanel({ api, orderId, openRequest = 0 }: AskPanelProps) {
         aria-expanded={open}
         aria-controls="ask-panel"
         onClick={() => setOpen((current) => !current)}
-        className={`${SECONDARY_BUTTON} w-full lg:hidden ${FOCUS_RING}`}
+        className={`${SECONDARY_BUTTON} h-12 w-full px-4 text-[15px] lg:hidden ${FOCUS_RING}`}
       >
         Ask Mend, powered by Claude
       </button>
@@ -199,17 +196,15 @@ export function AskPanel({ api, orderId, openRequest = 0 }: AskPanelProps) {
       <section
         id="ask-panel"
         aria-labelledby="ask-title"
-        className={`min-w-0 rounded-[8px] border border-rule bg-ink-raised p-5 lg:mt-0 lg:block ${open ? "mt-3" : "hidden"}`}
+        className={`patch patch-tinted min-w-0 bg-pale-teal p-[26px] lg:mt-0 lg:block ${open ? "mt-3" : "hidden"}`}
       >
         <div className="flex flex-wrap items-center justify-between gap-x-3 gap-y-2">
-          <h2 id="ask-title" className="text-[16px] font-semibold text-bone">
+          <h2 id="ask-title" className="text-[16px] font-semibold text-ink">
             Ask Mend
           </h2>
-          <span className="rounded-[6px] border border-rule px-2 py-[3px] font-mono text-[10.5px] uppercase tracking-[0.14em] text-bone-faint">
-            Claude &middot; read-only
-          </span>
+          <span className="label-tag h-6">Claude &middot; read-only</span>
         </div>
-        <p className="mt-2 text-[13px] leading-[1.5] text-bone-dim">
+        <p className="mt-2 text-[13px] leading-[1.5] text-ink-dim">
           Ask about the shop, a campaign or a PayPal order. Claude reads through Mend&apos;s tools; it has no tool that
           sends money.
         </p>
@@ -223,17 +218,17 @@ export function AskPanel({ api, orderId, openRequest = 0 }: AskPanelProps) {
           className={
             empty
               ? ""
-              : `mt-4 flex max-h-[420px] flex-col gap-4 overflow-y-auto [scrollbar-color:var(--color-bone-faint)_transparent] [scrollbar-width:thin] ${FOCUS_RING}`
+              : `mt-4 flex max-h-[420px] flex-col gap-4 overflow-y-auto [scrollbar-color:var(--color-ink-faint)_transparent] [scrollbar-width:thin] ${FOCUS_RING}`
           }
         >
           {messages.map((message) => (
             <Entry key={message.id} message={message} still={still} />
           ))}
           {pending && (
-            <div className="flex items-center gap-3 text-[13px] text-bone-dim">
+            <div className="flex items-center gap-3 text-[13px] text-ink-dim">
               <Spinner />
               <span>Claude is reading</span>
-              <span aria-hidden="true" className="font-mono tabular-nums text-bone-faint">
+              <span aria-hidden="true" className="font-mono tabular-nums text-ink-dim">
                 {elapsed} s
               </span>
             </div>
@@ -247,7 +242,7 @@ export function AskPanel({ api, orderId, openRequest = 0 }: AskPanelProps) {
                 key={text}
                 type="button"
                 onClick={() => void send(text)}
-                className={`rounded-[8px] border border-rule px-3 py-[6px] text-left text-[13px] text-bone-dim transition-colors duration-150 ease-out hover:text-bone ${FOCUS_RING}`}
+                className={`rounded-[10px] border-[1.5px] border-dashed border-ink/30 bg-paper-raised px-3 py-[7px] text-left text-[14px] leading-5 text-ink transition-colors duration-150 ease-out hover:bg-pale-butter ${FOCUS_RING}`}
               >
                 {text}
               </button>
@@ -277,12 +272,12 @@ export function AskPanel({ api, orderId, openRequest = 0 }: AskPanelProps) {
             }}
             aria-label="Your question for Claude"
             placeholder="Ask Claude about the shop"
-            className={`min-w-0 flex-1 resize-y rounded-[8px] border border-rule bg-ink-raised p-4 text-[16px] text-bone placeholder:text-bone-faint focus:border-bone-faint ${FOCUS_RING}`}
+            className={`min-w-0 flex-1 resize-y rounded-[14px] border-2 border-ink/20 bg-paper-raised px-4 py-[14px] text-[17px] text-ink placeholder:text-ink-faint focus:border-accent ${FOCUS_RING}`}
           />
           <button
             type="submit"
             disabled={draft.trim() === "" || pending}
-            className={`${PRIMARY_BUTTON} h-10 shrink-0 justify-center px-4 text-[14px] disabled:translate-y-0 disabled:cursor-default disabled:opacity-50 disabled:hover:translate-y-0 disabled:hover:bg-accent ${FOCUS_RING}`}
+            className={`${PRIMARY_BUTTON} h-12 shrink-0 px-5 text-[15px] ${FOCUS_RING}`}
           >
             Ask
           </button>

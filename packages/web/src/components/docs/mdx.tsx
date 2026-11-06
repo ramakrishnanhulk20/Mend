@@ -5,7 +5,7 @@ import type { MDXComponents } from "mdx/types";
 import type { ComponentProps, CSSProperties } from "react";
 import { Mermaid } from "./Mermaid";
 
-const CALLOUT_STYLE = { "--callout-color": "var(--color-bone-faint)" } as CSSProperties;
+const CALLOUT_STYLE = { "--callout-color": "var(--color-ink-faint)" } as CSSProperties;
 
 // remarkMdxMermaid (source.config.ts) turns a mermaid code block into <Mermaid chart="...">,
 // so mapping that one name here is what draws the diagram.

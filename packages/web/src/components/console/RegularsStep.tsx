@@ -6,7 +6,7 @@ import { useStill } from "@/components/motion/useStill";
 import { formatCount, formatDay } from "@/components/live/summary";
 import { ApiError, type ConsoleApi, type QuietRegular, type QuietRegulars } from "./api";
 import { formatUsd, plural } from "./money";
-import { EASE, FOCUS_RING, PRIMARY_BUTTON, TextButton } from "./ui";
+import { EASE, FOCUS_RING, PRIMARY_BUTTON, StepHeader, TextButton } from "./ui";
 
 const FIRST_ROWS = 12;
 const LIST_SIZE = 50;
@@ -95,32 +95,32 @@ function SilenceThread({ daysSilent, longest }: { daysSilent: number; longest: n
       viewBox={`0 0 ${THREAD_WIDTH} ${THREAD_HEIGHT}`}
       fill="none"
       aria-hidden="true"
-      className="block h-auto w-full md:h-[14px] md:w-[220px]"
+      className="block h-auto w-full md:h-[14px] md:w-[220px] lg:w-[150px] xl:w-[220px]"
     >
       <path
         d={`M0 ${THREAD_MIDDLE}H${THREAD_BREAKS_AT}`}
-        className="stroke-bone/70"
+        className="stroke-ink/55"
         strokeWidth="2"
         strokeLinecap="round"
         vectorEffect="non-scaling-stroke"
       />
       <path
         d={`M${resumesAt.toFixed(2)} ${THREAD_MIDDLE}H${THREAD_WIDTH}`}
-        className="stroke-bone/30"
+        className="stroke-ink/55"
         strokeWidth="2"
         strokeLinecap="round"
         vectorEffect="non-scaling-stroke"
       />
       <path
         d={fibers(THREAD_BREAKS_AT, 1)}
-        className="stroke-bone/70"
+        className="stroke-ink/55"
         strokeWidth="1.25"
         strokeLinecap="round"
         vectorEffect="non-scaling-stroke"
       />
       <path
         d={fibers(resumesAt, -1)}
-        className="stroke-bone/30"
+        className="stroke-ink/55"
         strokeWidth="1.25"
         strokeLinecap="round"
         vectorEffect="non-scaling-stroke"
@@ -130,7 +130,7 @@ function SilenceThread({ daysSilent, longest }: { daysSilent: number; longest: n
 }
 
 const ROW_GRID =
-  "grid grid-cols-[32px_minmax(0,1fr)_auto] items-center gap-x-3 gap-y-2 md:grid-cols-[56px_minmax(0,1fr)_220px_140px] md:gap-x-6 md:gap-y-0";
+  "grid grid-cols-[32px_minmax(0,1fr)_auto] items-center gap-x-3 gap-y-2 md:grid-cols-[56px_minmax(0,1fr)_220px_140px] md:gap-x-6 md:gap-y-0 lg:grid-cols-[32px_minmax(0,1fr)_150px_136px] lg:gap-x-4 xl:grid-cols-[56px_minmax(0,1fr)_220px_140px] xl:gap-x-6";
 
 // A score under 0.01 of an order would show as 0.00, which reads as "never", so it says so in words.
 function forecast(score: number): string {
@@ -149,42 +149,42 @@ function RegularRow({ row, longest, index, still }: { row: QuietRegular; longest
       role="listitem"
       tabIndex={0}
       title={`Spent ${paid} in total`}
-      className={`group border-b border-rule px-3 py-4 transition-colors duration-200 ease-out hover:bg-ink-raised focus:bg-ink-raised ${FOCUS_RING}`}
+      className={`group relative -mx-2 rounded-[12px] px-2 py-4 transition-colors duration-200 ease-out hover:bg-pale-butter focus:bg-pale-butter after:pointer-events-none after:absolute after:inset-x-2 after:bottom-0 after:border-b-[1.5px] after:border-dashed after:border-stitch after:content-[''] last:after:hidden ${FOCUS_RING}`}
       initial={still ? false : { opacity: 0, y: 8 }}
       animate={{ opacity: 1, y: 0 }}
       transition={{ duration: 0.4, ease: EASE, delay: index < FIRST_ROWS ? index * 0.03 : 0 }}
     >
       <div className={ROW_GRID}>
-        <span className="col-start-1 row-start-1 font-mono text-[12px] text-bone-faint md:row-span-2">{rank}</span>
-        <span className="col-start-2 row-start-1 min-w-0 truncate text-[16px] text-bone md:self-end">
+        <span className="col-start-1 row-start-1 font-mono text-[12px] text-ink-faint md:row-span-2">{rank}</span>
+        <span className="col-start-2 row-start-1 min-w-0 truncate text-[16px] text-ink md:self-end">
           {row.displayName}
         </span>
-        <span className="col-span-3 col-start-1 row-start-3 font-mono text-[12px] text-bone-faint md:col-span-1 md:col-start-2 md:row-start-2 md:self-start">
+        <span className="col-span-3 col-start-1 row-start-3 font-mono text-[12px] text-ink-faint md:col-span-1 md:col-start-2 md:row-start-2 md:self-start">
           {plural(row.purchaseDays, "purchase day", "purchase days")} &middot; silent {plural(row.daysSilent, "day", "days")}
         </span>
         <span className="col-span-3 col-start-1 row-start-2 md:col-span-1 md:col-start-3 md:row-span-2 md:row-start-1">
           <SilenceThread daysSilent={row.daysSilent} longest={longest} />
         </span>
         <span className="col-start-3 row-start-1 text-right md:col-start-4 md:row-span-2 md:text-left">
-          <span className="block text-[14px] tabular-nums text-bone">{forecast(row.score)}</span>
-          <span className="block font-mono text-[11px] text-bone-faint">expected in 13 weeks</span>
+          <span className="block text-[14px] tabular-nums text-ink">{forecast(row.score)}</span>
+          <span className="block font-mono text-[11px] text-ink-faint">expected in 13 weeks</span>
           {row.standIn ? (
-            <span className="mt-1 block font-mono text-[11px] text-bone-faint">demo stand-in</span>
+            <span className="mt-1 block font-mono text-[11px] text-ink-faint">demo stand-in</span>
           ) : row.member ? (
             <span className="mt-1 flex items-center justify-end gap-[6px] md:justify-start">
-              {/* The red stitch means "paid" elsewhere in the console, so joining gets a plain bone dot. */}
-              <span aria-hidden="true" className="h-[6px] w-[6px] rounded-full bg-bone" />
-              <span className="font-mono text-[11px] text-bone-dim">joined</span>
+              {/* The red stitch means "paid" elsewhere in the console, so joining gets a plain ink dot. */}
+              <span aria-hidden="true" className="h-[6px] w-[6px] rounded-full bg-ink" />
+              <span className="font-mono text-[11px] text-ink-dim">joined</span>
             </span>
           ) : (
-            <span className="mt-1 block font-mono text-[11px] text-bone-faint">not on the list</span>
+            <span className="mt-1 block font-mono text-[11px] text-ink-faint">not on the list</span>
           )}
         </span>
       </div>
 
       <div className="grid grid-rows-[0fr] transition-[grid-template-rows] duration-200 ease-[cubic-bezier(0.22,1,0.36,1)] group-hover:grid-rows-[1fr] group-focus:grid-rows-[1fr] motion-reduce:transition-none">
         <div className="min-h-0 overflow-hidden">
-          <p className="pt-3 text-[13px] leading-[1.5] text-bone-dim">
+          <p className="pt-3 text-[13px] leading-[1.5] text-ink-dim">
             Spent {paid} in total &middot; forecast {row.score.toFixed(4)} orders in the next 13 weeks &middot;{" "}
             {row.standIn ? "demo stand-in, joined by a script" : row.member ? "can be paid" : "cannot be paid until they join"}
           </p>
@@ -196,23 +196,23 @@ function RegularRow({ row, longest, index, still }: { row: QuietRegular; longest
 
 function PlaceholderRows({ still }: { still: boolean }) {
   return (
-    <ul role="list" aria-hidden="true" className="-mx-3 mt-10 border-t border-rule">
+    <ul role="list" aria-hidden="true" className="patch mt-8 px-7 py-3">
       {Array.from({ length: PLACEHOLDER_ROWS }, (_, i) => (
-        <li key={i} className="border-b border-rule px-3 py-4">
+        <li key={i} className="border-b-[1.5px] border-dashed border-stitch py-4 last:border-b-0">
           <motion.div
             className={ROW_GRID}
             initial={{ opacity: still ? 0.6 : 0.4 }}
             animate={still ? { opacity: 0.6 } : { opacity: [0.4, 0.8, 0.4] }}
             transition={still ? { duration: 0 } : { duration: 1.2, ease: "easeInOut", repeat: Infinity, delay: i * 0.08 }}
           >
-            <span className="col-start-1 row-start-1 h-[10px] w-[18px] rounded-[2px] bg-bone/8 md:row-span-2" />
-            <span className="col-start-2 row-start-1 h-[14px] w-32 max-w-full rounded-[2px] bg-bone/8 md:self-end" />
+            <span className="col-start-1 row-start-1 h-[10px] w-[18px] rounded-[2px] bg-pale-teal md:row-span-2" />
+            <span className="col-start-2 row-start-1 h-[14px] w-32 max-w-full rounded-[2px] bg-pale-teal md:self-end" />
             <span className="col-span-3 col-start-1 row-start-2 md:col-span-1 md:col-start-3 md:row-span-2 md:row-start-1">
-              <svg viewBox="0 0 220 14" fill="none" className="block h-auto w-full md:h-[14px] md:w-[220px]">
-                <path d="M0 7H220" className="stroke-bone/8" strokeWidth="1.5" strokeLinecap="round" vectorEffect="non-scaling-stroke" />
+              <svg viewBox="0 0 220 14" fill="none" className="block h-auto w-full md:h-[14px] md:w-[220px] lg:w-[150px] xl:w-[220px]">
+                <path d="M0 7H220" className="stroke-pale-teal" strokeWidth="2" strokeLinecap="round" vectorEffect="non-scaling-stroke" />
               </svg>
             </span>
-            <span className="col-start-3 row-start-1 h-[14px] w-16 rounded-[2px] bg-bone/8 md:col-start-4 md:row-span-2" />
+            <span className="col-start-3 row-start-1 h-[14px] w-16 rounded-[2px] bg-pale-teal md:col-start-4 md:row-span-2" />
           </motion.div>
         </li>
       ))}
@@ -220,7 +220,7 @@ function PlaceholderRows({ still }: { still: boolean }) {
   );
 }
 
-const LABEL = "font-mono text-[12px] uppercase tracking-[0.14em] text-bone-faint";
+const LABEL = "font-mono text-[12px] uppercase tracking-[0.14em] text-ink-faint";
 
 const PAYABLE = "Only customers who joined the shop's thank-you list with Log in with PayPal can be paid.";
 
@@ -259,8 +259,8 @@ function FailurePanel({ failure, onRetry }: { failure: Failure; onRetry: () => v
   }
 
   return (
-    <div role="alert" className="mt-10 flex flex-wrap items-center justify-between gap-4 rounded-[8px] border border-rule bg-ink-raised p-6">
-      <p className="flex max-w-[56ch] items-start gap-3 text-[16px] leading-[1.5] text-bone">
+    <div role="alert" className="patch patch-tinted mt-6 flex flex-wrap items-center justify-between gap-4 bg-pale-peach px-[22px] py-[18px]">
+      <p className="flex max-w-[56ch] items-start gap-3 text-[16px] leading-[1.5] text-ink">
         <span aria-hidden="true" className="mt-[9px] block h-[6px] w-[6px] shrink-0 rounded-full bg-accent" />
         {text}
       </p>
@@ -315,31 +315,30 @@ export function RegularsStep({ api, onPlan }: RegularsStepProps) {
 
   return (
     <section aria-labelledby="regulars-title" aria-busy={load.kind === "loading"}>
-      <p className={LABEL}>Step 1 &middot; Quiet regulars</p>
-
       {data !== null ? (
         <>
-          <h1
-            id="regulars-title"
-            className="poster-title mt-4 text-[40px] text-bone md:text-[56px]"
-            style={{ lineHeight: 0.9 }}
+          <StepHeader
+            tint="sky"
+            kicker="Step 1 · Quiet regulars"
+            titleId="regulars-title"
+            icon="/world/icons/regulars.webp"
+            title={`${plural(data.total, "regular", "regulars")} went quiet.`}
           >
-            {plural(data.total, "regular", "regulars")} went quiet.
-          </h1>
-          <p className="mt-5 max-w-[60ch] text-[16px] leading-[1.55] text-bone-dim">{forecastLine(data)}</p>
-          {data.asOf !== null && (
-            <p className="mt-2 font-mono text-[12px] text-bone-faint">Records run to {formatDay(data.asOf)}</p>
-          )}
-          <p className="mt-2 max-w-[60ch] text-[13px] text-bone-faint">
-            {data.asOf !== null
-              ? `The demo shop replays a UK giftware wholesaler's real orders from 2009 to 2011, moved forward to end on ${formatDay(data.asOf)}, in US dollars at 1.60 to the pound and with made-up names, so its totals are large and many regulars have been quiet for a long time.`
-              : "The demo shop replays a UK giftware wholesaler's real orders, so its totals are large and many regulars have been quiet for a long time."}
-          </p>
+            <p className="mt-5 max-w-[60ch] text-[16px] leading-[1.55] text-ink-dim">{forecastLine(data)}</p>
+            {data.asOf !== null && (
+              <p className="mt-2 font-mono text-[12px] text-ink-dim">Records run to {formatDay(data.asOf)}</p>
+            )}
+            <p className="mt-2 max-w-[60ch] text-[13px] text-ink-dim">
+              {data.asOf !== null
+                ? `The demo shop replays a UK giftware wholesaler's real orders from 2009 to 2011, moved forward to end on ${formatDay(data.asOf)}, in US dollars at 1.60 to the pound and with made-up names, so its totals are large and many regulars have been quiet for a long time.`
+                : "The demo shop replays a UK giftware wholesaler's real orders, so its totals are large and many regulars have been quiet for a long time."}
+            </p>
+          </StepHeader>
 
           {rows.length === 0 ? (
-            <p className="mt-10 border-t border-rule pt-6 text-[16px] text-bone-dim">No quiet regulars to show right now.</p>
+            <p className="patch p-7 text-[16px] text-ink-dim">No quiet regulars to show right now.</p>
           ) : (
-            <ul role="list" className="-mx-3 mt-10 border-t border-rule">
+            <ul role="list" className="patch px-7 py-3">
               {shown.map((row, i) => (
                 <RegularRow key={row.position} row={row} longest={longest} index={i} still={still} />
               ))}
@@ -355,7 +354,7 @@ export function RegularsStep({ api, onPlan }: RegularsStepProps) {
           )}
 
           <div className="mt-10 flex flex-wrap items-center justify-between gap-4">
-            <p className="text-[14px] text-bone-dim">Next, Claude drafts a plan from these customers.</p>
+            <p className="text-[14px] text-ink-dim">Next, Claude drafts a plan from these customers.</p>
             <button
               type="button"
               onClick={onPlan}
@@ -367,6 +366,7 @@ export function RegularsStep({ api, onPlan }: RegularsStepProps) {
         </>
       ) : (
         <>
+          <p className={LABEL}>Step 1 &middot; Quiet regulars</p>
           <h1 id="regulars-title" className="sr-only">
             Quiet regulars
           </h1>
@@ -375,7 +375,7 @@ export function RegularsStep({ api, onPlan }: RegularsStepProps) {
           ) : (
             <>
               {slow && (
-                <p role="status" className="mt-4 font-mono text-[12px] text-bone-faint">
+                <p role="status" className="mt-4 font-mono text-[12px] text-ink-faint">
                   Mend&apos;s forecast is ranking the shop&apos;s customers
                 </p>
               )}

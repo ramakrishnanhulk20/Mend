@@ -7,8 +7,9 @@ import { formatCount, formatDay, formatShare, type ShopSummary } from "@/compone
 
 export const EASE = [0.22, 1, 0.36, 1] as const;
 
+// outline-solid is needed because rows and columns also carry outline-none, which would otherwise switch this ring off.
 export const FOCUS_RING =
-  "focus-visible:outline-2 focus-visible:outline-offset-[3px] focus-visible:outline-bone";
+  "focus-visible:outline-solid focus-visible:outline-2 focus-visible:outline-offset-[3px] focus-visible:outline-ink";
 
 // The three proof blocks share a frame, a hover card, a size reader and the numbers toggle.
 // They live here, in the first block, so the other two import them without a cycle.
@@ -26,12 +27,12 @@ export function ChartFrame({
   children: ReactNode;
 }) {
   return (
-    <div className="min-w-0">
-      <h3 id={titleId} className="font-sans text-[18px] font-semibold text-bone">
+    <div className="patch h-full min-w-0 px-6 py-[30px] md:px-11 md:py-10">
+      <h3 id={titleId} className="poster-title text-[26px] text-ink md:text-[30px]">
         {title}
       </h3>
       {caption !== null && (
-        <p className="mt-2 max-w-[52ch] text-[14px] leading-[1.5] text-bone-dim">{caption}</p>
+        <p className="mt-3 max-w-[60ch] text-[15px] leading-[1.5] text-ink-dim">{caption}</p>
       )}
       <div className="mt-6">{children}</div>
     </div>
@@ -39,12 +40,12 @@ export function ChartFrame({
 }
 
 export function ChartPlaceholder({ heightClass }: { heightClass: string }) {
-  return <div aria-hidden="true" className={`w-full border border-bone/10 ${heightClass}`} />;
+  return <div aria-hidden="true" className={`w-full rounded-[12px] bg-pale-teal ${heightClass}`} />;
 }
 
 export function NotMeasured({ heightClass }: { heightClass: string }) {
   return (
-    <div className={`flex w-full items-center text-[14px] text-bone-dim ${heightClass}`}>
+    <div className={`flex w-full items-center text-[14px] text-ink-dim ${heightClass}`}>
       <p>Not measured yet.</p>
     </div>
   );
@@ -73,9 +74,11 @@ export function useMeasuredBox() {
 
 const TOOLTIP_FLIP_EDGE = 160;
 const TOOLTIP_SIDE_EDGE = 100;
+const TOOLTIP_PADDING = 24;
 
 // Centred over the mark, except near an edge: within 160 px of the right edge it opens
 // to the left of the mark, and within 100 px of the left edge it opens to the right.
+// Once measured, it is then held inside the chart so a narrow phone never cuts it off.
 export function ChartTooltip({
   x,
   bottom,
@@ -87,17 +90,17 @@ export function ChartTooltip({
   boxWidth: number;
   children: ReactNode;
 }) {
-  const shift =
-    boxWidth - x < TOOLTIP_FLIP_EDGE
-      ? "translateX(calc(-100% + 12px))"
-      : x < TOOLTIP_SIDE_EDGE
-        ? "translateX(-12px)"
-        : "translateX(-50%)";
+  const { ref, box } = useMeasuredBox();
+  const width = box === null ? 0 : box.w + TOOLTIP_PADDING;
+  const wanted =
+    boxWidth - x < TOOLTIP_FLIP_EDGE ? x + 12 - width : x < TOOLTIP_SIDE_EDGE ? x - 12 : x - width / 2;
+  const left = Math.min(Math.max(wanted, 0), Math.max(0, boxWidth - width));
   return (
     <div
+      ref={ref}
       aria-hidden="true"
-      className="pointer-events-none absolute z-10 w-max max-w-[220px] rounded-[8px] border border-rule bg-ink-raised px-3 py-2"
-      style={{ left: x, top: bottom, transform: `${shift} translateY(-100%)` }}
+      className="pointer-events-none absolute z-10 w-max max-w-[220px] rounded-[10px] bg-ink px-3 py-2 text-paper"
+      style={{ left, top: bottom, transform: "translateY(-100%)", visibility: box === null ? "hidden" : "visible" }}
     >
       {children}
     </div>
@@ -119,7 +122,7 @@ export function NumbersToggle({
       aria-expanded={open}
       aria-controls={controls}
       onClick={onToggle}
-      className={`mt-4 font-mono text-[12px] uppercase tracking-[0.14em] text-bone-dim underline-offset-4 hover:underline ${FOCUS_RING}`}
+      className={`mt-6 inline-flex h-10 items-center rounded-[10px] border-2 border-ink px-4 text-[15px] font-semibold text-ink transition-colors duration-[160ms] ease-out hover:bg-ink hover:text-paper ${FOCUS_RING}`}
     >
       {open ? "Hide the numbers" : "Show the numbers"}
     </button>
@@ -127,7 +130,13 @@ export function NumbersToggle({
 }
 
 export const HEAD_CELL =
-  "py-2 pr-4 text-left font-mono text-[11px] font-medium uppercase tracking-[0.14em] text-bone-faint";
+  "py-2 pr-4 text-left font-mono text-[12px] font-medium uppercase tracking-[0.14em] text-ink-faint";
+
+// A running stitch between table rows, with none under the last row.
+export const ROW_RULE = "border-b-[1.5px] border-dashed border-stitch last:border-b-0";
+
+// The one line that sits under the header row of every table.
+export const HEAD_RULE = "border-b-[1.5px] border-dashed border-stitch";
 
 const HEIGHT_CLASS = "h-[260px] md:h-[320px]";
 
@@ -137,13 +146,13 @@ const BOTTOM = 52;
 const BANDS = 10;
 const MAX_COLUMN = 24;
 
-const BONE = "#ede6da";
-const INK = "#0b0a0a";
-const COLUMN_FILL = "rgb(237 230 218 / 0.78)";
-const GRID = "rgb(237 230 218 / 0.10)";
+const PAPER_RAISED = "#FFFDF7";
+const FELT_TEAL = "#3FBFAE";
+const ACCENT = "#D72A16";
+const GRID = "rgb(18 59 63 / 0.10)";
 
-// Ink behind the letters keeps a label readable where it crosses a gridline.
-const HALO = { paintOrder: "stroke", stroke: INK, strokeWidth: 4, strokeLinejoin: "round" } as const;
+// Raised paper behind the letters keeps a label readable where it crosses a gridline.
+const HALO = { paintOrder: "stroke", stroke: PAPER_RAISED, strokeWidth: 4, strokeLinejoin: "round" } as const;
 
 const GROW: Variants = {
   hidden: { scaleY: 0 },
@@ -207,9 +216,9 @@ function DecilePlot({
       const bottom = hovered.decile === 1 ? hovered.top - 6 - 14 - 12 : hovered.top - 10;
       tooltip = (
         <ChartTooltip x={hovered.center} bottom={bottom} boxWidth={box.w}>
-          <p className="font-sans text-[15px] font-semibold text-bone">{formatShare(hovered.returnedShare)}</p>
-          <p className="text-[12px] text-bone-dim">bought again within {holdoutDays} days</p>
-          <p className="text-[12px] text-bone-dim">
+          <p className="font-sans text-[15px] font-semibold">{formatShare(hovered.returnedShare)}</p>
+          <p className="text-[12px]">bought again within {holdoutDays} days</p>
+          <p className="text-[12px]">
             group {hovered.decile}, {formatCount(hovered.customers)} customers
           </p>
         </ChartTooltip>
@@ -229,7 +238,7 @@ function DecilePlot({
         viewBox={`0 0 ${box.w} ${box.h}`}
         role="group"
         aria-labelledby={titleId}
-        className="block"
+        className="block overflow-visible"
         initial={still ? "shown" : "hidden"}
         whileInView={still ? undefined : "shown"}
         viewport={{ once: true, amount: 0.4 }}
@@ -239,7 +248,7 @@ function DecilePlot({
           return (
             <g key={line.label}>
               <line x1={GUTTER} x2={box.w} y1={y} y2={y} stroke={GRID} strokeWidth={1} />
-              <text x={GUTTER - 8} y={y + 4} textAnchor="end" className="fill-bone-faint font-mono text-[11px]">
+              <text x={GUTTER - 8} y={y + 4} textAnchor="end" className="fill-ink-faint font-mono text-[11px]">
                 {line.label}
               </text>
             </g>
@@ -248,7 +257,7 @@ function DecilePlot({
 
         {columns.map((c) => {
           const lit = active === c.decile;
-          const fill = lit ? BONE : COLUMN_FILL;
+          const fill = lit ? ACCENT : FELT_TEAL;
           return (
             <motion.path
               key={c.decile}
@@ -261,14 +270,14 @@ function DecilePlot({
         })}
 
         {columns.map((c) => (
-          <text key={c.decile} x={c.center} y={base + 18} textAnchor="middle" className="fill-bone-faint font-mono text-[11px]">
+          <text key={c.decile} x={c.center} y={base + 18} textAnchor="middle" className="fill-ink-faint font-mono text-[11px]">
             {c.decile}
           </text>
         ))}
-        <text x={GUTTER} y={base + 38} textAnchor="start" className="fill-bone-faint font-mono text-[11px]">
+        <text x={GUTTER} y={base + 38} textAnchor="start" className="fill-ink-faint font-mono text-[11px]">
           least at risk
         </text>
-        <text x={box.w} y={base + 38} textAnchor="end" className="fill-bone-faint font-mono text-[11px]">
+        <text x={box.w} y={base + 38} textAnchor="end" className="fill-ink-faint font-mono text-[11px]">
           most at risk
         </text>
 
@@ -279,7 +288,7 @@ function DecilePlot({
             textAnchor="middle"
             custom={first.index}
             variants={LABEL_FADE}
-            className="fill-bone font-sans text-[14px] font-semibold"
+            className="fill-ink font-sans text-[14px] font-semibold"
             style={HALO}
           >
             {formatShare(first.returnedShare)}
@@ -292,7 +301,7 @@ function DecilePlot({
             textAnchor="end"
             custom={last.index}
             variants={LABEL_FADE}
-            className="fill-bone font-sans text-[14px] font-semibold"
+            className="fill-ink font-sans text-[14px] font-semibold"
             style={HALO}
           >
             {formatShare(last.returnedShare)}
@@ -337,7 +346,7 @@ function DecilePlot({
         <table className="mt-4 w-full max-w-[480px] text-[14px] tabular-nums">
           <caption className="sr-only">Share who bought again, by forecast group</caption>
           <thead>
-            <tr className="border-b border-bone/10">
+            <tr className={HEAD_RULE}>
               <th scope="col" className={HEAD_CELL}>
                 Group
               </th>
@@ -351,12 +360,12 @@ function DecilePlot({
           </thead>
           <tbody>
             {deciles.map((d) => (
-              <tr key={d.decile} className="border-b border-bone/10">
-                <th scope="row" className="py-2 pr-4 text-left font-normal text-bone-dim">
+              <tr key={d.decile} className={ROW_RULE}>
+                <th scope="row" className="py-2 pr-4 text-left font-normal text-ink-dim">
                   {d.decile}
                 </th>
-                <td className="py-2 pr-4 text-right text-bone">{formatCount(d.customers)}</td>
-                <td className="py-2 text-right text-bone">{formatShare(d.returnedShare)}</td>
+                <td className="py-2 pr-4 text-right text-ink">{formatCount(d.customers)}</td>
+                <td className="py-2 text-right text-ink">{formatShare(d.returnedShare)}</td>
               </tr>
             ))}
           </tbody>

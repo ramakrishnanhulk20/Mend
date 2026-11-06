@@ -12,6 +12,8 @@ import {
   EASE,
   FOCUS_RING,
   HEAD_CELL,
+  HEAD_RULE,
+  ROW_RULE,
   ChartFrame,
   ChartPlaceholder,
   ChartTooltip,
@@ -27,15 +29,20 @@ const ROW_HEIGHT = 84;
 const AXIS_Y = 172;
 const PAD_LEFT = 6;
 const PAD_RIGHT = 64;
+// An end label is 40px wide, the zero label 34px, and they keep a 12px gap.
+const ZERO_LABEL_ROOM = 69;
+const END_LABEL_WIDTH = 40;
 
-const BONE = "#ede6da";
-const INK = "#0b0a0a";
-const LINE = "rgb(237 230 218 / 0.6)";
-const HOVER_BAND = "rgb(237 230 218 / 0.04)";
-const ZERO_LINE = "rgb(237 230 218 / 0.35)";
-const AXIS = "rgb(237 230 218 / 0.10)";
+const INK = "#123B3F";
+const PAPER = "#FBF5E9";
+const PAPER_RAISED = "#FFFDF7";
+const ACCENT = "#D72A16";
+const HOVER_BAND = "#FFF2C9";
+const ZERO_LINE = "rgb(18 59 63 / 0.35)";
+const AXIS = "rgb(18 59 63 / 0.10)";
 
-const HALO = { paintOrder: "stroke", stroke: INK, strokeWidth: 4, strokeLinejoin: "round" } as const;
+// Raised paper behind the letters keeps a label readable where it crosses a line.
+const HALO = { paintOrder: "stroke", stroke: PAPER_RAISED, strokeWidth: 4, strokeLinejoin: "round" } as const;
 const DOT_ORIGIN = { transformBox: "fill-box", transformOrigin: "center" } as const;
 
 const VERDICT_WORD = { better: "Better", tie: "A tie", worse: "Worse", unknown: "Not measured" } as const;
@@ -107,15 +114,22 @@ function IntervalPlot({ rows, titleId }: { rows: readonly Row[]; titleId: string
     const right = box.w - PAD_RIGHT;
     const x = (value: number) => left + ((value - lowest) / (highest - lowest)) * (right - left);
     const zeroX = x(0);
+    // On a narrow plot zero sits close to an end label, so its own label leans away from that end.
+    const zeroLabel =
+      zeroX - left < ZERO_LABEL_ROOM
+        ? { at: Math.max(zeroX, left + END_LABEL_WIDTH + 12), anchor: "start" as const }
+        : right - zeroX < ZERO_LABEL_ROOM
+          ? { at: Math.min(zeroX, right - END_LABEL_WIDTH - 12), anchor: "end" as const }
+          : { at: zeroX, anchor: "middle" as const };
 
     const hovered = active === null ? undefined : rows[active];
     if (active !== null && hovered?.measured) {
       const lineY = active * ROW_HEIGHT + 40;
       tooltip = (
         <ChartTooltip x={x(hovered.measured.mean)} bottom={lineY - 10} boxWidth={box.w}>
-          <p className="font-sans text-[15px] font-semibold text-bone">{formatDifference(hovered.measured.mean)}</p>
-          <p className="text-[12px] text-bone-dim">95 percent range {rangeText(hovered)}</p>
-          <p className="text-[12px] text-bone-dim">
+          <p className="font-sans text-[15px] font-semibold">{formatDifference(hovered.measured.mean)}</p>
+          <p className="text-[12px]">95 percent range {rangeText(hovered)}</p>
+          <p className="text-[12px]">
             won {hovered.group?.modelWins} of {hovered.group?.validCutoffs}
           </p>
         </ChartTooltip>
@@ -129,7 +143,7 @@ function IntervalPlot({ rows, titleId }: { rows: readonly Row[]; titleId: string
         viewBox={`0 0 ${box.w} ${HEIGHT}`}
         role="group"
         aria-labelledby={titleId}
-        className="block"
+        className="block overflow-visible"
         initial={still ? "shown" : "hidden"}
         whileInView={still ? undefined : "shown"}
         viewport={{ once: true, amount: 0.4 }}
@@ -137,22 +151,22 @@ function IntervalPlot({ rows, titleId }: { rows: readonly Row[]; titleId: string
         <line x1={left} x2={right} y1={AXIS_Y} y2={AXIS_Y} stroke={AXIS} strokeWidth={1} />
         {/* Drawn only beside each measured line and at the axis, so it never runs through a label. */}
         {[0, 1].map((index) => (
-          <line key={index} x1={zeroX} x2={zeroX} y1={index * ROW_HEIGHT + 28} y2={index * ROW_HEIGHT + 52} stroke={ZERO_LINE} strokeWidth={1} />
+          <line key={index} x1={zeroX} x2={zeroX} y1={index * ROW_HEIGHT + 28} y2={index * ROW_HEIGHT + 52} stroke={ZERO_LINE} strokeWidth={1} strokeDasharray="3 3" />
         ))}
-        <line x1={zeroX} x2={zeroX} y1={AXIS_Y - 6} y2={AXIS_Y + 5} stroke={ZERO_LINE} strokeWidth={1} />
+        <line x1={zeroX} x2={zeroX} y1={AXIS_Y - 6} y2={AXIS_Y + 5} stroke={ZERO_LINE} strokeWidth={1} strokeDasharray="3 3" />
         {[
           { at: left, anchor: "start" as const, value: lowest },
           { at: right, anchor: "end" as const, value: highest },
-          { at: zeroX, anchor: "middle" as const, value: 0 },
+          { at: zeroLabel.at, anchor: zeroLabel.anchor, value: 0 },
         ].map((tick) => (
-          <g key={tick.anchor}>
+          <g key={tick.value}>
             <line x1={x(tick.value)} x2={x(tick.value)} y1={AXIS_Y} y2={AXIS_Y + 5} stroke={ZERO_LINE} strokeWidth={1} />
-            <text x={tick.at} y={AXIS_Y + 22} textAnchor={tick.anchor} className="fill-bone-faint font-mono text-[11px]">
+            <text x={tick.at} y={AXIS_Y + 22} textAnchor={tick.anchor} className="fill-ink-faint font-mono text-[11px]">
               {formatDifference(tick.value)}
             </text>
           </g>
         ))}
-        <text x={zeroX} y={AXIS_Y + 40} textAnchor="middle" className="fill-bone-faint font-mono text-[11px]">
+        <text x={zeroLabel.at} y={AXIS_Y + 40} textAnchor={zeroLabel.anchor} className="fill-ink-faint font-mono text-[11px]">
           no better
         </text>
 
@@ -163,7 +177,7 @@ function IntervalPlot({ rows, titleId }: { rows: readonly Row[]; titleId: string
           return (
             <g key={row.key}>
               {lit && <rect x={0} y={top} width={box.w} height={ROW_HEIGHT - 8} rx={4} fill={HOVER_BAND} />}
-              <text x={0} y={top + 16} className="fill-bone font-sans text-[14px]" style={HALO}>
+              <text x={0} y={top + 16} className="fill-ink font-sans text-[14px]" style={HALO}>
                 {row.label}
               </text>
               {row.measured !== null && row.group !== null ? (
@@ -172,7 +186,7 @@ function IntervalPlot({ rows, titleId }: { rows: readonly Row[]; titleId: string
                     d={`M${x(row.measured.mean)} ${lineY}L${x(row.measured.low)} ${lineY}`}
                     variants={DRAW}
                     fill="none"
-                    stroke={lit ? BONE : LINE}
+                    stroke={INK}
                     strokeWidth={2}
                     strokeLinecap="round"
                   />
@@ -180,25 +194,25 @@ function IntervalPlot({ rows, titleId }: { rows: readonly Row[]; titleId: string
                     d={`M${x(row.measured.mean)} ${lineY}L${x(row.measured.high)} ${lineY}`}
                     variants={DRAW}
                     fill="none"
-                    stroke={lit ? BONE : LINE}
+                    stroke={INK}
                     strokeWidth={2}
                     strokeLinecap="round"
                   />
                   <motion.circle
                     cx={x(row.measured.mean)}
                     cy={lineY}
-                    r={4.5}
-                    fill={BONE}
-                    stroke={INK}
-                    strokeWidth={4}
+                    r={6}
+                    fill={ACCENT}
+                    stroke={PAPER}
+                    strokeWidth={2}
                     variants={POP}
-                    style={{ ...DOT_ORIGIN, paintOrder: "stroke" }}
+                    style={DOT_ORIGIN}
                   />
                   <motion.text
                     x={x(row.measured.high) + 10}
                     y={lineY + 5}
                     variants={LABEL_FADE}
-                    className="fill-bone font-sans text-[14px] font-semibold"
+                    className="fill-ink font-sans text-[14px] font-semibold"
                     style={HALO}
                   >
                     {formatDifference(row.measured.mean)}
@@ -207,14 +221,14 @@ function IntervalPlot({ rows, titleId }: { rows: readonly Row[]; titleId: string
                     x={0}
                     y={top + 64}
                     variants={LABEL_FADE}
-                    className="fill-bone-dim font-mono text-[12px]"
+                    className="fill-ink-dim font-mono text-[12px]"
                     style={HALO}
                   >
                     {`${verdictWord(row)}: won ${row.group.modelWins} of ${row.group.validCutoffs} test dates`}
                   </motion.text>
                 </>
               ) : (
-                <text x={0} y={top + 40} className="fill-bone-dim font-sans text-[14px]">
+                <text x={0} y={top + 40} className="fill-ink-dim font-sans text-[14px]">
                   Not measured yet.
                 </text>
               )}
@@ -259,7 +273,7 @@ function IntervalPlot({ rows, titleId }: { rows: readonly Row[]; titleId: string
         <table className="mt-4 w-full text-[14px] tabular-nums">
           <caption className="sr-only">Difference in ranking quality against sorting by last order</caption>
           <thead>
-            <tr className="border-b border-bone/10">
+            <tr className={HEAD_RULE}>
               <th scope="col" className={HEAD_CELL}>
                 Group
               </th>
@@ -276,20 +290,20 @@ function IntervalPlot({ rows, titleId }: { rows: readonly Row[]; titleId: string
           </thead>
           <tbody>
             {rows.map((row) => (
-              <tr key={row.key} className="border-b border-bone/10">
-                <th scope="row" className="py-2 pr-4 text-left font-normal text-bone-dim">
+              <tr key={row.key} className={ROW_RULE}>
+                <th scope="row" className="py-2 pr-4 text-left font-normal text-ink-dim">
                   {row.label}
                 </th>
                 {row.measured !== null && row.group !== null ? (
                   <>
-                    <td className="py-2 pr-4 text-right text-bone">{formatDifference(row.measured.mean)}</td>
-                    <td className="py-2 pr-4 text-right text-bone">{rangeText(row)}</td>
-                    <td className="py-2 text-right text-bone">
+                    <td className="py-2 pr-4 text-right text-ink">{formatDifference(row.measured.mean)}</td>
+                    <td className="py-2 pr-4 text-right text-ink">{rangeText(row)}</td>
+                    <td className="py-2 text-right text-ink">
                       {row.group.modelWins} of {row.group.validCutoffs}
                     </td>
                   </>
                 ) : (
-                  <td colSpan={3} className="py-2 text-right text-bone-dim">
+                  <td colSpan={3} className="py-2 text-right text-ink-dim">
                     Not measured yet.
                   </td>
                 )}

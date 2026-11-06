@@ -295,8 +295,8 @@ describe("GET /api/join/paypal/start", () => {
     expect(csrfCookie).toMatch(/^__Host-mend_csrf=a1\./);
     expect(csrf).toMatch(/^c2\.[A-Za-z0-9_-]{43}$/);
     expect(html).toContain('<p class="tag">MEND · SANDBOX</p>');
-    expect(html).toContain('<path d="M4 16h8M20 16h8" stroke="#ede6da" stroke-width="2.5" stroke-linecap="round"/>');
-    expect(html).toContain('<path d="M13 12l6 8M19 12l-6 8" stroke="#ff4d2e" stroke-width="2.5" stroke-linecap="round"/>');
+    expect(html).toContain('<path d="M4 16h8M20 16h8" stroke="#123B3F" stroke-width="2.5" stroke-linecap="round"/>');
+    expect(html).toContain('<path d="M13 12l6 8M19 12l-6 8" stroke="#D72A16" stroke-width="2.5" stroke-linecap="round"/>');
     expect(html).toContain(
       '<h1>Copperwick Gifts</h1>\n<p class="words">Copperwick Gifts may look at your past orders.</p>\n' +
         "<p class=\"note\">You sign in on PayPal's own page, so Mend never sees your password.</p>",

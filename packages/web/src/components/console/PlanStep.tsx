@@ -5,7 +5,18 @@ import { motion } from "motion/react";
 import { useStill } from "@/components/motion/useStill";
 import { ApiError, type ConsoleApi, type Draft } from "./api";
 import { formatShare, formatUsd, plural } from "./money";
-import { EASE, FOCUS_RING, LoomLine, NoticePanel, PRIMARY_BUTTON, Spinner, TextButton, useElapsedSeconds } from "./ui";
+import {
+  EASE,
+  FOCUS_RING,
+  Figure,
+  LoomLine,
+  NoticePanel,
+  PRIMARY_BUTTON,
+  Spinner,
+  StepHeader,
+  TextButton,
+  useElapsedSeconds,
+} from "./ui";
 
 const GOAL_LIMIT = 500;
 // Above this the form says Claude will lower the budget. The request still goes, and the server clamps it.
@@ -18,7 +29,10 @@ const SUGGESTIONS = [
   "Bring back customers silent for over three months, 10 dollars in total",
 ] as const;
 
-const LABEL = "font-mono text-[11px] uppercase tracking-[0.14em] text-bone-faint";
+const LABEL = "font-mono text-[12px] uppercase tracking-[0.14em] text-ink-dim";
+
+const FIELD =
+  "rounded-[14px] border-2 border-ink/20 bg-paper-raised px-4 py-[14px] text-[17px] text-ink placeholder:text-ink-faint focus:border-accent";
 
 function limitMinutes(error: ApiError): number | null {
   return error.retryAfterSeconds === null ? null : Math.max(1, Math.ceil(error.retryAfterSeconds / 60));
@@ -57,17 +71,8 @@ type Outcome =
 function ThreadGlyph() {
   return (
     <svg width="16" height="6" viewBox="0 0 16 6" fill="none" aria-hidden="true" className="mt-[9px] shrink-0">
-      <path d="M0 3H16" className="stroke-bone/40" strokeWidth="1.5" strokeLinecap="round" />
+      <path d="M0 3H16" className="stroke-ink/40" strokeWidth="1.5" strokeLinecap="round" />
     </svg>
-  );
-}
-
-function Figure({ label, value }: { label: string; value: string | number }) {
-  return (
-    <div>
-      <dt className={LABEL}>{label}</dt>
-      <dd className="mt-2 text-[24px] font-semibold tabular-nums text-bone">{value}</dd>
-    </div>
   );
 }
 
@@ -84,7 +89,7 @@ function PlanPanel({ draft, still, onReview }: { draft: Draft; still: boolean; o
   return (
     <motion.div
       ref={panel}
-      className="mt-8 rounded-[8px] border border-rule bg-ink-raised p-6"
+      className="patch mt-8 p-7"
       initial={still ? false : { opacity: 0, y: 16 }}
       animate={{ opacity: 1, y: 0 }}
       transition={{ duration: 0.4, ease: EASE }}
@@ -92,11 +97,11 @@ function PlanPanel({ draft, still, onReview }: { draft: Draft; still: boolean; o
       <p className={LABEL}>Claude&apos;s plan</p>
 
       {settings !== null && (
-        <dl className="mt-5 grid grid-cols-2 gap-x-6 gap-y-5 md:grid-cols-4">
-          <Figure label="Budget" value={formatUsd(settings.budgetMinor)} />
-          <Figure label="Per customer" value={formatUsd(settings.perRecipientMinor)} />
-          <Figure label="Held back" value={formatShare(settings.holdoutShare)} />
-          <Figure label="Considered" value={settings.maxCandidates} />
+        <dl className="mt-5 grid grid-cols-2 gap-x-6 gap-y-5 xl:grid-cols-4">
+          <Figure label="Budget">{formatUsd(settings.budgetMinor)}</Figure>
+          <Figure label="Per customer">{formatUsd(settings.perRecipientMinor)}</Figure>
+          <Figure label="Held back">{formatShare(settings.holdoutShare)}</Figure>
+          <Figure label="Considered">{settings.maxCandidates}</Figure>
         </dl>
       )}
 
@@ -105,7 +110,7 @@ function PlanPanel({ draft, still, onReview }: { draft: Draft; still: boolean; o
           <p className={LABEL}>What Claude adjusted</p>
           <ul role="list" className="mt-3 flex flex-col gap-2">
             {changes.map((change) => (
-              <li key={change} className="flex items-start gap-3 text-[14px] leading-[1.5] text-bone-dim">
+              <li key={change} className="flex items-start gap-3 text-[14px] leading-[1.5] text-ink-dim">
                 <ThreadGlyph />
                 {change}
               </li>
@@ -114,7 +119,7 @@ function PlanPanel({ draft, still, onReview }: { draft: Draft; still: boolean; o
         </div>
       )}
 
-      <p className="mt-4 text-[15px] leading-[1.5] text-bone">
+      <p className="mt-4 text-[15px] leading-[1.5] text-ink">
         {plural(draft.rewarded, "customer", "customers")} {draft.rewarded === 1 ? "gets" : "get"} cashback,{" "}
         {draft.heldBack} {draft.heldBack === 1 ? "is" : "are"} held back, {formatUsd(draft.totalMinor)} in total.
       </p>
@@ -212,17 +217,21 @@ export function PlanStep({ api, onDrafted, onReview }: PlanStepProps) {
 
   return (
     <section aria-labelledby="plan-title" aria-busy={pending}>
-      <p className="font-mono text-[12px] uppercase tracking-[0.14em] text-bone-faint">Step 2 &middot; Plan</p>
-      <h1 id="plan-title" className="poster-title mt-4 text-[40px] text-bone md:text-[56px]" style={{ lineHeight: 0.9 }}>
-        Ask Claude for a plan.
-      </h1>
-      <p className="mt-5 max-w-[60ch] text-[16px] leading-[1.55] text-bone-dim">
-        Describe what you want in plain words. Claude turns it into a budget and a reward size within the
-        demo&apos;s caps, then Mend&apos;s engine picks the customers and holds a random group back.
-      </p>
+      <StepHeader
+        tint="butter"
+        kicker="Step 2 · Plan"
+        titleId="plan-title"
+        title="Ask Claude for a plan."
+        icon="/world/icons/plan.webp"
+      >
+        <p className="mt-5 max-w-[60ch] text-[16px] leading-[1.55] text-ink-dim">
+          Describe what you want in plain words. Claude turns it into a budget and a reward size within the
+          demo&apos;s caps, then Mend&apos;s engine picks the customers and holds a random group back.
+        </p>
+      </StepHeader>
 
       <form
-        className="mt-8"
+        className="patch p-7"
         onSubmit={(event) => {
           event.preventDefault();
           if (!pending) void draftPlan();
@@ -239,9 +248,9 @@ export function PlanStep({ api, onDrafted, onReview }: PlanStepProps) {
           value={goal}
           onChange={(event) => setGoal(event.target.value)}
           placeholder={PLACEHOLDER}
-          className={`mt-2 w-full resize-y rounded-[8px] border border-rule bg-ink-raised p-4 text-[16px] text-bone placeholder:text-bone-faint focus:border-bone-faint ${FOCUS_RING}`}
+          className={`mt-2 w-full resize-y ${FIELD} ${FOCUS_RING}`}
         />
-        <p className="mt-2 text-right font-mono text-[11px] tabular-nums text-bone-faint">
+        <p className="mt-2 text-right font-mono text-[11px] tabular-nums text-ink-faint">
           {goal.length} / {GOAL_LIMIT}
         </p>
         <div className="mt-3 flex flex-wrap gap-2">
@@ -250,7 +259,7 @@ export function PlanStep({ api, onDrafted, onReview }: PlanStepProps) {
               key={text}
               type="button"
               onClick={() => suggest(text)}
-              className={`rounded-[8px] border border-rule px-3 py-[6px] text-left text-[13px] text-bone-dim transition-colors duration-150 ease-out hover:border-bone-faint hover:text-bone ${FOCUS_RING}`}
+              className={`min-h-[38px] rounded-[10px] border-[1.5px] border-dashed border-ink/30 bg-pale-sky px-[14px] py-[9px] text-left text-[15px] leading-5 text-ink transition-colors duration-150 ease-out hover:bg-felt-sky ${FOCUS_RING}`}
             >
               {text}
             </button>
@@ -270,10 +279,10 @@ export function PlanStep({ api, onDrafted, onReview }: PlanStepProps) {
             value={budget}
             onChange={(event) => setBudget(event.target.value)}
             aria-describedby={overLimit ? "plan-budget-hint" : undefined}
-            className={`mt-2 h-10 w-[140px] rounded-[8px] border border-rule bg-ink-raised px-3 text-[16px] tabular-nums text-bone placeholder:text-bone-faint focus:border-bone-faint ${FOCUS_RING}`}
+            className={`mt-2 w-[140px] tabular-nums ${FIELD} ${FOCUS_RING}`}
           />
           {overLimit && (
-            <p id="plan-budget-hint" className="mt-2 max-w-[300px] text-[14px] leading-[1.5] text-bone-dim">
+            <p id="plan-budget-hint" className="mt-2 max-w-[300px] text-[14px] leading-[1.5] text-ink-dim">
               {OVER_BUDGET_HINT}
             </p>
           )}
@@ -283,7 +292,7 @@ export function PlanStep({ api, onDrafted, onReview }: PlanStepProps) {
           type="submit"
           disabled={goal.trim() === "" || pending}
           aria-busy={pending}
-          className={`group/primary ${PRIMARY_BUTTON} mt-6 h-12 gap-2 px-[22px] text-[15px] disabled:translate-y-0 disabled:cursor-default disabled:opacity-50 disabled:hover:translate-y-0 disabled:hover:bg-accent ${FOCUS_RING}`}
+          className={`group/primary ${PRIMARY_BUTTON} mt-6 h-12 px-[22px] text-[15px] ${FOCUS_RING}`}
         >
           {pending ? (
             <>
@@ -301,12 +310,12 @@ export function PlanStep({ api, onDrafted, onReview }: PlanStepProps) {
 
       <div aria-live="polite">
         {outcome.kind === "pending" && (
-          <div className="mt-6 rounded-[8px] border border-rule p-5">
+          <div className="patch mt-6 p-7">
             <LoomLine />
-            <p className="mt-4 text-[14px] leading-[1.5] text-bone-dim">
+            <p className="mt-4 text-[14px] leading-[1.5] text-ink-dim">
               Claude reads your goal, then Mend&apos;s engine picks the customers and holds a random group back.
             </p>
-            <p className="mt-2 font-mono text-[12px] tabular-nums text-bone-faint">{elapsed} s</p>
+            <p className="mt-2 font-mono text-[12px] tabular-nums text-ink-faint">{elapsed} s</p>
           </div>
         )}
 
@@ -314,7 +323,7 @@ export function PlanStep({ api, onDrafted, onReview }: PlanStepProps) {
           <NoticePanel>
             <span className="block">
               <span className="block">{outcome.message}</span>
-              <span className="mt-2 block text-bone-dim">Add an amount to your goal, or fill in the budget.</span>
+              <span className="mt-2 block text-ink-dim">Add an amount to your goal, or fill in the budget.</span>
             </span>
           </NoticePanel>
         )}

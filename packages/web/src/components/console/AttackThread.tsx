@@ -30,7 +30,7 @@ function DashedRoad() {
       y1={MIDDLE}
       x2={FAR_END_X}
       y2={MIDDLE}
-      className="stroke-bone/30"
+      className="stroke-ink/55"
       strokeWidth="1.5"
       strokeDasharray="2 6"
     />
@@ -41,7 +41,7 @@ function Runner({ still }: { still: boolean }) {
   if (still) {
     // Reduced motion: the bright piece rests in the middle of the road to the guard.
     const left = 8 + (GUARD_X - 8 - RUNNER_LENGTH) / 2;
-    return <line x1={left} y1={MIDDLE} x2={left + RUNNER_LENGTH} y2={MIDDLE} className="stroke-bone/80" strokeWidth="1.5" />;
+    return <line x1={left} y1={MIDDLE} x2={left + RUNNER_LENGTH} y2={MIDDLE} className="stroke-ink/80" strokeWidth="1.5" />;
   }
   return (
     <motion.line
@@ -49,7 +49,7 @@ function Runner({ still }: { still: boolean }) {
       y1={MIDDLE}
       x2={8 + RUNNER_LENGTH}
       y2={MIDDLE}
-      className="stroke-bone/80"
+      className="stroke-ink/80"
       strokeWidth="1.5"
       initial={{ x: 0 }}
       animate={{ x: RUNNER_TRAVEL }}
@@ -83,7 +83,7 @@ function Held({ still }: { still: boolean }) {
   if (still) {
     return (
       <>
-        <path d={`M8 ${MIDDLE}H124`} className="stroke-bone/70" strokeWidth="1.5" />
+        <path d={`M8 ${MIDDLE}H124`} className="stroke-ink/55" strokeWidth="1.5" />
         <Knot still />
       </>
     );
@@ -92,7 +92,7 @@ function Held({ still }: { still: boolean }) {
     <>
       <motion.path
         d={`M8 ${MIDDLE}H124`}
-        className="stroke-bone/70"
+        className="stroke-ink/55"
         strokeWidth="1.5"
         initial={{ pathLength: 0 }}
         animate={{ pathLength: 1 }}
@@ -100,7 +100,7 @@ function Held({ still }: { still: boolean }) {
       />
       <motion.path
         d={`M${FAR_START_X} ${MIDDLE}H${FAR_END_X}`}
-        className="stroke-bone/40"
+        className="stroke-ink/55"
         style={FAR_ORIGIN}
         initial={{ opacity: 1, y: 0, rotate: 0 }}
         animate={{ opacity: 0, y: 6, rotate: 8 }}
@@ -112,11 +112,11 @@ function Held({ still }: { still: boolean }) {
 }
 
 function NotHeld({ still }: { still: boolean }) {
-  if (still) return <path d={`M8 ${MIDDLE}H${FAR_END_X}`} className="stroke-bone" strokeWidth="1.5" />;
+  if (still) return <path d={`M8 ${MIDDLE}H${FAR_END_X}`} className="stroke-ink" strokeWidth="1.5" />;
   return (
     <motion.path
       d={`M8 ${MIDDLE}H${FAR_END_X}`}
-      className="stroke-bone"
+      className="stroke-ink"
       strokeWidth="1.5"
       initial={{ pathLength: 0 }}
       animate={{ pathLength: 1 }}
@@ -132,9 +132,9 @@ export function AttackThread({ state }: { state: ThreadState }) {
 
   return (
     <svg viewBox={`0 0 ${VIEW_WIDTH} ${VIEW_HEIGHT}`} fill="none" aria-hidden="true" className="block h-6 w-full max-w-[200px]">
-      <circle cx="4" cy={MIDDLE} r="3" className="fill-bone-dim" />
-      <line x1={GUARD_X} y1="4" x2={GUARD_X} y2="20" className="stroke-bone-faint" strokeWidth="1.5" strokeLinecap="round" />
-      <rect x="186" y="6" width="12" height="12" rx="3" className="stroke-bone-faint" strokeWidth="1.5" />
+      <circle cx="4" cy={MIDDLE} r="3" className="fill-ink-dim" />
+      <line x1={GUARD_X} y1="4" x2={GUARD_X} y2="20" className="stroke-ink-faint" strokeWidth="1.5" strokeLinecap="round" />
+      <rect x="186" y="6" width="12" height="12" rx="3" className="stroke-ink-faint" strokeWidth="1.5" />
 
       {dashed && <DashedRoad />}
       {/* Keyed by state so a second run of the same attack plays its drawing again. */}

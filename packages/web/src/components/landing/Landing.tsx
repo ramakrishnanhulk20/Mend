@@ -3,11 +3,11 @@
 import { MotionConfig } from "motion/react";
 import { Closing } from "@/components/closing/Closing";
 import { Footer } from "@/components/closing/Footer";
-import { Hero } from "@/components/hero/Hero";
 import { HowItWorks } from "@/components/how/HowItWorks";
 import { useShopSummary } from "@/components/live/useShopSummary";
 import { ProofSection } from "@/components/proof/ProofSection";
 import { Guardrails } from "@/components/safety/Guardrails";
+import { WorldHero } from "@/components/world/WorldHero";
 
 export function Landing() {
   const { state, summary, slow, retry } = useShopSummary();
@@ -17,7 +17,7 @@ export function Landing() {
     // of animations already running by then, so a reduced-motion visitor never sees things slide.
     <MotionConfig reducedMotion="user">
       <main>
-        <Hero
+        <WorldHero
           live={
             summary
               ? {

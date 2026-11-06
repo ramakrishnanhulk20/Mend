@@ -6,49 +6,49 @@ import { createPortal } from "react-dom";
 import { useStill } from "@/components/motion/useStill";
 
 const EASE = [0.22, 1, 0.36, 1] as const;
-const FOCUS_RING = "focus-visible:outline-2 focus-visible:outline-offset-[3px] focus-visible:outline-bone";
+const FOCUS_RING = "focus-visible:outline-2 focus-visible:outline-offset-[3px] focus-visible:outline-ink";
 
 type DrawState = "drawing" | "failed" | { svg: string };
 
 // The site's tokens as plain values: Mermaid builds its own stylesheet and cannot read CSS classes.
-const INK = "#0b0a0a";
-const INK_RAISED = "#151312";
-const BONE = "#ede6da";
-const EDGE = "rgb(237 230 218 / 0.38)";
-const LINE = "rgb(237 230 218 / 0.5)";
+const PAPER = "#FBF5E9";
+const PAPER_RAISED = "#FFFDF7";
+const INK = "#123B3F";
+const EDGE = "rgb(18 59 63 / 0.62)";
+const LINE = "rgb(18 59 63 / 0.74)";
 
 const THEME_VARIABLES = {
-  background: INK,
-  primaryColor: INK_RAISED,
-  primaryTextColor: BONE,
+  background: PAPER,
+  primaryColor: PAPER_RAISED,
+  primaryTextColor: INK,
   primaryBorderColor: EDGE,
   lineColor: LINE,
   fontFamily: "var(--font-instrument), sans-serif",
   // The rest keep Mermaid from filling in its own tints (blue-grey groups, yellow notes).
-  secondaryColor: INK_RAISED,
-  tertiaryColor: INK_RAISED,
-  textColor: BONE,
-  mainBkg: INK_RAISED,
+  secondaryColor: PAPER_RAISED,
+  tertiaryColor: PAPER_RAISED,
+  textColor: INK,
+  mainBkg: PAPER_RAISED,
   nodeBorder: EDGE,
-  clusterBkg: "rgb(237 230 218 / 0.04)",
+  clusterBkg: "rgb(18 59 63 / 0.04)",
   clusterBorder: EDGE,
-  edgeLabelBackground: INK,
-  actorBkg: INK_RAISED,
+  edgeLabelBackground: PAPER,
+  actorBkg: PAPER_RAISED,
   actorBorder: EDGE,
-  actorTextColor: BONE,
+  actorTextColor: INK,
   actorLineColor: LINE,
   signalColor: LINE,
-  signalTextColor: BONE,
-  labelBoxBkgColor: INK_RAISED,
+  signalTextColor: INK,
+  labelBoxBkgColor: PAPER_RAISED,
   labelBoxBorderColor: EDGE,
-  labelTextColor: BONE,
-  loopTextColor: BONE,
-  noteBkgColor: INK_RAISED,
+  labelTextColor: INK,
+  loopTextColor: INK,
+  noteBkgColor: PAPER_RAISED,
   noteBorderColor: EDGE,
-  noteTextColor: BONE,
-  activationBkgColor: "rgb(237 230 218 / 0.12)",
+  noteTextColor: INK,
+  activationBkgColor: "rgb(18 59 63 / 0.12)",
   activationBorderColor: EDGE,
-  sequenceNumberColor: INK,
+  sequenceNumberColor: PAPER,
 };
 
 let initialised = false;
@@ -127,9 +127,9 @@ export function Mermaid({ chart }: { chart: string }) {
     return (
       <div
         aria-busy="true"
-        className="not-prose my-6 flex min-h-[180px] items-center justify-center rounded-[8px] border border-rule bg-ink"
+        className="not-prose my-6 flex min-h-[180px] items-center justify-center rounded-[8px] border border-rule bg-paper"
       >
-        <span className="font-mono text-[12px] uppercase tracking-[0.14em] text-bone-faint">
+        <span className="font-mono text-[12px] uppercase tracking-[0.14em] text-ink-faint">
           Drawing the diagram
         </span>
       </div>
@@ -140,7 +140,7 @@ export function Mermaid({ chart }: { chart: string }) {
     return (
       <pre
         data-mermaid="source"
-        className="not-prose fd-scroll-container my-6 overflow-x-auto rounded-[8px] border border-rule bg-ink-raised p-4 font-mono text-[13px] leading-[1.6] text-bone-dim"
+        className="not-prose fd-scroll-container my-6 overflow-x-auto rounded-[8px] border border-rule bg-paper-raised p-4 font-mono text-[13px] leading-[1.6] text-ink-dim"
       >
         {chart}
       </pre>
@@ -154,7 +154,7 @@ export function Mermaid({ chart }: { chart: string }) {
         aria-label="Diagram"
         tabIndex={0}
         data-mermaid="drawn"
-        className={`not-prose fd-scroll-container my-6 overflow-x-auto rounded-[8px] border border-rule bg-ink p-4 [&_svg]:h-auto [&_svg]:max-w-full ${FOCUS_RING}`}
+        className={`not-prose fd-scroll-container my-6 overflow-x-auto rounded-[8px] border border-rule bg-paper p-4 [&_svg]:h-auto [&_svg]:max-w-full ${FOCUS_RING}`}
         dangerouslySetInnerHTML={{ __html: state.svg }}
       />
       <div className="not-prose -mt-4 mb-6 flex justify-end">
@@ -162,7 +162,7 @@ export function Mermaid({ chart }: { chart: string }) {
           ref={openButtonRef}
           type="button"
           onClick={() => setOpen(true)}
-          className={`font-mono text-[12px] uppercase tracking-[0.14em] text-bone-dim underline-offset-4 transition-colors duration-150 ease-out hover:text-bone hover:underline ${FOCUS_RING}`}
+          className={`font-mono text-[12px] uppercase tracking-[0.14em] text-ink-dim underline-offset-4 transition-colors duration-150 ease-out hover:text-ink hover:underline ${FOCUS_RING}`}
         >
           Open full size
         </button>
@@ -176,20 +176,20 @@ export function Mermaid({ chart }: { chart: string }) {
               role="dialog"
               aria-modal="true"
               aria-label="Diagram, full size"
-              className="fixed inset-0 z-50 bg-ink/95 backdrop-blur-sm"
+              className="fixed inset-0 z-50 bg-paper/95 backdrop-blur-sm"
               initial={{ opacity: 0 }}
               animate={{ opacity: 1, transition: { duration: still ? 0 : 0.2, ease: EASE } }}
               exit={{ opacity: 0, transition: { duration: still ? 0 : 0.15, ease: EASE } }}
             >
               <div className="flex h-14 items-center justify-between border-b border-rule px-4 md:px-6">
-                <span className="font-mono text-[12px] uppercase tracking-[0.14em] text-bone-faint">
+                <span className="font-mono text-[12px] uppercase tracking-[0.14em] text-ink-faint">
                   Diagram
                 </span>
                 <button
                   ref={closeButtonRef}
                   type="button"
                   onClick={() => setOpen(false)}
-                  className={`text-[14px] text-bone underline-offset-4 hover:underline ${FOCUS_RING}`}
+                  className={`text-[14px] text-ink underline-offset-4 hover:underline ${FOCUS_RING}`}
                 >
                   Close
                 </button>

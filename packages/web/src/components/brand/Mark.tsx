@@ -21,7 +21,7 @@ export function Mark({ size = 22, className, spinOnHover = false }: MarkProps) {
       <path d="M4 16h8M20 16h8" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" />
       <path
         d="M13 12l6 8M19 12l-6 8"
-        stroke="#ff4d2e"
+        stroke="#D72A16"
         strokeWidth="2.5"
         strokeLinecap="round"
         className={spinOnHover ? SPIN_CLASSES : undefined}

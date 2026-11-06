@@ -3,18 +3,18 @@
 import { useState } from "react";
 import { formatCount } from "@/components/live/summary";
 import { useShopSummary } from "@/components/live/useShopSummary";
-import { FOCUS_RING, TextButton } from "./StepRail";
+import { TextButton } from "./StepRail";
 
-const ROW = "flex items-center justify-between border-b border-rule py-3 last:border-0";
-const LABEL = "text-[14px] text-bone-dim";
-const VALUE = "text-[15px] font-semibold tabular-nums text-bone";
+const ROW = "flex items-center justify-between border-b-[1.5px] border-dashed border-stitch py-3 last:border-b-0";
+const LABEL = "text-[14px] text-ink-dim";
+const VALUE = "text-[15px] font-semibold tabular-nums text-ink";
 
 function capitalised(text: string): string {
   return text.charAt(0).toUpperCase() + text.slice(1);
 }
 
 function Bar({ width }: { width: string }) {
-  return <span aria-hidden="true" className={`block h-[14px] rounded-[3px] bg-bone/10 ${width}`} />;
+  return <span aria-hidden="true" className={`block h-[14px] rounded-[3px] bg-pale-teal ${width}`} />;
 }
 
 /**
@@ -27,12 +27,12 @@ export function ShopCard() {
   const ready = state === "ready" && summary !== null;
 
   return (
-    <div className="rounded-[8px] border border-rule bg-ink-raised">
+    <div className="patch">
       <button
         type="button"
         aria-expanded={open}
         onClick={() => setOpen((current) => !current)}
-        className={`flex min-h-12 w-full items-center justify-between gap-4 px-4 py-3 text-left text-[14px] text-bone-dim transition-colors duration-200 ease-out hover:text-bone lg:hidden ${FOCUS_RING}`}
+        className="flex min-h-12 w-full items-center justify-between gap-4 rounded-[28px] px-6 py-3 text-left text-[14px] text-ink-dim transition-colors duration-200 ease-out hover:text-ink focus-visible:outline-2 focus-visible:outline-offset-[-6px] focus-visible:outline-ink lg:hidden"
       >
         {ready ? (
           <span>
@@ -59,12 +59,12 @@ export function ShopCard() {
         className={`grid transition-[grid-template-rows] duration-300 ease-[cubic-bezier(0.22,1,0.36,1)] motion-reduce:transition-none lg:grid-rows-[1fr] ${open ? "grid-rows-[1fr]" : "grid-rows-[0fr]"}`}
       >
         <div className="min-h-0 overflow-hidden">
-          <div className={`px-4 pb-4 lg:p-6 ${open ? "" : "invisible"} lg:visible`}>
-            <p className="font-mono text-[11px] uppercase tracking-[0.14em] text-bone-faint">The demo shop</p>
+          <div className={`px-6 pb-6 lg:p-[26px] ${open ? "" : "invisible"} lg:visible`}>
+            <p className="font-mono text-[12px] uppercase tracking-[0.14em] text-ink-dim">The demo shop</p>
 
             {state === "unavailable" ? (
               <div className="mt-4 flex items-center justify-between gap-4">
-                <p className="text-[14px] text-bone-dim">Live numbers unavailable.</p>
+                <p className="text-[14px] text-ink-dim">Live numbers unavailable.</p>
                 <TextButton onClick={retry}>Try again</TextButton>
               </div>
             ) : (
@@ -90,7 +90,7 @@ export function ShopCard() {
               </dl>
             )}
 
-            <p className="mt-4 text-[12px] leading-[1.5] text-bone-faint">
+            <p className="mt-4 text-[12px] leading-[1.5] text-ink-faint">
               Demo stand-ins were joined by a script so the demo has people to pay. They never signed up, and
               they are always labelled.
             </p>

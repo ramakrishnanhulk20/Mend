@@ -3,11 +3,11 @@
 import { useEffect, useId, useRef, useState } from "react";
 import { motion, useInView } from "motion/react";
 import { useStill } from "@/components/motion/useStill";
-import { FOCUS_RING, UNDERLINE_DRAW } from "@/components/console/ui";
+import { FOCUS_RING } from "@/components/console/ui";
 
 const EASE = [0.22, 1, 0.36, 1] as const;
 
-const STITCH_RED = "#ff4d2e";
+const STITCH_RED = "#D72A16";
 
 const CLAUDE_CAN = [
   "Read the shop's order history and see who went quiet",
@@ -27,14 +27,17 @@ const RULES = [
   {
     label: "In code, not in the prompt",
     text: "Every reward has a cap per customer, per campaign and per day, set by Mend's engine, never by the AI.",
+    tint: "bg-pale-teal",
   },
   {
     label: "Checked before it goes",
     text: "Every note is checked before PayPal delivers it: no links, no contact details, no claims that PayPal is paying.",
+    tint: "bg-pale-peach",
   },
   {
     label: "Sandbox only",
     text: "Mend runs on PayPal's sandbox. No real money moves, and the engine refuses to start against live PayPal.",
+    tint: "bg-pale-sage",
   },
 ];
 
@@ -84,11 +87,11 @@ function Glyph({ broken }: { broken: boolean }) {
     >
       {broken ? (
         <>
-          <path d="M0 5h9M19 5h9" className="stroke-bone-faint" strokeWidth="1.5" strokeLinecap="round" />
+          <path d="M0 5h9M19 5h9" className="stroke-ink-faint" strokeWidth="1.5" strokeLinecap="round" />
           <path d="M11.5 2.5l5 5M16.5 2.5l-5 5" stroke={STITCH_RED} strokeWidth="1.5" strokeLinecap="round" />
         </>
       ) : (
-        <path d="M0 5h28" className="stroke-bone-faint" strokeWidth="1.5" strokeLinecap="round" />
+        <path d="M0 5h28" className="stroke-ink-faint" strokeWidth="1.5" strokeLinecap="round" />
       )}
     </svg>
   );
@@ -99,22 +102,24 @@ function Capabilities({
   items,
   broken,
   fromX,
+  tint,
   still,
 }: {
   heading: string;
   items: string[];
   broken: boolean;
   fromX: number;
+  tint: string;
   still: boolean;
 }) {
   return (
-    <div>
-      <h3 className="font-sans text-[20px] font-semibold text-bone">{heading}</h3>
-      <ul role="list" className="mt-6 flex flex-col gap-[18px]">
+    <div className={`patch patch-tinted ${tint} px-[26px] py-[30px] md:p-10`}>
+      <h3 className="poster-title text-[32px] text-ink">{heading}</h3>
+      <ul role="list" className="mt-6 flex flex-col gap-[14px]">
         {items.map((item, i) => (
           <motion.li
             key={item}
-            className="flex gap-[14px] text-[16px] leading-[1.5] text-bone-dim md:text-[17px]"
+            className="flex gap-[14px] text-[17px] leading-[1.5] text-ink"
             {...slideIn(still, i * 80, fromX)}
           >
             <Glyph broken={broken} />
@@ -126,8 +131,8 @@ function Capabilities({
   );
 }
 
-// The thread between the two lists. Its length is read from the page, so the line and the
-// stitch count follow the real height (or width) of the lists at every screen size.
+// The thread between the two pieces. Its length is read from the page, so the line and the
+// stitch count follow the real height (or width) of the pieces at every screen size.
 function Seam({ vertical, show, still }: { vertical: boolean; show: boolean; still: boolean }) {
   const boxRef = useRef<HTMLDivElement>(null);
   const [length, setLength] = useState(0);
@@ -154,13 +159,13 @@ function Seam({ vertical, show, still }: { vertical: boolean; show: boolean; sti
       className={
         vertical
           ? "relative hidden w-[56px] md:block"
-          : "relative my-10 h-8 w-full md:hidden"
+          : "relative my-2 h-8 w-full md:hidden"
       }
     >
       <svg className="absolute inset-0 h-full w-full overflow-visible" fill="none">
         <motion.path
           d={vertical ? `M${centre} 0V${length}` : `M0 ${centre}H${length}`}
-          className="stroke-bone/20"
+          className="stroke-ink/20"
           strokeWidth="1"
           initial={still ? false : { pathLength: 0 }}
           animate={{ pathLength: show ? 1 : 0 }}
@@ -190,72 +195,78 @@ export function Guardrails() {
   const drawn = still || splitInView;
 
   return (
-    <section
-      id="safety"
-      aria-labelledby={titleId}
-      className="border-t border-rule bg-ink px-4 py-28 md:px-10 md:py-40"
-    >
-      <motion.p
-        className="font-mono text-[12px] uppercase tracking-[0.14em] text-bone-faint"
-        {...rise(still, 0)}
-      >
-        The guardrails
-      </motion.p>
-      {/* Inline line height, because .poster-title sits outside Tailwind's layers and would beat a leading class. */}
-      <motion.h2
-        id={titleId}
-        className="poster-title mt-6 text-[44px] text-bone md:text-[length:clamp(3.5rem,7vw,7.5rem)]"
-        style={{ lineHeight: 0.9 }}
-        {...rise(still, 90)}
-      >
-        Claude plans. Only you pay.
-      </motion.h2>
-      <motion.p
-        className="mt-6 max-w-[58ch] text-[16px] leading-[1.55] text-bone-dim md:text-[18px]"
-        {...rise(still, 180)}
-      >
-        Mend&apos;s AI is Claude, running on Mend&apos;s own server. It reads the shop&apos;s numbers
-        and PayPal orders, drafts the plan and writes each customer&apos;s note. It has no tool that
-        sends money. A payout happens only when a person approves one exact plan.
-      </motion.p>
+    <section id="safety" aria-labelledby={titleId} className="border-t border-rule bg-paper">
+      <div className="mx-auto max-w-[1440px] px-4 py-24 md:px-12">
+        <motion.p className="label-tag" {...rise(still, 0)}>
+          The guardrails
+        </motion.p>
+        <motion.h2
+          id={titleId}
+          className="poster-title mt-6 text-[36px] text-ink md:text-[length:clamp(2.75rem,5.4vw,5.5rem)]"
+          {...rise(still, 90)}
+        >
+          Claude plans. Only you pay.
+        </motion.h2>
+        <motion.p
+          className="mb-12 mt-6 max-w-[34em] text-[16px] leading-[1.55] text-ink-dim md:text-[18px]"
+          {...rise(still, 180)}
+        >
+          Mend&apos;s AI is Claude, running on Mend&apos;s own server. It reads the shop&apos;s numbers
+          and PayPal orders, drafts the plan and writes each customer&apos;s note. It has no tool that
+          sends money. A payout happens only when a person approves one exact plan.
+        </motion.p>
 
-      <div ref={splitRef} className="mt-20 md:grid md:grid-cols-[1fr_56px_1fr]">
-        <Capabilities heading="Claude can" items={CLAUDE_CAN} broken={false} fromX={-12} still={still} />
-        <Seam vertical show={drawn} still={still} />
-        <Seam vertical={false} show={drawn} still={still} />
-        <Capabilities heading="Only you can" items={ONLY_YOU_CAN} broken fromX={12} still={still} />
-      </div>
+        <div ref={splitRef} className="md:grid md:grid-cols-[1fr_56px_1fr]">
+          <Capabilities
+            heading="Claude can"
+            items={CLAUDE_CAN}
+            broken={false}
+            fromX={-12}
+            tint="bg-pale-sky"
+            still={still}
+          />
+          <Seam vertical show={drawn} still={still} />
+          <Seam vertical={false} show={drawn} still={still} />
+          <Capabilities
+            heading="Only you can"
+            items={ONLY_YOU_CAN}
+            broken
+            fromX={12}
+            tint="bg-pale-butter"
+            still={still}
+          />
+        </div>
 
-      <div className="mt-24 grid grid-cols-1 divide-y divide-rule md:mt-28 md:grid-cols-3 md:divide-x md:divide-y-0">
-        {RULES.map((rule, i) => (
-          <motion.div
-            key={rule.label}
-            className="px-0 py-6 md:px-8 md:first:pl-0"
-            {...fadeIn(still, i * 100)}
+        <div className="mt-7 grid grid-cols-1 gap-5 md:grid-cols-3">
+          {RULES.map((rule, i) => (
+            <motion.div
+              key={rule.label}
+              className={`patch patch-tinted ${rule.tint} p-[30px]`}
+              {...fadeIn(still, i * 100)}
+            >
+              <p className="font-mono text-[13px] uppercase tracking-[0.08em] text-ink-faint">
+                {rule.label}
+              </p>
+              <p className="mt-3 text-[16px] leading-[1.5] text-ink-dim">{rule.text}</p>
+            </motion.div>
+          ))}
+        </div>
+
+        <p className="mt-9 text-center text-[18px] leading-[1.55] text-ink-dim">
+          Every rule above can be tested from your browser, against the live app.
+        </p>
+        <div className="mt-5 flex justify-center">
+          <a
+            href="/demo?step=break-it"
+            className={`inline-flex h-[54px] items-center gap-3 rounded-[12px] border-2 border-ink px-6 text-[17px] font-semibold text-ink transition-colors duration-[160ms] ease-out hover:bg-ink hover:text-paper motion-reduce:transition-none ${FOCUS_RING}`}
           >
-            <p className="font-mono text-[11px] uppercase tracking-[0.14em] text-bone-faint">
-              {rule.label}
-            </p>
-            <p className="mt-3 text-[15px] leading-[1.5] text-bone-dim">{rule.text}</p>
-          </motion.div>
-        ))}
+            <svg width="10" height="10" viewBox="0 0 10 10" fill="none" aria-hidden="true" className="shrink-0">
+              <path d="M1.5 1.5l7 7M8.5 1.5l-7 7" className="stroke-accent" strokeWidth="1.5" strokeLinecap="round" />
+            </svg>
+            Try to break it yourself
+          </a>
+        </div>
       </div>
-
-      <p className="mt-14 max-w-[52ch] text-[16px] leading-[1.55] text-bone-dim">
-        Every rule above can be tested from your browser, against the live app.
-      </p>
-      <a
-        href="/demo?step=break-it"
-        className={`group/link mt-3 inline-flex items-center gap-3 font-mono text-[12px] uppercase tracking-[0.14em] text-bone-dim transition-colors duration-150 ease-out hover:text-bone ${FOCUS_RING}`}
-      >
-        <svg width="10" height="10" viewBox="0 0 10 10" fill="none" aria-hidden="true" className="shrink-0">
-          <path d="M1.5 1.5l7 7M8.5 1.5l-7 7" className="stroke-accent" strokeWidth="1.5" strokeLinecap="round" />
-        </svg>
-        <span className="relative">
-          Try to break it yourself
-          <span aria-hidden="true" className={`${UNDERLINE_DRAW} group-hover/link:scale-x-100`} />
-        </span>
-      </a>
     </section>
   );
 }

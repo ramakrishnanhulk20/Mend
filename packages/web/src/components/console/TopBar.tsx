@@ -19,22 +19,19 @@ type TopBarProps = {
 // room left for the console label as well below 2xl, so it steps aside until then.
 export function TopBar({ step, session, ending, onEnd, onBreakIt }: TopBarProps) {
   return (
-    <header className="sticky top-0 z-40 flex h-16 items-center justify-between whitespace-nowrap border-b border-rule bg-ink/90 px-4 backdrop-blur md:px-10">
+    <header className="sticky top-0 z-40 mx-auto flex h-[60px] w-[calc(100%-24px)] max-w-[1392px] items-center justify-between whitespace-nowrap rounded-b-[20px] bg-paper px-4 shadow-[0_8px_24px_rgb(18_59_63/0.12)] after:pointer-events-none after:absolute after:inset-x-[6px] after:bottom-[6px] after:top-0 after:rounded-b-[15px] after:border-[1.5px] after:border-t-0 after:border-dashed after:border-stitch after:content-[''] md:w-[calc(100%-48px)] md:px-7">
       <div className="flex flex-1 items-center gap-4">
-        <Link href="/" className={`group inline-flex items-center gap-[10px] text-bone ${FOCUS_RING}`}>
+        <Link href="/" className={`group inline-flex items-center gap-[10px] text-ink ${FOCUS_RING}`}>
           <Mark size={20} spinOnHover />
-          {/* Inline, because .poster-title sits outside Tailwind's layers and would beat a tracking class. */}
-          <span className="poster-title hidden text-[20px] min-[400px]:inline" style={{ letterSpacing: "0.04em" }}>
+          <span className="brand-word hidden text-[20px] min-[400px]:inline">
             Mend
           </span>
         </Link>
         <span aria-hidden="true" className="hidden h-5 w-px bg-rule sm:block lg:hidden 2xl:block" />
-        <span className="hidden font-mono text-[12px] uppercase tracking-[0.14em] text-bone-dim sm:block lg:hidden 2xl:block">
+        <span className="hidden font-mono text-[12px] uppercase tracking-[0.14em] text-ink-dim sm:block lg:hidden 2xl:block">
           Demo console
         </span>
-        <span className="rounded-[6px] border border-rule px-2 py-[3px] font-mono text-[10.5px] uppercase tracking-[0.14em] text-bone-faint">
-          Sandbox
-        </span>
+        <span className="label-tag h-6">Sandbox</span>
       </div>
 
       <StepRail step={step} onBreakIt={onBreakIt} />
@@ -42,7 +39,7 @@ export function TopBar({ step, session, ending, onEnd, onBreakIt }: TopBarProps)
       <div className="flex flex-1 items-center justify-end gap-4">
         <Link
           href="/docs"
-          className={`group/docs inline-flex items-center py-2 text-[14px] text-bone-dim transition-colors duration-200 ease-out hover:text-bone focus-visible:text-bone ${FOCUS_RING}`}
+          className={`group/docs inline-flex items-center py-2 text-[14px] text-ink-dim transition-colors duration-200 ease-out hover:text-ink focus-visible:text-ink ${FOCUS_RING}`}
         >
           <span className="relative">
             Docs

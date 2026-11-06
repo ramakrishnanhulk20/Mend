@@ -8,28 +8,16 @@ import { useStill } from "@/components/motion/useStill";
 const EASE = [0.22, 1, 0.36, 1] as const;
 
 const FOCUS_RING =
-  "focus-visible:outline-2 focus-visible:outline-offset-[3px] focus-visible:outline-bone";
+  "focus-visible:outline-2 focus-visible:outline-offset-[3px] focus-visible:outline-ink";
 
-const PRIMARY_BUTTON =
-  "inline-flex items-center rounded-[8px] bg-accent font-semibold text-ink transition-[background-color,translate] duration-150 ease-out hover:-translate-y-px hover:bg-accent-hi active:translate-y-0";
+// The felt button from globals.css: the same one as the hero, with its height and padding set here.
+const PRIMARY_BUTTON = "btn-felt";
 
-const UNDERLINE_DRAW =
-  "absolute inset-x-0 -bottom-1 h-px origin-left scale-x-0 bg-bone transition-transform duration-200 ease-out";
+const SECONDARY_BUTTON =
+  "inline-flex h-[54px] items-center justify-center whitespace-nowrap rounded-[12px] border-2 border-ink px-6 text-[17px] font-semibold leading-none text-ink transition-colors duration-[160ms] ease-out hover:bg-ink hover:text-paper motion-reduce:transition-none";
 
 const TITLE = "Try it on the demo shop.";
 const WORDS = TITLE.split(" ");
-
-// Eighteen threads from eight to ninety-two percent of the height. The eleventh is the broken one.
-const THREAD_COUNT = 18;
-const THREAD_TOP = 8;
-const THREAD_BOTTOM = 92;
-const BROKEN_THREAD = 10;
-const BREAK_CENTRE = 64;
-const BREAK_HALF_WIDTH = 1.4;
-
-function threadY(index: number) {
-  return THREAD_TOP + (index * (THREAD_BOTTOM - THREAD_TOP)) / (THREAD_COUNT - 1);
-}
 
 function rise(still: boolean, shown: boolean, delayMs: number) {
   return {
@@ -42,112 +30,48 @@ function rise(still: boolean, shown: boolean, delayMs: number) {
 export function Closing() {
   const still = useStill();
   const titleId = useId();
-  const sectionRef = useRef<HTMLElement>(null);
+  const patchRef = useRef<HTMLDivElement>(null);
   const titleRef = useRef<HTMLHeadingElement>(null);
-  const sectionInView = useInView(sectionRef, { once: true, amount: 0.3 });
+  // The film is tall, so the patch is watched on its own: the entrance plays when its text is on screen.
+  const patchInView = useInView(patchRef, { once: true, amount: 0.3 });
   // The words sit inside clipping boxes, so the heading is watched instead of the words.
   const titleInView = useInView(titleRef, { once: true, amount: 0.3 });
-  const stitched = still || sectionInView;
   const titleShown = still || titleInView;
-  const brokenY = threadY(BROKEN_THREAD);
 
   return (
     <section
-      ref={sectionRef}
       id="demo"
       aria-labelledby={titleId}
-      className="relative flex min-h-svh flex-col justify-center overflow-hidden border-t border-rule bg-ink px-4 py-28 md:px-10"
+      className="relative bg-paper pb-16 min-[860px]:pb-24"
     >
-      <svg
-        aria-hidden="true"
-        className="pointer-events-none absolute inset-0 h-full w-full"
-        viewBox="0 0 100 100"
-        preserveAspectRatio="none"
-        fill="none"
-      >
-        {Array.from({ length: THREAD_COUNT }, (_, i) => {
-          const y = threadY(i);
-          if (i !== BROKEN_THREAD) {
-            return (
-              <line
-                key={i}
-                x1="0"
-                x2="100"
-                y1={y}
-                y2={y}
-                className="stroke-bone/8"
-                strokeWidth="1"
-                vectorEffect="non-scaling-stroke"
-              />
-            );
-          }
-          return (
-            <Fragment key={i}>
-              <line
-                x1="0"
-                x2={BREAK_CENTRE - BREAK_HALF_WIDTH}
-                y1={y}
-                y2={y}
-                className="stroke-bone/25"
-                strokeWidth="1"
-                vectorEffect="non-scaling-stroke"
-              />
-              <line
-                x1={BREAK_CENTRE + BREAK_HALF_WIDTH}
-                x2="100"
-                y1={y}
-                y2={y}
-                className="stroke-bone/25"
-                strokeWidth="1"
-                vectorEffect="non-scaling-stroke"
-              />
-            </Fragment>
-          );
-        })}
-      </svg>
-
-      {/* The stitch is a separate box, because the thread field is stretched and would squash it. */}
-      <div
-        aria-hidden="true"
-        className="pointer-events-none absolute h-[clamp(12px,1.5vw,22px)] w-[clamp(12px,1.5vw,22px)] -translate-x-1/2 -translate-y-1/2"
-        style={{ left: `${BREAK_CENTRE}%`, top: `${brokenY}%` }}
-      >
-        <motion.svg
-          width="100%"
-          height="100%"
-          viewBox="-6 -6 12 12"
-          fill="none"
-          className="block overflow-visible"
-          initial={still ? false : { scale: 0 }}
-          animate={{ scale: stitched ? 1 : 0 }}
-          transition={{ type: "spring", stiffness: 500, damping: 22, delay: 0.6 }}
-        >
-          <path
-            d="M-6 -6L6 6M-6 6L6 -6"
-            stroke="#ff4d2e"
-            strokeWidth="2.5"
-            strokeLinecap="round"
-            vectorEffect="non-scaling-stroke"
+      <div className="relative aspect-[4/5] w-full overflow-hidden min-[860px]:aspect-[2/1]">
+        <picture className="block h-full w-full">
+          <source media="(max-width: 859px)" srcSet="/world/film/end-phone.jpg" />
+          <img
+            src="/world/film/end.jpg"
+            alt="The clay town at the end of the story: the road is mended and the customer's window is lit."
+            loading="lazy"
+            decoding="async"
+            className="block h-full w-full object-cover"
           />
-        </motion.svg>
+        </picture>
       </div>
 
-      <div className="relative max-w-[1100px] text-left">
-        <p className="font-mono text-[12px] uppercase tracking-[0.14em] text-bone-faint">
-          Now showing
-        </p>
-        {/* Inline line height, because .poster-title sits outside Tailwind's layers and would beat a leading class. */}
+      <div
+        ref={patchRef}
+        className="patch relative z-10 mx-auto mt-[calc(-1*clamp(120px,12vw,190px))] w-[calc(100%_-_32px)] max-w-[1344px] px-[26px] py-10 text-left min-[860px]:w-[calc(100%_-_96px)] min-[860px]:px-[68px] min-[860px]:py-[60px]"
+      >
+        <span className="label-tag">Now showing</span>
         <h2
           ref={titleRef}
           id={titleId}
           aria-label={TITLE}
-          className="poster-title mt-4 text-[52px] text-bone md:text-[length:clamp(4rem,10vw,10rem)]"
-          style={{ lineHeight: 0.85 }}
+          className="poster-title mt-4 text-[42px] text-ink md:text-[length:clamp(3rem,6.6vw,6.5rem)]"
         >
           {WORDS.map((word, i) => (
             <Fragment key={word}>
               {i > 0 && " "}
-              <span className="inline-block overflow-hidden pb-[0.04em]">
+              <span className="inline-block overflow-hidden pb-[0.14em] -mb-[0.1em]">
                 <motion.span
                   aria-hidden="true"
                   className="inline-block"
@@ -163,8 +87,8 @@ export function Closing() {
         </h2>
 
         <motion.p
-          className="mt-8 max-w-[52ch] text-[16px] leading-[1.55] text-bone-dim md:text-[18px]"
-          {...rise(still, sectionInView, 120)}
+          className="mt-8 max-w-[36em] text-[17px] leading-[1.5] text-ink-dim min-[860px]:text-[20px]"
+          {...rise(still, patchInView, 120)}
         >
           No sign-up. A sandbox shop with two years of real order history, real PayPal sandbox
           payouts and Claude. Plan a campaign, approve it, and watch the money land.
@@ -172,12 +96,9 @@ export function Closing() {
 
         <motion.div
           className="mt-10 flex flex-col gap-[10px] md:flex-row md:gap-4"
-          {...rise(still, sectionInView, 240)}
+          {...rise(still, patchInView, 240)}
         >
-          <Link
-            href="/demo"
-            className={`group/primary ${PRIMARY_BUTTON} h-12 gap-2 px-[22px] text-[15px] ${FOCUS_RING}`}
-          >
+          <Link href="/demo" className={`${PRIMARY_BUTTON} group/primary h-[54px] whitespace-nowrap px-6 text-[17px] leading-none ${FOCUS_RING}`}>
             Run the live demo
             <svg
               width="14"
@@ -185,7 +106,7 @@ export function Closing() {
               viewBox="0 0 14 14"
               fill="none"
               aria-hidden="true"
-              className="transition-transform duration-150 ease-out group-hover/primary:translate-x-[3px]"
+              className="transition-transform duration-150 ease-out motion-safe:group-hover/primary:translate-x-[3px]"
             >
               <path
                 d="M3 7h8M8 3.5 11.5 7 8 10.5"
@@ -196,24 +117,14 @@ export function Closing() {
               />
             </svg>
           </Link>
-          <Link
-            href="/docs"
-            className={`group/secondary inline-flex h-12 items-center text-[15px] text-bone ${FOCUS_RING}`}
-          >
-            <span className="relative inline-block">
-              Read the docs
-              <span aria-hidden="true" className="absolute inset-x-0 -bottom-1 h-px bg-bone/35" />
-              <span
-                aria-hidden="true"
-                className={`${UNDERLINE_DRAW} group-hover/secondary:scale-x-100`}
-              />
-            </span>
+          <Link href="/docs" className={`${SECONDARY_BUTTON} ${FOCUS_RING}`}>
+            Read the docs
           </Link>
         </motion.div>
 
         <motion.p
-          className="mt-24 border-t border-rule pt-6 text-left font-mono text-[10.5px] uppercase leading-[2] tracking-[0.18em] text-bone-faint md:mt-32 md:text-justify md:text-[11px]"
-          {...rise(still, sectionInView, 360)}
+          className="mt-8 border-t border-rule pt-6 text-left font-mono text-[12px] uppercase leading-[2] tracking-[0.18em] text-ink-faint"
+          {...rise(still, patchInView, 360)}
         >
           Mend. A win-back engine for shops. Built on PayPal Payouts, Log in with PayPal and
           PayPal&apos;s MCP server. Forecast by a BG/NBD model. Planned and written with Claude. Every

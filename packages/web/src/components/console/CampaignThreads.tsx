@@ -42,14 +42,14 @@ const LEFT_TITLE =
 const HOLDOUT_NOTE = "Held back on purpose. Never paid, so the results have something to compare with.";
 
 const LABEL_COLOR: Record<ThreadState, string> = {
-  waiting: "text-bone-faint",
-  sending: "text-bone-faint",
-  sent: "text-bone-dim",
-  claimed: "text-bone",
-  returned: "text-bone-dim",
-  refused: "text-bone-faint",
-  unclear: "text-bone-faint",
-  held: "text-bone-faint",
+  waiting: "text-ink-faint",
+  sending: "text-ink-faint",
+  sent: "text-ink-dim",
+  claimed: "text-ink",
+  returned: "text-ink-dim",
+  refused: "text-ink-faint",
+  unclear: "text-ink-faint",
+  held: "text-ink-faint",
 };
 
 function fibers(from: number, direction: 1 | -1): string {
@@ -99,7 +99,7 @@ function Thread({ role, mode, look, still }: ThreadProps) {
   const reward = role === "reward";
   const guide = reward && (state === "sending" || state === "unclear" || (state === null && mode === "sealed"));
   const bright = mended || hasReturn;
-  const segmentClass = bright ? "stroke-bone/90" : "stroke-bone/70";
+  const segmentClass = bright ? "stroke-ink/90" : "stroke-ink/55";
   const segments = `M0 ${MIDDLE}H${CUT_FROM}M${CUT_TO} ${MIDDLE}H${WIDTH}`;
 
   return (
@@ -107,13 +107,13 @@ function Thread({ role, mode, look, still }: ThreadProps) {
       viewBox={`0 0 ${WIDTH} ${HEIGHT}`}
       fill="none"
       aria-hidden="true"
-      className="block h-auto w-full overflow-visible md:h-[14px] md:w-[220px]"
+      className="block h-auto w-full overflow-visible md:h-[14px] md:w-[220px] lg:w-[160px] xl:w-[220px]"
     >
       {reward && mended && (
         <defs>
           <radialGradient id={glowId}>
-            <stop offset="0" stopColor="#ff4d2e" stopOpacity="1" />
-            <stop offset="1" stopColor="#ff4d2e" stopOpacity="0" />
+            <stop offset="0" stopColor="#D72A16" stopOpacity="1" />
+            <stop offset="1" stopColor="#D72A16" stopOpacity="0" />
           </radialGradient>
         </defs>
       )}
@@ -128,7 +128,7 @@ function Thread({ role, mode, look, still }: ThreadProps) {
       {lightUp && (
         <motion.path
           d={segments}
-          className="stroke-bone"
+          className="stroke-ink"
           strokeWidth="2"
           strokeLinecap="round"
           vectorEffect="non-scaling-stroke"
@@ -150,13 +150,13 @@ function Thread({ role, mode, look, still }: ThreadProps) {
 
       {role === "holdout" &&
         BRIDGE_DOTS.map((x) => (
-          <circle key={x} cx={x} cy={MIDDLE} r="1.25" className={bright ? "fill-bone/90" : "fill-bone/70"} />
+          <circle key={x} cx={x} cy={MIDDLE} r="1.25" className={bright ? "fill-ink/90" : "fill-ink-faint"} />
         ))}
 
       {guide && (
         <path
           d={`M${CUT_FROM} ${MIDDLE}H${CUT_TO}`}
-          className="stroke-bone/40"
+          className="stroke-ink/55"
           strokeWidth="1"
           strokeDasharray="3 4"
           vectorEffect="non-scaling-stroke"
@@ -165,13 +165,13 @@ function Thread({ role, mode, look, still }: ThreadProps) {
 
       {reward && state === "sending" &&
         (still ? (
-          <circle cx={GAP_MIDDLE} cy={MIDDLE} r="3" className="fill-bone" />
+          <circle cx={GAP_MIDDLE} cy={MIDDLE} r="3" className="fill-ink" />
         ) : (
           <motion.circle
             cx={CUT_FROM}
             cy={MIDDLE}
             r="3"
-            className="fill-bone"
+            className="fill-ink"
             initial={{ x: 0 }}
             animate={{ x: GAP }}
             transition={{ duration: 1.4, ease: "easeInOut", repeat: Infinity }}
@@ -181,7 +181,7 @@ function Thread({ role, mode, look, still }: ThreadProps) {
       {reward && state === "returned" && (
         <path
           d={`M${CUT_FROM} ${MIDDLE}H${CUT_TO}`}
-          className="stroke-bone/40"
+          className="stroke-ink-faint"
           strokeWidth="1.5"
           strokeLinecap="round"
           strokeDasharray="0.1 4.5"
@@ -244,8 +244,8 @@ function Thread({ role, mode, look, still }: ThreadProps) {
             transition={{ type: "spring", stiffness: 500, damping: 22 }}
             style={{ originX: 0.5, originY: 0.5 }}
           >
-            <circle r={KNOT_RADIUS + KNOT_RING} className="fill-ink" />
-            <circle r={KNOT_RADIUS} className="fill-bone" />
+            <circle r={KNOT_RADIUS + KNOT_RING} className="fill-paper-raised" />
+            <circle r={KNOT_RADIUS} className="fill-ink" />
           </motion.g>
         </g>
       )}
@@ -272,12 +272,12 @@ function ThreadRow({
   return (
     <motion.li
       role="listitem"
-      className="grid grid-cols-[minmax(0,1fr)_auto] items-start gap-x-6 gap-y-3 border-b border-rule py-4 md:grid-cols-[48px_220px_minmax(0,1fr)_120px] md:gap-y-0"
+      className="grid grid-cols-[minmax(0,1fr)_auto] items-start gap-x-6 gap-y-3 border-b-[1.5px] border-dashed border-stitch py-4 last:border-b-0 md:grid-cols-[48px_220px_minmax(0,1fr)_120px] md:gap-y-0 lg:grid-cols-[40px_160px_minmax(0,1fr)_96px] lg:gap-x-4 xl:grid-cols-[48px_220px_minmax(0,1fr)_120px] xl:gap-x-6"
       initial={still ? false : { opacity: 0, y: 8 }}
       animate={{ opacity: 1, y: 0 }}
       transition={{ duration: 0.4, ease: EASE, delay: index * 0.04 }}
     >
-      <span className="font-mono text-[12px] leading-6 text-bone-faint md:col-start-1 md:row-start-1">
+      <span className="font-mono text-[12px] leading-6 text-ink-faint md:col-start-1 md:row-start-1">
         #{row.rank}
       </span>
 
@@ -286,7 +286,7 @@ function ThreadRow({
           <Thread role={row.role} mode={mode} look={look} still={still} />
         </span>
         {returned !== null && (
-          <p className="mt-1 text-right font-mono text-[11px] text-bone md:w-[220px]">
+          <p className="mt-1 text-right font-mono text-[11px] text-ink md:w-[220px] lg:w-[160px] xl:w-[220px]">
             {returned === "simulated" ? "came back (simulated)" : "came back"}
           </p>
         )}
@@ -294,24 +294,24 @@ function ThreadRow({
 
       <div className="col-span-2 row-start-3 min-w-0 md:col-span-1 md:col-start-3 md:row-start-1">
         {typeof row.displayName === "string" && row.displayName !== "" && (
-          <p className="text-[15px] font-medium leading-[1.5] text-bone">{row.displayName}</p>
+          <p className="text-[15px] font-medium leading-[1.5] text-ink">{row.displayName}</p>
         )}
         {reward ? (
-          row.note !== null && <p className="text-[15px] leading-[1.5] text-bone">{row.note}</p>
+          row.note !== null && <p className="text-[15px] leading-[1.5] text-ink">{row.note}</p>
         ) : (
-          <p className="text-[14px] leading-[1.5] text-bone-faint">{HOLDOUT_NOTE}</p>
+          <p className="text-[14px] leading-[1.5] text-ink-faint">{HOLDOUT_NOTE}</p>
         )}
         <p className="mt-2 font-mono text-[11px]">
           {row.standIn ? (
-            <span title={STAND_IN_TITLE} className="text-bone-faint">
+            <span title={STAND_IN_TITLE} className="text-ink-faint">
               demo stand-in
             </span>
           ) : !row.onList ? (
-            <span title={LEFT_TITLE} className="text-bone-faint">
+            <span title={LEFT_TITLE} className="text-ink-faint">
               no longer on the list
             </span>
           ) : (
-            <span className="text-bone-dim">joined with PayPal</span>
+            <span className="text-ink-dim">joined with PayPal</span>
           )}
           {reward && look !== undefined && (
             <span className={LABEL_COLOR[look.state]}> &middot; {STATE_LABEL[look.state]}</span>
@@ -320,7 +320,7 @@ function ThreadRow({
       </div>
 
       {reward && row.amountMinor !== null && (
-        <span className="col-start-2 row-start-1 text-right text-[15px] font-semibold leading-6 tabular-nums text-bone md:col-start-4">
+        <span className="col-start-2 row-start-1 text-right text-[15px] font-semibold leading-6 tabular-nums text-ink md:col-start-4">
           {formatUsd(row.amountMinor)}
         </span>
       )}
@@ -341,12 +341,12 @@ function Group({ title, rows, mode, statuses, still }: GroupProps) {
   if (rows.length === 0) return null;
 
   return (
-    <section aria-labelledby={headingId} className="mt-10 first:mt-0">
-      <div className="flex items-baseline justify-between border-b border-rule pb-3">
-        <h2 id={headingId} className="font-mono text-[12px] uppercase tracking-[0.14em] text-bone-dim">
+    <section aria-labelledby={headingId} className="patch mt-6 px-7 py-3 first:mt-0">
+      <div className="flex items-baseline justify-between border-b-[1.5px] border-dashed border-stitch pb-3 pt-3">
+        <h2 id={headingId} className="font-mono text-[12px] uppercase tracking-[0.14em] text-ink-dim">
           {title}
         </h2>
-        <span className="font-mono text-[12px] tabular-nums text-bone-faint">{rows.length}</span>
+        <span className="font-mono text-[12px] tabular-nums text-ink-faint">{rows.length}</span>
       </div>
       <ul role="list">
         {rows.map((row, i) => (

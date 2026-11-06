@@ -1,18 +1,16 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { formatDay } from "@/components/live/summary";
 import { ApiError, type CampaignView, type Cancelled, type ConsoleApi, type Results } from "./api";
 import { CampaignThreads } from "./CampaignThreads";
 import { formatPercent, formatUsd, plural, utcDay } from "./money";
 import { looksFromRows } from "./status";
-import { FOCUS_RING, LoomLine, NoticePanel, PRIMARY_BUTTON, Spinner, TextButton } from "./ui";
+import { FOCUS_RING, Figure, LoomLine, NoticePanel, PRIMARY_BUTTON, SECONDARY_BUTTON, Spinner, StepHeader, TextButton } from "./ui";
 
 const REFRESH_EVERY_MS = 20_000;
 
-const LABEL = "font-mono text-[11px] uppercase tracking-[0.14em] text-bone-faint";
-const SECONDARY_BUTTON =
-  "inline-flex h-10 items-center justify-center gap-2 rounded-[8px] border border-rule px-4 text-[14px] text-bone transition-colors duration-150 ease-out hover:border-bone-faint hover:bg-ink-raised disabled:cursor-default disabled:opacity-50 disabled:hover:border-rule disabled:hover:bg-transparent";
+const LABEL = "font-mono text-[12px] uppercase tracking-[0.14em] text-ink-dim";
 
 function capitalised(text: string): string {
   return text.charAt(0).toUpperCase() + text.slice(1);
@@ -67,31 +65,19 @@ function takeBackLine(answer: Cancelled): string {
     : base;
 }
 
-function Figure({ label, note, children }: { label: string; note?: string; children: ReactNode }) {
-  return (
-    <div>
-      <dt className={LABEL}>
-        {label}
-        {note !== undefined && <> <span className="normal-case tracking-normal">{note}</span></>}
-      </dt>
-      <dd className="mt-2 text-[24px] font-semibold tabular-nums text-bone">{children}</dd>
-    </div>
-  );
-}
-
 type Arm = Results["rewarded"];
 
 function ArmPanel({ title, arm }: { title: string; arm: Arm }) {
   return (
-    <section aria-label={title} className="rounded-[8px] border border-rule p-5">
+    <section aria-label={title} className="patch p-7">
       <p className={LABEL}>{title}</p>
-      <p className="mt-2 text-[24px] font-semibold tabular-nums text-bone">
+      <p className="mt-2 text-[24px] font-semibold tabular-nums text-ink">
         {plural(arm.members, "customer", "customers")}
       </p>
       <dl className="mt-5 grid grid-cols-2 items-end gap-x-6 gap-y-5">
         <Figure label="Came back">
           {arm.realReturns}
-          {arm.realRate !== null && <> <span className="text-[16px] font-normal text-bone-dim">{formatPercent(arm.realRate)}</span></>}
+          {arm.realRate !== null && <> <span className="font-sans text-[16px] font-normal text-ink-dim">{formatPercent(arm.realRate)}</span></>}
         </Figure>
         <Figure label="Simulated returns" note="(kept apart)">
           {arm.simulatedReturns}
@@ -103,7 +89,7 @@ function ArmPanel({ title, arm }: { title: string; arm: Arm }) {
 
 function InlineAlert({ children }: { children: string }) {
   return (
-    <p role="alert" className="mt-4 flex items-start gap-3 text-[14px] leading-[1.5] text-bone-dim">
+    <p role="alert" className="mt-4 flex items-start gap-3 text-[14px] leading-[1.5] text-ink-dim">
       <span aria-hidden="true" className="mt-[7px] block h-[6px] w-[6px] shrink-0 rounded-full bg-accent" />
       {children}
     </p>
@@ -210,40 +196,43 @@ export function ResultsStep({ api, campaignId, onNewPlan, onOrder }: ResultsStep
 
   return (
     <section aria-labelledby="results-title" aria-busy={load.kind === "loading"}>
-      <p className="font-mono text-[12px] uppercase tracking-[0.14em] text-bone-faint">Step 5 &middot; Results</p>
-
       {results !== null && view !== null ? (
         <>
-          <h1 id="results-title" className="poster-title mt-4 text-[40px] text-bone md:text-[56px]" style={{ lineHeight: 0.9 }}>
-            {verdictTitle(results.verdict)}
-          </h1>
-          <p className="mt-5 max-w-[60ch] text-[16px] leading-[1.55] text-bone-dim">
-            Mend compares how many customers came back in the paid group with the held-back group, over a window
-            that started when the cashback was sent. It gives a verdict only when both groups are big enough to tell. A
-            five-person demo group never is, and Mend says so instead of guessing.
-          </p>
-          <p className="mt-2 font-mono text-[12px] text-bone-faint">
-            {results.windowStartsAt !== null && results.windowEndsAt !== null && (
-              <>
-                Window {formatDay(utcDay(results.windowStartsAt))} to {formatDay(utcDay(results.windowEndsAt))} &middot;{" "}
-                {results.windowOpen ? "open" : "closed"}
-              </>
-            )}
-            {results.pValue !== null && <> &middot; p = {results.pValue.toFixed(2)}</>}
-          </p>
+          <StepHeader
+            tint="sage"
+            kicker="Step 5 · Results"
+            titleId="results-title"
+            title={verdictTitle(results.verdict)}
+            icon="/world/icons/results.webp"
+          >
+            <p className="mt-5 max-w-[60ch] text-[16px] leading-[1.55] text-ink-dim">
+              Mend compares how many customers came back in the paid group with the held-back group, over a window
+              that started when the cashback was sent. It gives a verdict only when both groups are big enough to tell. A
+              five-person demo group never is, and Mend says so instead of guessing.
+            </p>
+            <p className="mt-2 font-mono text-[12px] text-ink-dim">
+              {results.windowStartsAt !== null && results.windowEndsAt !== null && (
+                <>
+                  Window {formatDay(utcDay(results.windowStartsAt))} to {formatDay(utcDay(results.windowEndsAt))} &middot;{" "}
+                  {results.windowOpen ? "open" : "closed"}
+                </>
+              )}
+              {results.pValue !== null && <> &middot; p = {results.pValue.toFixed(2)}</>}
+            </p>
+          </StepHeader>
 
-          <div className="mt-8 grid grid-cols-1 gap-4 md:grid-cols-2">
+          <div className="grid grid-cols-1 gap-6 md:grid-cols-2 lg:grid-cols-1 xl:grid-cols-2">
             <ArmPanel title="Paid" arm={results.rewarded} />
             <ArmPanel title="Held back" arm={results.holdout} />
           </div>
 
-          <div className="mt-10">
+          <div className="mt-6">
             <CampaignThreads rows={view.rows} mode="sealed" statuses={statuses} />
           </div>
 
-          <div className="mt-10 rounded-[8px] border border-rule p-5" aria-busy={simulation.kind === "pending"}>
-            <p className="text-[16px] leading-6 text-bone">Simulate a customer coming back</p>
-            <p className="mt-2 max-w-[60ch] text-[14px] leading-[1.5] text-bone-dim">
+          <div className="patch mt-6 p-7" aria-busy={simulation.kind === "pending"}>
+            <p className="text-[16px] leading-6 text-ink">Simulate a customer coming back</p>
+            <p className="mt-2 max-w-[60ch] text-[14px] leading-[1.5] text-ink-dim">
               Mend makes a real sandbox purchase with a PayPal test card for the customer you pick, and counts it for
               their group. Simulated returns are always kept apart from real ones.
             </p>
@@ -253,7 +242,7 @@ export function ResultsStep({ api, campaignId, onNewPlan, onOrder }: ResultsStep
                 value={picked}
                 onChange={(event) => setPick(event.target.value)}
                 disabled={simulation.kind === "pending"}
-                className={`h-10 w-full rounded-[8px] border border-rule bg-ink-raised px-3 text-[14px] text-bone focus:border-bone-faint disabled:opacity-50 md:w-auto md:min-w-[220px] ${FOCUS_RING}`}
+                className={`h-12 w-full rounded-[14px] border-2 border-ink/20 bg-paper-raised px-4 text-[15px] text-ink focus:border-accent disabled:opacity-50 md:w-auto md:min-w-[220px] ${FOCUS_RING}`}
               >
                 {results.rows.map((row) => (
                   <option key={row.ref} value={row.ref}>
@@ -266,19 +255,19 @@ export function ResultsStep({ api, campaignId, onNewPlan, onOrder }: ResultsStep
                 type="button"
                 onClick={() => void simulate()}
                 disabled={simulation.kind === "pending" || picked === ""}
-                className={`${SECONDARY_BUTTON} ${FOCUS_RING}`}
+                className={`${SECONDARY_BUTTON} h-12 px-5 text-[15px] ${FOCUS_RING}`}
               >
                 Simulate a return purchase
               </button>
             </div>
             {simulation.kind === "pending" && (
-              <p role="status" className="mt-4 flex items-center gap-3 text-[14px] leading-[1.5] text-bone-dim">
+              <p role="status" className="mt-4 flex items-center gap-3 text-[14px] leading-[1.5] text-ink-dim">
                 <Spinner />
                 Buying with a sandbox test card
               </p>
             )}
             {simulation.kind === "done" && (
-              <p role="status" className="mt-4 font-mono text-[12px] leading-[1.5] text-bone-dim">
+              <p role="status" className="mt-4 font-mono text-[12px] leading-[1.5] text-ink-dim">
                 {simulation.value}
               </p>
             )}
@@ -286,17 +275,17 @@ export function ResultsStep({ api, campaignId, onNewPlan, onOrder }: ResultsStep
           </div>
 
           {showTakeBack && (
-            <div className="mt-6 rounded-[8px] border border-rule p-5" aria-busy={takeBack.kind === "pending"}>
+            <div className="patch mt-6 p-7" aria-busy={takeBack.kind === "pending"}>
               {unclaimed > 0 && (
                 <>
-                  <p className="text-[15px] leading-[1.5] text-bone">{formatUsd(unclaimed)} is still waiting to be claimed.</p>
+                  <p className="text-[15px] leading-[1.5] text-ink">{formatUsd(unclaimed)} is still waiting to be claimed.</p>
                   {results.payouts.unclaimedReturnBy !== null && (
-                    <p className="mt-2 max-w-[60ch] text-[14px] leading-[1.5] text-bone-dim">
+                    <p className="mt-2 max-w-[60ch] text-[14px] leading-[1.5] text-ink-dim">
                       PayPal returns it on {formatDay(utcDay(results.payouts.unclaimedReturnBy))} if nobody claims it.
                     </p>
                   )}
                   {takeBack.kind === "pending" ? (
-                    <p role="status" className="mt-5 flex items-center gap-3 text-[14px] leading-[1.5] text-bone-dim">
+                    <p role="status" className="mt-5 flex items-center gap-3 text-[14px] leading-[1.5] text-ink-dim">
                       <Spinner />
                       Asking PayPal to return the cashback
                     </p>
@@ -312,7 +301,7 @@ export function ResultsStep({ api, campaignId, onNewPlan, onOrder }: ResultsStep
                 </>
               )}
               {takeBack.kind === "done" && (
-                <p role="status" className={`${unclaimed > 0 ? "mt-4" : ""} text-[15px] leading-[1.5] text-bone`}>
+                <p role="status" className={`${unclaimed > 0 ? "mt-4" : ""} text-[15px] leading-[1.5] text-ink`}>
                   {takeBackLine(takeBack.value)}
                 </p>
               )}
@@ -320,12 +309,13 @@ export function ResultsStep({ api, campaignId, onNewPlan, onOrder }: ResultsStep
             </div>
           )}
 
-          <div className="mt-10">
+          <div className="mt-8">
             <TextButton onClick={onNewPlan}>Start over with a new plan</TextButton>
           </div>
         </>
       ) : (
         <>
+          <p className="font-mono text-[12px] uppercase tracking-[0.14em] text-ink-dim">Step 5 &middot; Results</p>
           <h1 id="results-title" className="sr-only">
             Results
           </h1>
@@ -347,9 +337,9 @@ export function ResultsStep({ api, campaignId, onNewPlan, onOrder }: ResultsStep
               {load.text}
             </NoticePanel>
           ) : (
-            <div role="status" className="mt-8">
+            <div role="status" className="patch mt-6 p-7">
               <LoomLine />
-              <p className="mt-4 text-[14px] leading-[1.5] text-bone-dim">Loading the results</p>
+              <p className="mt-4 text-[14px] leading-[1.5] text-ink-dim">Loading the results</p>
             </div>
           )}
         </>

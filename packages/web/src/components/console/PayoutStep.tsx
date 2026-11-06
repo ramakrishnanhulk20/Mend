@@ -10,10 +10,12 @@ import { isSettled, looksFromRows, threadState, type ThreadLook } from "./status
 import {
   EASE,
   FOCUS_RING,
+  Figure,
   LoomLine,
   NoticePanel,
   PRIMARY_BUTTON,
   Spinner,
+  StepHeader,
   TextButton,
   useElapsedSeconds,
 } from "./ui";
@@ -89,9 +91,14 @@ function CopyButton({ text }: { text: string }) {
   );
 }
 
-function moneyLine(results: Results): string {
+function moneyFigures(results: Results): { label: string; value: string }[] {
   const { payouts, feesMinor } = results;
-  return `Claimed ${formatUsd(payouts.claimedMinor)} · Waiting ${formatUsd(payouts.unclaimedMinor + payouts.pendingMinor)} · Returned ${formatUsd(payouts.returnedMinor)} · Fees ${formatUsd(feesMinor)}`;
+  return [
+    { label: "Claimed", value: formatUsd(payouts.claimedMinor) },
+    { label: "Waiting", value: formatUsd(payouts.unclaimedMinor + payouts.pendingMinor) },
+    { label: "Returned", value: formatUsd(payouts.returnedMinor) },
+    { label: "Fees", value: formatUsd(feesMinor) },
+  ];
 }
 
 type PayoutStepProps = {
@@ -226,14 +233,18 @@ export function PayoutStep({ api, campaignId, onNewPlan, onResults }: PayoutStep
 
   return (
     <section aria-labelledby="payout-title" aria-busy={sending || load.kind === "loading"}>
-      <p className="font-mono text-[12px] uppercase tracking-[0.14em] text-bone-faint">Step 4 &middot; Payout</p>
-      <h1 id="payout-title" className="poster-title mt-4 text-[40px] text-bone md:text-[56px]" style={{ lineHeight: 0.9 }}>
-        {title}
-      </h1>
-      <p className="mt-5 max-w-[60ch] text-[16px] leading-[1.55] text-bone-dim">
-        Mend sends the sealed plan as one PayPal Payouts batch. Each customer&apos;s thread is stitched as PayPal
-        confirms their payment.
-      </p>
+      <StepHeader
+        tint="teal"
+        kicker="Step 4 · Payout"
+        titleId="payout-title"
+        title={title}
+        icon="/world/icons/payout.webp"
+      >
+        <p className="mt-5 max-w-[60ch] text-[16px] leading-[1.55] text-ink-dim">
+          Mend sends the sealed plan as one PayPal Payouts batch. Each customer&apos;s thread is stitched as PayPal
+          confirms their payment.
+        </p>
+      </StepHeader>
 
       {view === null ? (
         load.kind === "failed" ? (
@@ -241,27 +252,27 @@ export function PayoutStep({ api, campaignId, onNewPlan, onResults }: PayoutStep
             {load.text}
           </NoticePanel>
         ) : (
-          <div role="status" className="mt-8">
+          <div role="status" className="patch p-7">
             <LoomLine />
-            <p className="mt-4 text-[14px] leading-[1.5] text-bone-dim">Loading the plan</p>
+            <p className="mt-4 text-[14px] leading-[1.5] text-ink-dim">Loading the plan</p>
           </div>
         )
       ) : (
         <>
           {phase.kind === "ready" && (
             <motion.div
-              className="mt-8 rounded-[8px] border border-rule p-5"
+              className="patch p-7"
               initial={still ? false : { opacity: 0, y: 12 }}
               animate={{ opacity: 1, y: 0 }}
               transition={{ duration: 0.4, ease: EASE }}
             >
-              <p className="text-[15px] leading-[1.5] text-bone">
+              <p className="text-[15px] leading-[1.5] text-ink">
                 {formatUsd(view.totalMinor)} to {plural(rewarded, "customer", "customers")} in one batch.
               </p>
-              <p className="mt-2 max-w-[60ch] text-[14px] leading-[1.5] text-bone-dim">
+              <p className="mt-2 max-w-[60ch] text-[14px] leading-[1.5] text-ink-dim">
                 This is PayPal&apos;s sandbox: the money is PayPal&apos;s test money, and no real account is charged.
               </p>
-              <p className="mt-2 max-w-[60ch] text-[14px] leading-[1.5] text-bone-dim">
+              <p className="mt-2 max-w-[60ch] text-[14px] leading-[1.5] text-ink-dim">
                 Demo stand-ins have no real PayPal account, so PayPal holds their cashback as unclaimed. You can
                 take it back in the results step.
               </p>
@@ -284,21 +295,21 @@ export function PayoutStep({ api, campaignId, onNewPlan, onResults }: PayoutStep
           )}
 
           {sending && (
-            <div role="status" className="mt-8 rounded-[8px] border border-rule p-5">
+            <div role="status" className="patch p-7">
               <LoomLine />
-              <p className="mt-4 flex items-center gap-3 text-[14px] leading-[1.5] text-bone-dim">
+              <p className="mt-4 flex items-center gap-3 text-[14px] leading-[1.5] text-ink-dim">
                 <Spinner />
                 Sending the batch to PayPal
               </p>
-              <p className="mt-2 font-mono text-[12px] tabular-nums text-bone-faint">{elapsed} s</p>
+              <p className="mt-2 font-mono text-[12px] tabular-nums text-ink-faint">{elapsed} s</p>
             </div>
           )}
 
           {phase.kind === "sent" && (
-            <div className="mt-8">
+            <div className="patch p-7">
               {(phase.batchId !== null || phase.alreadySent) && (
                 <div className="flex flex-wrap items-center gap-x-4">
-                  <p className="font-mono text-[12px] leading-[1.5] text-bone-dim">
+                  <p className="font-mono text-[12px] leading-[1.5] text-ink-dim">
                     {phase.batchId !== null && `PayPal batch ${phase.batchId}`}
                     {phase.batchId !== null && phase.alreadySent && " · "}
                     {phase.alreadySent && (phase.batchId !== null ? "already sent" : "Already sent")}
@@ -308,7 +319,13 @@ export function PayoutStep({ api, campaignId, onNewPlan, onResults }: PayoutStep
               )}
 
               {results !== null && (
-                <p className="mt-2 font-mono text-[12px] tabular-nums leading-[1.5] text-bone-dim">{moneyLine(results)}</p>
+                <dl className="mt-5 grid grid-cols-2 gap-x-6 gap-y-5 xl:grid-cols-4">
+                  {moneyFigures(results).map(({ label, value }) => (
+                    <Figure key={label} label={label}>
+                      {value}
+                    </Figure>
+                  ))}
+                </dl>
               )}
 
               {!polling && (
@@ -327,7 +344,7 @@ export function PayoutStep({ api, campaignId, onNewPlan, onResults }: PayoutStep
             </div>
           )}
 
-          <div className="mt-10">
+          <div className="mt-6">
             <CampaignThreads rows={rows} mode="sealed" statuses={statuses} />
           </div>
         </>

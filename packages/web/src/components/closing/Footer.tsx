@@ -2,10 +2,10 @@ import Link from "next/link";
 import { Mark } from "@/components/brand/Mark";
 
 const FOCUS_RING =
-  "focus-visible:outline-2 focus-visible:outline-offset-[3px] focus-visible:outline-bone";
+  "focus-visible:outline-2 focus-visible:outline-offset-[3px] focus-visible:outline-ink";
 
 const UNDERLINE_DRAW =
-  "absolute inset-x-0 -bottom-1 h-px origin-left scale-x-0 bg-bone transition-transform duration-200 ease-out";
+  "absolute inset-x-0 -bottom-1 h-px origin-left scale-x-0 bg-ink transition-transform duration-200 ease-out";
 
 const LINKS = [
   { label: "How it works", href: "/#how-it-works" },
@@ -16,16 +16,15 @@ const LINKS = [
 
 export function Footer() {
   return (
-    <footer className="flex flex-col gap-6 border-t border-rule bg-ink px-4 py-10 md:flex-row md:items-center md:justify-between md:px-10">
+    <footer className="flex flex-col gap-6 border-t-2 border-dashed border-stitch bg-paper px-4 py-10 md:flex-row md:items-center md:justify-between md:px-12">
       <div className="flex flex-wrap items-center gap-x-4 gap-y-2 md:block">
-        <div className="flex items-center gap-[10px] text-bone">
+        <div className="flex items-center gap-[10px] text-ink">
           <Mark size={20} />
-          {/* Inline, because .poster-title sits outside Tailwind's layers and would beat a tracking class. */}
-          <span className="poster-title text-[20px]" style={{ letterSpacing: "0.04em" }}>
+          <span className="brand-word text-[20px]">
             Mend
           </span>
         </div>
-        <p className="text-[14px] text-bone-dim md:mt-2">Sandbox only. No real money moves.</p>
+        <p className="text-[14px] text-ink-dim md:mt-2">Sandbox only. No real money moves.</p>
       </div>
 
       <nav aria-label="Footer" className="flex flex-wrap gap-x-7 gap-y-3">
@@ -33,7 +32,7 @@ export function Footer() {
           <Link
             key={link.href}
             href={link.href}
-            className={`group/link relative text-[14px] text-bone-dim transition-colors duration-200 ease-out hover:text-bone ${FOCUS_RING}`}
+            className={`group/link relative text-[14px] text-ink-dim transition-colors duration-200 ease-out hover:text-ink ${FOCUS_RING}`}
           >
             {link.label}
             <span aria-hidden="true" className={`${UNDERLINE_DRAW} group-hover/link:scale-x-100`} />

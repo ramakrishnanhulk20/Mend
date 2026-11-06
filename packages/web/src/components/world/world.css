@@ -1,0 +1,420 @@
+.world-hero {
+  --paper: var(--color-paper);
+  --ink: var(--color-ink);
+  --ink-soft: var(--color-ink-dim);
+  --yarn: var(--color-accent);
+  --yarn-deep: var(--color-accent-hi);
+  --stitch: var(--color-stitch);
+
+  /* The patch must fit the first screen, and it must not hide the road, which sits 70 percent
+     down the film. On short windows the film slides up under the nav to make the room.
+     --patch-h is measured in WorldHero. */
+  --film-h: 50vw;
+  --road: 35vw;
+  --max-shift: 10vw;
+  --patch-h: 300px;
+  --shift: clamp(0px, calc(var(--road) + var(--patch-h) + 16px - 100svh), var(--max-shift));
+
+  position: relative;
+  overflow-x: clip;
+  background: var(--paper);
+  color: var(--ink);
+}
+
+.world-hero a:focus-visible,
+.world-hero button:focus-visible {
+  outline: 2px solid var(--yarn);
+  outline-offset: 2px;
+}
+
+/* Film block */
+
+.world-film {
+  position: relative;
+  width: 100%;
+  height: calc(var(--film-h) - var(--shift));
+  overflow: hidden;
+}
+
+.world-film-shift {
+  position: absolute;
+  top: calc(-1 * var(--shift));
+  left: 0;
+  right: 0;
+  height: var(--film-h);
+}
+
+.world-film-media,
+.world-film-videos {
+  position: absolute;
+  inset: 0;
+}
+
+.world-film picture {
+  display: block;
+  width: 100%;
+  height: 100%;
+}
+
+/* The still and both videos share one frame, so swapping between them never shifts the picture. */
+.world-film img,
+.world-film video {
+  display: block;
+  width: 100%;
+  height: 100%;
+  max-width: none;
+  object-fit: cover;
+  transform: scale(1.06);
+}
+
+.world-film video {
+  position: absolute;
+  inset: 0;
+}
+
+/* Nav */
+
+.world-nav {
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  z-index: 20;
+  margin-inline: auto;
+  width: calc(100% - 72px);
+  max-width: 1368px;
+  height: 60px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 0 28px;
+  background: var(--paper);
+  border-radius: 0 0 20px 20px;
+  box-shadow: 0 8px 24px rgb(18 59 63 / 0.16);
+}
+
+.world-nav::after {
+  content: "";
+  position: absolute;
+  inset: 0 6px 6px 6px;
+  border: 1.5px dashed var(--stitch);
+  border-top: 0;
+  border-radius: 0 0 15px 15px;
+  pointer-events: none;
+}
+
+.world-brand {
+  display: inline-flex;
+  align-items: center;
+  gap: 10px;
+  font-size: 20px;
+  color: var(--ink);
+  text-decoration: none;
+}
+
+.world-nav-links {
+  display: flex;
+  gap: 28px;
+}
+
+.world-nav-end {
+  display: flex;
+  align-items: center;
+  gap: 20px;
+}
+
+.world-link--phone {
+  display: none;
+}
+
+.world-link {
+  position: relative;
+  padding: 4px 0;
+  font-size: 15px;
+  font-weight: 500;
+  color: var(--ink);
+  text-decoration: none;
+}
+
+.world-link::after {
+  content: "";
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: -1px;
+  height: 2px;
+  background: repeating-linear-gradient(90deg, var(--yarn) 0 6px, transparent 6px 10px);
+  clip-path: inset(0 100% 0 0);
+  transition: clip-path 180ms ease;
+}
+
+.world-link:hover::after {
+  clip-path: inset(0 0 0 0);
+}
+
+/* Patch */
+
+.world-patch {
+  position: relative;
+  z-index: 10;
+  margin-top: calc(var(--road) - var(--film-h));
+  width: calc(100% - 96px);
+  max-width: 1344px;
+  margin-inline: auto;
+  background: var(--paper);
+  border-radius: 28px;
+  padding: clamp(30px, 5.4svh, 60px) clamp(40px, 4.6vw, 68px) clamp(28px, 5svh, 56px);
+  box-shadow: 0 -6px 40px rgb(18 59 63 / 0.20);
+}
+
+.world-patch::before {
+  content: "";
+  position: absolute;
+  inset: 13px;
+  border: 2px dashed var(--stitch);
+  border-radius: 18px;
+  pointer-events: none;
+}
+
+.world-grid {
+  display: grid;
+  grid-template-columns: minmax(0, 1.35fr) minmax(0, 1fr);
+  gap: clamp(36px, 4.4vw, 64px);
+  align-items: end;
+}
+
+/* Title: the face, weight and spacing come from .poster-title. */
+
+.world-title {
+  margin: 0;
+  max-width: 11em;
+  font-size: clamp(2.6rem, min(5.7vw, 9.2svh), 5.75rem);
+  color: var(--ink);
+}
+
+.world-nobreak {
+  white-space: nowrap;
+}
+
+.world-quiet {
+  position: relative;
+  display: inline-block;
+}
+
+/* The path is drawn in pixels, not scaled, so the dashes keep their size at any title size. */
+.world-stitch {
+  position: absolute;
+  left: 0;
+  bottom: calc(-0.04em - 7px);
+  width: 100%;
+  height: 14px;
+  pointer-events: none;
+}
+
+.world-stitch path {
+  fill: none;
+  stroke: var(--yarn);
+  stroke-width: 5;
+  stroke-linecap: round;
+  stroke-dasharray: 14 11;
+}
+
+/* Copy and buttons */
+
+.world-copy {
+  margin: 0;
+  max-width: 34em;
+  font-size: clamp(16px, 2.5svh, 20px);
+  line-height: 1.5;
+  color: var(--ink-soft);
+}
+
+.world-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 14px;
+  margin-top: clamp(14px, 2.6svh, 28px);
+}
+
+.world-btn {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  height: clamp(46px, 6.4svh, 54px);
+  padding: 0 24px;
+  border-radius: 12px;
+  font-family: var(--font-sans);
+  font-size: 17px;
+  font-weight: 600;
+  line-height: 1;
+  text-decoration: none;
+  white-space: nowrap;
+}
+
+.world-btn--primary {
+  background: var(--yarn);
+  color: var(--paper);
+  transition:
+    background-color 160ms ease,
+    transform 160ms ease;
+}
+
+.world-btn--primary::after {
+  content: "";
+  position: absolute;
+  inset: 4px;
+  border: 1.5px dashed rgb(251 245 233 / 0.55);
+  border-radius: 9px;
+  pointer-events: none;
+}
+
+.world-btn--primary:hover {
+  background: var(--yarn-deep);
+  transform: translateY(-1px);
+}
+
+.world-btn--secondary {
+  background: transparent;
+  color: var(--ink);
+  border: 2px solid var(--ink);
+  transition:
+    background-color 160ms ease,
+    color 160ms ease;
+}
+
+.world-btn--secondary:hover {
+  background: var(--ink);
+  color: var(--paper);
+}
+
+.world-btn--small {
+  height: 40px;
+  padding: 0 16px;
+  font-size: 15px;
+}
+
+.world-btn--small::after {
+  inset: 3px;
+}
+
+/* Room for one line is kept even before the numbers load, so the patch does not grow. */
+.world-live-slot {
+  min-height: 22px;
+  margin-top: clamp(10px, 1.8svh, 18px);
+}
+
+.world-live {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  margin: 0;
+  font-size: 14px;
+  line-height: 1.45;
+  color: var(--ink-soft);
+}
+
+.world-live-dot {
+  flex: none;
+  width: 7px;
+  height: 7px;
+  margin-top: 7px;
+  border-radius: 50%;
+  background: var(--yarn);
+}
+
+.world-credits {
+  margin: clamp(4px, 1svh, 10px) 0 0;
+  font-size: 13px;
+  line-height: 1.4;
+  color: var(--ink-soft);
+}
+
+/* Mobile */
+
+@media (max-width: 859px) {
+  .world-hero {
+    --film-h: 125vw;
+    --road: 82.5vw;
+    --max-shift: 25vw;
+    --patch-h: 470px;
+  }
+
+  .world-live-slot {
+    min-height: 44px;
+  }
+
+  .world-film img,
+  .world-film video {
+    object-position: 50% 50%;
+  }
+
+  .world-nav {
+    width: calc(100% - 24px);
+    height: 54px;
+  }
+
+  .world-nav-links {
+    display: none;
+  }
+
+  .world-link--phone {
+    display: inline-block;
+  }
+
+  .world-patch {
+    width: calc(100% - 32px);
+    padding: clamp(26px, 3.8svh, 40px) 22px clamp(22px, 3.2svh, 32px);
+  }
+
+  .world-patch::before {
+    inset: 9px;
+  }
+
+  .world-grid {
+    grid-template-columns: minmax(0, 1fr);
+    gap: clamp(12px, 2svh, 22px);
+    align-items: start;
+  }
+
+  .world-title {
+    font-size: clamp(34px, 5.4svh, 44px);
+  }
+
+  .world-copy {
+    font-size: clamp(15.5px, 2.1svh, 17px);
+  }
+
+  .world-actions {
+    gap: 10px;
+  }
+
+  .world-actions .world-btn {
+    flex: 1 1 auto;
+    padding: 0 12px;
+    font-size: 15px;
+  }
+}
+
+/* Reduced motion: the end state shows at once. Forced here as well because the motion
+   library only skips its own animations, not the scroll-linked film shift. */
+
+@media (prefers-reduced-motion: reduce) {
+  .world-patch {
+    opacity: 1 !important;
+    transform: none !important;
+  }
+
+  .world-film-shift {
+    transform: none !important;
+  }
+
+  .world-stitch {
+    clip-path: none !important;
+  }
+
+  .world-btn,
+  .world-link::after {
+    transition: none;
+  }
+}

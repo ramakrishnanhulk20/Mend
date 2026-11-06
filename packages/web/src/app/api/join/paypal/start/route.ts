@@ -19,19 +19,19 @@ const WAIT_MS = 15_000;
 // outside this string, is refused by the browser. Colours are the site's tokens.
 const STYLESHEET = [
   "*{box-sizing:border-box}",
-  'body{margin:0;background:#0b0a0a;color:#ede6da;font-family:system-ui,-apple-system,"Segoe UI",sans-serif;line-height:1.5}',
-  "main{max-width:560px;margin:12vh auto;padding:32px 24px;border:1px solid rgba(237,230,218,0.12);border-radius:8px;background:#151312}",
-  ".tag{margin:0;font-family:ui-monospace,Menlo,Consolas,monospace;font-size:11px;letter-spacing:0.14em;color:rgba(237,230,218,0.38)}",
+  'body{margin:0;background:#FBF5E9;color:#123B3F;font-family:system-ui,-apple-system,"Segoe UI",sans-serif;line-height:1.5}',
+  "main{max-width:560px;margin:12vh auto;padding:32px 24px;border:1px solid rgba(18,59,63,0.14);border-radius:8px;background:#FFFDF7}",
+  ".tag{margin:0;font-family:ui-monospace,Menlo,Consolas,monospace;font-size:11px;letter-spacing:0.14em;color:rgba(18,59,63,0.62)}",
   "svg{display:block;margin-top:16px}",
-  'h1{margin:24px 0 0;font-family:"Avenir Next Condensed",Bahnschrift,"Roboto Condensed","Arial Narrow",sans-serif-condensed,system-ui;font-stretch:condensed;font-size:40px;line-height:0.95;font-weight:800;letter-spacing:-0.01em;text-transform:uppercase}',
-  ".words{margin:16px 0 0;font-size:16px;line-height:1.55;color:rgba(237,230,218,0.64)}",
-  ".note{margin:16px 0 0;font-size:14px;color:rgba(237,230,218,0.38)}",
+  'h1{margin:24px 0 0;font-family:Georgia,"Times New Roman",serif;font-size:40px;line-height:0.95;font-weight:600;letter-spacing:-0.01em;text-transform:none}',
+  ".words{margin:16px 0 0;font-size:16px;line-height:1.55;color:rgba(18,59,63,0.74)}",
+  ".note{margin:16px 0 0;font-size:14px;color:rgba(18,59,63,0.62)}",
   "form{margin:32px 0 0}",
-  "button{display:block;width:100%;height:48px;border:0;border-radius:8px;background:#ff4d2e;color:#0b0a0a;font-family:inherit;font-size:16px;font-weight:600;cursor:pointer}",
-  "button:hover{background:#ff6a4d}",
-  "button:focus-visible{outline:2px solid #ede6da;outline-offset:3px}",
-  ".foot{margin:0 16px 32px;text-align:center;font-size:12px;color:rgba(237,230,218,0.38)}",
-  ".foot a{color:#ede6da;text-decoration:underline;text-underline-offset:4px}",
+  "button{display:block;width:100%;height:48px;border:0;border-radius:8px;background:#D72A16;color:#FBF5E9;font-family:inherit;font-size:16px;font-weight:600;cursor:pointer}",
+  "button:hover{background:#C42613}",
+  "button:focus-visible{outline:2px solid #123B3F;outline-offset:3px}",
+  ".foot{margin:0 16px 32px;text-align:center;font-size:12px;color:rgba(18,59,63,0.62)}",
+  ".foot a{color:#123B3F;text-decoration:underline;text-underline-offset:4px}",
   "@media (max-width:599.98px){main{margin:24px 16px}}",
 ].join("\n");
 
@@ -59,8 +59,8 @@ function escapeHtml(value: string): string {
 // No xmlns: an SVG inside HTML needs none, and the page names no address it could fetch.
 const MARK = [
   '<svg width="32" height="32" viewBox="0 0 32 32" fill="none" aria-hidden="true">',
-  '<path d="M4 16h8M20 16h8" stroke="#ede6da" stroke-width="2.5" stroke-linecap="round"/>',
-  '<path d="M13 12l6 8M19 12l-6 8" stroke="#ff4d2e" stroke-width="2.5" stroke-linecap="round"/>',
+  '<path d="M4 16h8M20 16h8" stroke="#123B3F" stroke-width="2.5" stroke-linecap="round"/>',
+  '<path d="M13 12l6 8M19 12l-6 8" stroke="#D72A16" stroke-width="2.5" stroke-linecap="round"/>',
   "</svg>",
 ].join("\n");
 

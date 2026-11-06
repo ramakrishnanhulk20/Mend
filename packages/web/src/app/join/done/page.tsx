@@ -50,19 +50,18 @@ export default async function JoinDonePage({ searchParams }: JoinDoneProps) {
   const { result } = await searchParams;
   const copy = typeof result === "string" && Object.hasOwn(RESULTS, result) ? RESULTS[result] : GENERIC;
   return (
-    <main className="flow-root min-h-screen bg-ink">
-      <div className="mx-4 mt-[12vh] max-w-[560px] rounded-[8px] border border-rule bg-ink-raised px-6 py-8 min-[600px]:mx-auto">
-        <p className="font-mono text-[11px] tracking-[0.14em] text-bone-faint">MEND · SANDBOX</p>
-        <Mark size={32} className="mt-4 text-bone" />
-        {/* Inline line height, because .poster-title sits outside Tailwind's layers and would beat a leading class. */}
-        <h1 className="poster-title mt-6 text-[40px] text-bone" style={{ lineHeight: 0.95 }}>
+    <main className="flow-root min-h-screen bg-paper">
+      <div className="patch mx-4 mt-[12vh] max-w-[560px] px-[26px] py-9 min-[600px]:mx-auto min-[600px]:px-11 min-[600px]:py-12">
+        <p className="font-mono text-[12px] tracking-[0.14em] text-ink-dim">MEND · SANDBOX</p>
+        <Mark size={32} className="mt-4 text-ink" />
+        <h1 className="poster-title mt-6 text-[36px] text-ink">
           {copy.title}
         </h1>
-        <p className="mt-4 text-[16px] leading-[1.55] text-bone-dim">{copy.text}</p>
-        <Link href="/" className="mt-8 inline-block text-bone underline underline-offset-4">
+        <p className="mt-4 text-[16px] leading-[1.55] text-ink-dim">{copy.text}</p>
+        <Link href="/" className="mt-8 inline-block text-ink underline underline-offset-4">
           What is Mend?
         </Link>
-        <p className="mt-3 text-[12px] text-bone-faint">Sandbox only. No real money moves.</p>
+        <p className="mt-3 text-[12px] text-ink-dim">Sandbox only. No real money moves.</p>
       </div>
     </main>
   );

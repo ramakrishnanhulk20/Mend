@@ -4,7 +4,7 @@ import { useState } from "react";
 import { motion } from "motion/react";
 import { useStill } from "@/components/motion/useStill";
 import { ApiError, type ConsoleApi } from "./api";
-import { EASE, FOCUS_RING, PRIMARY_BUTTON, Spinner } from "./ui";
+import { EASE, FOCUS_RING, PRIMARY_BUTTON, Spinner, StepHeader } from "./ui";
 
 const HAPPENS = [
   { title: "See who went quiet", line: "Mend's forecast picks the quiet regulars worth a nudge." },
@@ -59,29 +59,30 @@ export function StartStep({ api, notice, onStarted }: StartStepProps) {
 
   return (
     <section aria-labelledby="start-title">
-      <p className="font-mono text-[12px] uppercase tracking-[0.14em] text-bone-faint">The demo shop</p>
-      <h1
-        id="start-title"
-        className="poster-title mt-4 text-[44px] text-bone md:text-[64px]"
-        style={{ lineHeight: 0.9 }}
+      <StepHeader
+        tint="butter"
+        kicker="The demo shop"
+        titleId="start-title"
+        title="Run a real campaign."
+        titleClass="text-[38px] md:text-[56px]"
+        icon="/world/icons/start.webp"
       >
-        Run a real campaign.
-      </h1>
-      <p className="mt-6 max-w-[56ch] text-[16px] leading-[1.55] text-bone-dim md:text-[18px]">
-        This shop replays two years of a real store&apos;s orders. You ask Claude for a win-back plan, approve
-        the exact plan, and PayPal&apos;s sandbox pays it out. Rewards are small and capped, and some customers
-        are held back on purpose so you can see whether the money worked.
-      </p>
-      <p className="mt-4 text-[14px] text-bone-faint">
-        No sign-up and no PayPal login. Sandbox only: no real money moves.
-      </p>
+        <p className="mt-6 max-w-[56ch] text-[16px] leading-[1.55] text-ink-dim md:text-[18px]">
+          This shop replays two years of a real store&apos;s orders. You ask Claude for a win-back plan, approve
+          the exact plan, and PayPal&apos;s sandbox pays it out. Rewards are small and capped, and some customers
+          are held back on purpose so you can see whether the money worked.
+        </p>
+        <p className="mt-4 text-[14px] text-ink-dim">
+          No sign-up and no PayPal login. Sandbox only: no real money moves.
+        </p>
+      </StepHeader>
 
       <button
         type="button"
         onClick={start}
         disabled={pending}
         aria-busy={pending}
-        className={`group/primary ${PRIMARY_BUTTON} mt-8 h-12 gap-2 px-[22px] text-[15px] disabled:translate-y-0 disabled:cursor-default disabled:hover:translate-y-0 disabled:hover:bg-accent ${FOCUS_RING}`}
+        className={`group/primary ${PRIMARY_BUTTON} h-12 px-[22px] text-[15px] disabled:opacity-100 ${FOCUS_RING}`}
       >
         {pending ? (
           <>
@@ -114,35 +115,37 @@ export function StartStep({ api, notice, onStarted }: StartStepProps) {
       {message !== null && (
         <p
           role={failure === null ? "status" : "alert"}
-          className="mt-5 flex max-w-[56ch] items-start gap-3 text-[14px] leading-[1.5] text-bone-dim"
+          className="mt-5 flex max-w-[56ch] items-start gap-3 text-[14px] leading-[1.5] text-ink-dim"
         >
           <span aria-hidden="true" className="mt-[7px] block h-[6px] w-[6px] shrink-0 rounded-full bg-accent" />
           {message}
         </p>
       )}
 
-      <h2 className="mt-14 font-mono text-[12px] uppercase tracking-[0.14em] text-bone-faint">What happens</h2>
-      <ol role="list" className="mt-5 flex max-w-[56ch] flex-col gap-[18px]">
-        {HAPPENS.map((item, i) => (
-          <motion.li
-            key={item.title}
-            className="relative grid grid-cols-[36px_minmax(0,1fr)]"
-            initial={still ? false : { opacity: 0, y: 8 }}
-            whileInView={{ opacity: 1, y: 0 }}
-            viewport={{ once: true }}
-            transition={{ duration: 0.4, ease: EASE, delay: i * 0.06 }}
-          >
-            <span className="font-mono text-[12px] leading-6 text-bone-faint">0{i + 1}</span>
-            {i < HAPPENS.length - 1 && (
-              <span aria-hidden="true" className="absolute left-[7px] top-[28px] -bottom-[14px] w-px bg-bone/15" />
-            )}
-            <div>
-              <p className="text-[16px] leading-6 text-bone">{item.title}</p>
-              <p className="mt-[2px] text-[14px] leading-[1.5] text-bone-dim">{item.line}</p>
-            </div>
-          </motion.li>
-        ))}
-      </ol>
+      <div className="patch mt-10 p-7">
+        <h2 className="font-mono text-[13px] uppercase tracking-[0.08em] text-ink-dim">What happens</h2>
+        <ol role="list" className="mt-5 flex max-w-[56ch] flex-col gap-[18px]">
+          {HAPPENS.map((item, i) => (
+            <motion.li
+              key={item.title}
+              className="relative grid grid-cols-[36px_minmax(0,1fr)]"
+              initial={still ? false : { opacity: 0, y: 8 }}
+              whileInView={{ opacity: 1, y: 0 }}
+              viewport={{ once: true }}
+              transition={{ duration: 0.4, ease: EASE, delay: i * 0.06 }}
+            >
+              <span className="font-mono text-[12px] leading-6 text-ink-faint">0{i + 1}</span>
+              {i < HAPPENS.length - 1 && (
+                <span aria-hidden="true" className="absolute left-[7px] top-[28px] -bottom-[14px] w-0 border-l-[1.5px] border-dashed border-stitch" />
+              )}
+              <div>
+                <p className="text-[16px] leading-6 text-ink">{item.title}</p>
+                <p className="mt-[2px] text-[14px] leading-[1.5] text-ink-dim">{item.line}</p>
+              </div>
+            </motion.li>
+          ))}
+        </ol>
+      </div>
     </section>
   );
 }

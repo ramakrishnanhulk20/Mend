@@ -15,7 +15,7 @@ import {
   type AttackId,
   type AttackResult,
 } from "./breakit";
-import { FOCUS_RING, NoticePanel, PRIMARY_BUTTON, Spinner, StitchedThread, TextButton, UNDERLINE_DRAW } from "./ui";
+import { FOCUS_RING, NoticePanel, PRIMARY_BUTTON, Spinner, StepHeader, StitchedThread, TextButton, UNDERLINE_DRAW } from "./ui";
 
 const GROUPS: readonly AttackGroup[] = ["Money", "AI", "Web"];
 const DOCS_PATH = "/docs/security/try-to-break-it";
@@ -154,7 +154,7 @@ function DocsLink({ href, children }: { href: string; children: ReactNode }) {
       href={href}
       target="_blank"
       rel="noopener"
-      className={`group/text inline-flex items-center py-2 font-mono text-[12px] uppercase tracking-[0.14em] text-bone-dim transition-colors duration-200 ease-out hover:text-bone focus-visible:text-bone ${FOCUS_RING}`}
+      className={`group/text inline-flex items-center py-2 font-mono text-[12px] uppercase tracking-[0.14em] text-ink-dim transition-colors duration-200 ease-out hover:text-ink focus-visible:text-ink ${FOCUS_RING}`}
     >
       <span className="relative">
         {children}
@@ -168,14 +168,14 @@ function DocsLink({ href, children }: { href: string; children: ReactNode }) {
 }
 
 function Label({ children }: { children: ReactNode }) {
-  return <p className="font-mono text-[10.5px] uppercase tracking-[0.14em] text-bone-faint">{children}</p>;
+  return <p className="font-mono text-[12px] uppercase tracking-[0.14em] text-ink-dim">{children}</p>;
 }
 
 function ExchangeBlock({ label, text }: { label: string; text: string }) {
   return (
     <div className="min-w-0">
       <Label>{label}</Label>
-      <pre className="mt-2 max-h-[220px] overflow-auto whitespace-pre-wrap break-words rounded-[8px] border border-rule bg-ink-raised p-3 font-mono text-[12px] leading-[1.6] text-bone-dim [overflow-wrap:anywhere]">
+      <pre className="mt-2 max-h-[220px] overflow-auto whitespace-pre-wrap break-words rounded-[12px] bg-pale-teal p-4 font-mono text-[13px] leading-[1.6] text-ink [overflow-wrap:anywhere]">
         {text}
       </pre>
     </div>
@@ -186,13 +186,13 @@ function ResultBlock({ attack, result }: { attack: Attack; result: AttackResult 
   const held = result.outcome === "held";
   return (
     <>
-      <p className="mt-4 flex items-center gap-2 text-[15px]">
+      <p className="mt-4 flex items-center gap-2 text-[18px] font-semibold">
         {held ? (
           <StitchedThread />
         ) : (
-          <span aria-hidden="true" className="block h-[6px] w-[6px] shrink-0 rounded-full border border-bone-faint" />
+          <span aria-hidden="true" className="block h-[6px] w-[6px] shrink-0 rounded-full border border-ink-faint" />
         )}
-        <span className={held ? "text-bone" : "text-bone-dim"}>{summarise(result)}</span>
+        <span className={held ? "text-ink" : "text-ink-dim"}>{summarise(result)}</span>
       </p>
 
       {result.outcome === "not-held" && (
@@ -201,7 +201,7 @@ function ResultBlock({ attack, result }: { attack: Attack; result: AttackResult 
         </NoticePanel>
       )}
 
-      <div className="mt-4 grid grid-cols-1 gap-3 md:grid-cols-2">
+      <div className="mt-4 grid grid-cols-1 gap-3 md:grid-cols-2 lg:grid-cols-1 xl:grid-cols-2">
         <ExchangeBlock label="Sent" text={result.exchange.sent} />
         <ExchangeBlock label="Answer" text={result.exchange.answer} />
       </div>
@@ -209,7 +209,7 @@ function ResultBlock({ attack, result }: { attack: Attack; result: AttackResult 
       {held && (
         <div className="mt-4">
           <Label>What stopped it</Label>
-          <p className="mt-2 flex items-start gap-3 text-[14px] leading-[1.5] text-bone">
+          <p className="mt-2 flex items-start gap-3 text-[14px] leading-[1.5] text-ink">
             <span aria-hidden="true" className="mt-[7px] h-[6px] w-[6px] shrink-0 rounded-full bg-accent" />
             {attack.stoppedBy}
           </p>
@@ -239,14 +239,14 @@ export function AttackCard({ attack, running, result, needMet, locked, onRun }: 
   const thread: ThreadState = running ? "running" : (shown?.outcome ?? "idle");
 
   return (
-    <li className="-mx-3 grid grid-cols-1 gap-y-4 rounded-[8px] border-b border-rule px-3 py-7 transition-colors duration-150 ease-out hover:bg-ink-raised/40 md:grid-cols-[200px_minmax(0,1fr)] md:gap-x-10">
+    <li className="patch grid grid-cols-1 gap-y-4 p-7 md:grid-cols-[200px_minmax(0,1fr)] md:gap-x-10 lg:gap-x-6 xl:gap-x-10">
       <div>
         <AttackThread state={thread} />
       </div>
 
       <div className="min-w-0">
         <div className="flex flex-wrap items-baseline justify-between gap-x-4 gap-y-2">
-          <h3 className="font-sans text-[17px] font-semibold text-bone">{attack.title}</h3>
+          <h3 className="font-sans text-[17px] font-semibold text-ink">{attack.title}</h3>
           {waitingMessage === null && (
             <span title={shown === undefined ? undefined : attack.costNote}>
               <TextButton mono onClick={onRun} disabled={running || locked}>
@@ -265,13 +265,13 @@ export function AttackCard({ attack, running, result, needMet, locked, onRun }: 
           )}
         </div>
 
-        <p className="mt-1 text-[14px] leading-[1.5] text-bone-dim">{attack.tries}</p>
-        <p className="mt-1 font-mono text-[11px] text-bone-faint">{attack.costNote}</p>
+        <p className="mt-1 text-[14px] leading-[1.5] text-ink-dim">{attack.tries}</p>
+        <p className="mt-1 font-mono text-[12px] text-ink-dim">{attack.costNote}</p>
 
         {waitingMessage === null ? (
           <div aria-live="polite">{shown !== undefined && <ResultBlock attack={attack} result={shown} />}</div>
         ) : (
-          <p className="mt-4 text-[14px] text-bone-dim">{waitingMessage}</p>
+          <p className="mt-4 text-[14px] text-ink-dim">{waitingMessage}</p>
         )}
       </div>
     </li>
@@ -384,64 +384,66 @@ export function BreakItStep({ api, campaignId, sessionKey, onBack }: BreakItStep
 
   return (
     <section aria-labelledby="breakit-title">
-      <div className="md:flex md:items-start md:justify-between md:gap-6">
-        <div>
-          <p className="font-mono text-[12px] uppercase tracking-[0.14em] text-bone-faint">Step 6 &middot; Break it</p>
-          <h1 id="breakit-title" className="poster-title mt-4 text-[40px] text-bone md:text-[56px]" style={{ lineHeight: 0.9 }}>
-            Try to break it.
-          </h1>
-        </div>
-        <div className="mt-3 md:-mt-2 md:shrink-0">
+      <StepHeader
+        tint="peach"
+        kicker="Step 6 · Break it"
+        titleId="breakit-title"
+        title="Try to break it."
+        icon="/world/icons/breakit.webp"
+      >
+        <div className="mt-3 md:absolute md:right-11 md:top-[33px] md:mt-0">
           <TextButton mono onClick={onBack}>
             Back to the demo
           </TextButton>
         </div>
-      </div>
-      <p className="mt-5 max-w-[60ch] text-[16px] leading-[1.55] text-bone-dim">
-        Each attack sends a real request from your browser to the live app, and you see exactly what came back. Nothing
-        here is staged, and nothing you try here can move money.
-      </p>
-      <p className="mt-2 font-mono text-[12px] text-bone-faint">
-        Eleven attacks &middot; each one is real &middot; results stay in this tab
-      </p>
+        <p className="mt-5 max-w-[60ch] text-[16px] leading-[1.55] text-ink-dim">
+          Each attack sends a real request from your browser to the live app, and you see exactly what came back.
+          Nothing here is staged, and nothing you try here can move money.
+        </p>
+        <p className="mt-2 font-mono text-[12px] text-ink-dim">
+          Eleven attacks &middot; each one is real &middot; results stay in this tab
+        </p>
+      </StepHeader>
 
-      <div className="mt-8 flex flex-wrap items-center gap-x-6 gap-y-3">
-        <button
-          type="button"
-          onClick={runEvery}
-          disabled={anyRunning}
-          aria-busy={runAllActive}
-          className={`${PRIMARY_BUTTON} h-12 gap-2 px-[22px] text-[15px] disabled:translate-y-0 disabled:cursor-default disabled:hover:translate-y-0 disabled:hover:bg-accent ${runAllActive ? "" : "disabled:opacity-50"} ${FOCUS_RING}`}
-        >
-          {runAllActive ? (
-            <>
-              <Spinner />
-              {`Running ${progress} of ${RUN_ALL_ORDER.length}`}
-            </>
-          ) : (
-            "Run every attack"
-          )}
-        </button>
-        <DocsLink href={DOCS_PATH}>How each is tested</DocsLink>
-        {ranAll && !anyRunning && <p className="w-full font-mono text-[12px] text-bone-dim">{runAllSummary(counts)}</p>}
+      <div className="patch p-7">
+        <div className="flex flex-wrap items-center gap-x-6 gap-y-3">
+          <button
+            type="button"
+            onClick={runEvery}
+            disabled={anyRunning}
+            aria-busy={runAllActive}
+            className={`${PRIMARY_BUTTON} h-12 px-[22px] text-[15px] ${runAllActive ? "disabled:opacity-100" : ""} ${FOCUS_RING}`}
+          >
+            {runAllActive ? (
+              <>
+                <Spinner />
+                {`Running ${progress} of ${RUN_ALL_ORDER.length}`}
+              </>
+            ) : (
+              "Run every attack"
+            )}
+          </button>
+          <DocsLink href={DOCS_PATH}>How each is tested</DocsLink>
+          {ranAll && !anyRunning && <p className="w-full font-mono text-[12px] text-ink-dim">{runAllSummary(counts)}</p>}
+        </div>
+        {/* "At least": Mend's assistant makes one Claude call per round, and a round that uses a tool adds another. */}
+        <p className="mt-3 font-mono text-[12px] text-ink-dim">
+          Running them all uses at least 3 Claude calls and 2 of this session&apos;s 5 drafts a day. Nothing is paid.
+        </p>
       </div>
-      {/* "At least": Mend's assistant makes one Claude call per round, and a round that uses a tool adds another. */}
-      <p className="mt-3 font-mono text-[12px] text-bone-faint">
-        Running them all uses at least 3 Claude calls and 2 of this session&apos;s 5 drafts a day. Nothing is paid.
-      </p>
 
       {GROUPS.map((group) => {
         const attacks = ATTACKS.filter((attack) => attack.group === group);
         const headingId = group.toLowerCase();
         return (
-          <section key={group} aria-labelledby={headingId} className="mt-14">
-            <div className="flex items-baseline justify-between border-b border-rule pb-3">
-              <h2 id={headingId} className="font-mono text-[12px] uppercase tracking-[0.14em] text-bone-faint">
+          <section key={group} aria-labelledby={headingId} className="mt-12">
+            <div className="flex items-baseline justify-between border-b-[1.5px] border-dashed border-stitch pb-3">
+              <h2 id={headingId} className="font-mono text-[13px] uppercase tracking-[0.08em] text-ink-dim">
                 {group}
               </h2>
-              <span className="font-mono text-[12px] text-bone-faint">{`${attacks.length} attacks`}</span>
+              <span className="font-mono text-[12px] text-ink-dim">{`${attacks.length} attacks`}</span>
             </div>
-            <ul role="list">
+            <ul role="list" className="mt-4 flex flex-col gap-4">
               {attacks.map((attack) => (
                 <AttackCard
                   key={attack.id}

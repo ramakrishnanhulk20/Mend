@@ -1,6 +1,5 @@
 import type { Metadata } from "next";
 import { Console } from "@/components/console/Console";
-import { SmoothScroll } from "@/components/motion/SmoothScroll";
 
 export const metadata: Metadata = {
   title: "Demo | Mend",
@@ -8,10 +7,7 @@ export const metadata: Metadata = {
 };
 
 export default function DemoPage() {
-  return (
-    <>
-      <SmoothScroll />
-      <Console />
-    </>
-  );
+  // No smooth scrolling here: its own scroll target fights the jump to the top of each step,
+  // and a click right after a wheel scroll would leave the visitor below a shorter step.
+  return <Console />;
 }

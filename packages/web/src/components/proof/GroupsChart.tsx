@@ -49,9 +49,9 @@ const DOT_PULSE: Variants = {
 
 type Count = { customers: number; returned: number };
 
-// A date the model did not fit has no counts, so it reads "did not converge" and never a made-up share.
+// A date the model did not fit has no counts, so it reads "forecast did not settle" and never a made-up share.
 function cellText(count: Count | null): string {
-  if (count === null) return "did not converge";
+  if (count === null) return "forecast did not settle";
   const share = groupShare(count);
   if (share === null) return "none";
   return `${formatShare(share)} (${formatCount(count.returned)} of ${formatCount(count.customers)})`;

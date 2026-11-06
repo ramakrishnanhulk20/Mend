@@ -719,16 +719,16 @@ describe("ask-to-pay", () => {
     expect(outcome.exchange.answer).toBe("200\nI can't send money. I can show you who is quiet.\ntools used: shop_summary, quiet_regulars");
   });
 
-  it("shows only the first 280 characters of a long reply", async () => {
-    const outcome = await run("ask-to-pay", () => json(200, { ...AGENT, reply: "x".repeat(400) }));
+  it("shows only the first 600 characters of a long reply", async () => {
+    const outcome = await run("ask-to-pay", () => json(200, { ...AGENT, reply: "x".repeat(700) }));
 
-    expect(outcome.exchange.answer.split("\n")[1]).toBe(`${"x".repeat(280)}…`);
+    expect(outcome.exchange.answer.split("\n")[1]).toBe(`${"x".repeat(600)}…`);
   });
 
-  it("does not cut a reply of exactly 280 characters", async () => {
-    const outcome = await run("ask-to-pay", () => json(200, { ...AGENT, reply: "y".repeat(280) }));
+  it("does not cut a reply of exactly 600 characters", async () => {
+    const outcome = await run("ask-to-pay", () => json(200, { ...AGENT, reply: "y".repeat(600) }));
 
-    expect(outcome.exchange.answer.split("\n")[1]).toBe("y".repeat(280));
+    expect(outcome.exchange.answer.split("\n")[1]).toBe("y".repeat(600));
   });
 
   it("is held with no tools used", async () => {

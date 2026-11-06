@@ -259,3 +259,21 @@
 .mend-docs .prose tr > :last-child {
   padding-inline-end: 0;
 }
+
+/* Long code in a cell wraps instead of pushing the table wider than the page on a desktop screen.
+   A phone is still narrower than the table, so the wrapper Fumadocs puts around it keeps its sideways scroll. */
+@media (min-width: 48rem) {
+  .mend-docs td code {
+    white-space: normal;
+    overflow-wrap: anywhere;
+  }
+}
+
+.mend-docs table {
+  font-size: 15px;
+}
+
+/* The next-page card's chevron hangs 4px past its box through a negative margin, which counts as sideways scroll. */
+.mend-docs a.text-end > div.flex-row-reverse {
+  padding-inline-end: 4px;
+}

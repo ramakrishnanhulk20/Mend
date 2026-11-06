@@ -12,6 +12,7 @@ const LINKS = [
   { label: "Results", href: "/#results" },
   { label: "Guardrails", href: "/#safety" },
   { label: "Docs", href: "/docs" },
+  { label: "GitHub", href: "https://github.com/ramakrishnanhulk20/Mend" },
 ];
 
 export function Footer() {

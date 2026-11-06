@@ -81,9 +81,9 @@ function PlanPanel({ draft, still, onReview }: { draft: Draft; still: boolean; o
   const changes = draft.plan?.changes ?? [];
   const panel = useRef<HTMLDivElement>(null);
 
-  // The plan lands under the goal form, below the fold on most screens; "nearest" brings its button into view.
+  // The plan lands under the goal form, below the fold on most screens; centring it keeps its button well inside the window.
   useEffect(() => {
-    panel.current?.scrollIntoView({ behavior: still ? "auto" : "smooth", block: "nearest" });
+    panel.current?.scrollIntoView({ behavior: still ? "auto" : "smooth", block: "center" });
   }, [still]);
 
   return (
@@ -163,6 +163,7 @@ export function PlanStep({ api, onDrafted, onReview }: PlanStepProps) {
   const [budget, setBudget] = useState("");
   const textarea = useRef<HTMLTextAreaElement>(null);
   const budgetInput = useRef<HTMLInputElement>(null);
+  const pendingPanel = useRef<HTMLDivElement>(null);
   const controller = useRef<AbortController | null>(null);
   const pending = outcome.kind === "pending";
   const elapsed = useElapsedSeconds(pending);
@@ -173,6 +174,11 @@ export function PlanStep({ api, onDrafted, onReview }: PlanStepProps) {
     },
     [],
   );
+
+  // The drafting panel can sit below the fold, so it is brought into view the moment the click lands.
+  useEffect(() => {
+    if (pending) pendingPanel.current?.scrollIntoView({ behavior: still ? "auto" : "smooth", block: "center" });
+  }, [pending, still]);
 
   useEffect(() => {
     if (outcome.kind === "needs_budget") budgetInput.current?.focus();
@@ -310,7 +316,7 @@ export function PlanStep({ api, onDrafted, onReview }: PlanStepProps) {
 
       <div aria-live="polite">
         {outcome.kind === "pending" && (
-          <div className="patch mt-6 p-7">
+          <div ref={pendingPanel} className="patch mt-6 p-7">
             <LoomLine />
             <p className="mt-4 text-[14px] leading-[1.5] text-ink-dim">
               Claude reads your goal, then Mend&apos;s engine picks the customers and holds a random group back.

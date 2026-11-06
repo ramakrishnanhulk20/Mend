@@ -74,7 +74,7 @@ export function HowItWorks() {
             <div
               key={panel.numeral}
               style={{ "--stack-top": `${96 + i * 14}px` } as CSSProperties}
-              className={`patch patch-tinted ${panel.tint} grid items-center gap-7 px-[26px] py-[30px] lg:min-h-[min(620px,calc(100svh-150px))] lg:grid-cols-[1fr_1.15fr] lg:gap-14 lg:p-14 lg:motion-safe:sticky lg:motion-safe:top-[var(--stack-top)] lg:motion-safe:mb-10`}
+              className={`patch patch-tinted ${panel.tint} grid items-center gap-7 px-[26px] py-[30px] lg:min-h-[min(620px,calc(100svh-150px))] lg:grid-cols-[1fr_1.15fr] lg:gap-14 lg:p-14 lg:motion-safe:sticky lg:motion-safe:top-[var(--stack-top)] ${i < PANELS.length - 1 ? "lg:motion-safe:mb-[26svh]" : "lg:motion-safe:mb-10"}`}
             >
               <div className="min-w-0">
                 <motion.p
@@ -108,13 +108,7 @@ export function HowItWorks() {
                     className="block h-full w-full object-cover transition-transform duration-500 ease-out motion-reduce:transition-none motion-safe:group-hover/frame:scale-[1.03]"
                   />
                 </div>
-                <div className="mt-5 flex flex-wrap gap-2">
-                  {panel.tags.map((tag) => (
-                    <span key={tag} className="label-tag">
-                      {tag}
-                    </span>
-                  ))}
-                </div>
+                <p className="mt-5 font-mono text-[13px] text-ink-dim">{panel.tags.join(" · ")}</p>
               </div>
             </div>
           ))}

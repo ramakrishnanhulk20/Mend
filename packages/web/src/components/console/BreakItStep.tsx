@@ -175,7 +175,7 @@ function ExchangeBlock({ label, text }: { label: string; text: string }) {
   return (
     <div className="min-w-0">
       <Label>{label}</Label>
-      <pre className="mt-2 max-h-[220px] overflow-auto whitespace-pre-wrap break-words rounded-[12px] bg-pale-teal p-4 font-mono text-[13px] leading-[1.6] text-ink [overflow-wrap:anywhere]">
+      <pre className="mt-2 max-h-[360px] overflow-auto whitespace-pre-wrap break-words rounded-[12px] bg-pale-teal p-4 font-mono text-[13px] leading-[1.6] text-ink [overflow-wrap:anywhere]">
         {text}
       </pre>
     </div>

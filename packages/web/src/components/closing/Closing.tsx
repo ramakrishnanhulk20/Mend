@@ -123,7 +123,7 @@ export function Closing() {
         </motion.div>
 
         <motion.p
-          className="mt-8 border-t border-rule pt-6 text-left font-mono text-[12px] uppercase leading-[2] tracking-[0.18em] text-ink-faint"
+          className="mt-8 border-t border-rule pt-6 text-left font-mono text-[12px] uppercase leading-[2] tracking-[0.18em] text-ink-dim"
           {...rise(still, patchInView, 360)}
         >
           Mend. A win-back engine for shops. Built on PayPal Payouts, Log in with PayPal and

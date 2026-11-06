@@ -8,6 +8,7 @@ Mend moves money, holds customers' details and runs a public demo where anyone c
 ## Money
 
 - One money path. Money leaves the shop only when an approved plan becomes one PayPal Payouts batch, or when the simulate button buys from the shop with PayPal's sandbox test card. No assistant tool, webhook or scheduled job can create a payment, an order, a capture or a refund. The one exception is the reconcile job resending a batch whose first send got no clear answer, from the same approved plan under the same id, so PayPal pays it at most once. Cancelling an unclaimed reward only returns money.
+- The dashboard's agents cannot reach money. They run in the browser and have no tool that touches a campaign, an approval or a payout, and each round is capped from a pool of its own. See [Claude in Mend](/docs/developers/ai#the-dashboards-agents).
 - Approval by fingerprint. The owner approves a hash of every recipient, amount and note. The batch is built from that frozen copy, and any change voids the approval. Only a person's click can approve.
 - At most one batch per campaign. The move to sending is one atomic step, and the batch id is derived from the plan, so double clicks, two tabs and retries cannot pay twice. In a test, 20 approve requests at once produced one PayPal call.
 - Caps in code. Every amount is computed by code in whole cents and checked against the per-customer cap, the per-campaign cap and a rolling daily cap, when the draft is built and again at approval. The demo's caps are USD 2.00, USD 10.00 and USD 50.00 a day across all visitors. No one can change a cap from the site.
@@ -17,7 +18,7 @@ Mend moves money, holds customers' details and runs a public demo where anyone c
 
 - Opt-in only. Nobody is paid without joining with Log in with PayPal, on consent wording that names every use of their data. Leaving deletes them and cancels any unsent campaign that includes them.
 - Recipients from PayPal. The address paid comes from the member's own PayPal sign-in, never from an order record, a note or anything Claude wrote.
-- No customer email reaches Claude. Prompts carry opaque references, item names and counts.
+- No customer email reaches Claude. Prompts carry opaque references, item names and counts. The dashboard's data agent can also see the shop's made-up display names, such as "Maya R.".
 - PayPal data is deleted within 48 hours. Stored webhook payloads are purged at 47 hours.
 - Demo identities are made up. The demo shop's order history is real, and every name and email in it is generated.
 

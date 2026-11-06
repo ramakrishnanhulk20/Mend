@@ -15,7 +15,7 @@ Mend finds a shop's regulars who have gone quiet, has Claude draft a small cashb
 | Jobs, `mend-jobs` | A Render cron job, every 5 minutes | Runs purge, process_events, reconcile, refresh_items and cancel_demo_unclaimed |
 | Database, `mend-db` | Render Postgres 18 | Order records, members and their consent, campaigns, payouts and an append-only audit log |
 | PayPal webhook | Sandbox webhook `8N112937B9769545W`, posting to `/api/webhooks/paypal` | 12 event types: 8 for payout items, 3 for payout batches, 1 for completed captures |
-| Claude | `claude-haiku-5-5` on the Anthropic API | Reads the owner's goal, writes the notes, answers the owner's questions |
+| Claude | `claude-haiku-5-5` on the Anthropic API | Reads the owner's goal, writes the notes, answers the owner's questions, runs the dashboard's agents |
 
 Everything is PayPal sandbox. No real money moves.
 
@@ -70,12 +70,29 @@ Mend works from the shop's own order history. A forecast picks the regulars who 
 - The held-back group is drawn by code from a secure random source before Claude sees anyone, and it is never paid.
 - Returns count for 30 days from the send. Mend uses Fisher's exact test and gives a verdict and a p-value only after the window closes, with at least 30 members in each group and 5 returns expected in the smaller one. Until then it says "too early to tell".
 - Simulated returns are labelled and kept out of the verdict.
+- The dashboard (step 07, built on AG Studio) shows the verdict, the money and every customer's thread on three pages. A Mend analyst on the dashboard answers "Did this campaign work?" from the same numbers. More below.
 
 ### Guardrails
 
 - Demo caps in code: USD 2.00 per customer, USD 10.00 per campaign, USD 50.00 a day across all demo visitors.
 - Sandbox only. Mend refuses to start with any other PayPal setting.
 - Customer emails never reach Claude, and the assistant's PayPal keys cannot send payouts.
+
+## The owner's dashboard, built on AG Studio
+
+Step 07 of the demo is the owner's dashboard, built on AG Studio 3.0.0. It has three pages (This campaign, The shop, The proof), an Edit layout switch and a Mend analyst the owner can ask whether a campaign worked. Paths below are inside `packages/web/src`.
+
+| Studio feature | What Mend did with it |
+|---|---|
+| Custom widgets | Two of Mend's own: `mend-verdict` ("Did it work?") and `mend-threads` ("Every customer's thread"), in `components/studio/widgets/` |
+| Theming | `components/studio/studio-theme.ts` gives Studio the site's own look: paper, ink, the red accent, a dashed stitch round each widget and Fraunces titles |
+| Layout tools | Three pages, Edit layout, and a separate stacked layout for phones, in `components/studio/dashboard-report.ts` |
+| Data | `components/studio/dashboard-data.ts` builds eight flat tables in the browser from answers Mend's own API already gave. No table holds an email or a payer id |
+| A custom agent | `mend_analyst`, with three read-only tools that hand back rows the page already holds: `components/studio/agents/analyst.ts`, `components/studio/agents/tools.ts` |
+| Talking to Studio's built-in agents | `mend_lead` replaces Studio's lead, because the built-in lead cannot discover a custom agent. It hands work to Studio's planning, data, page and widget agents: `components/studio/agents/lead.ts` |
+| Claude behind our own route | Studio's Direct LLM Runner sends each round through `components/studio/studio-adapter.ts` to `POST /api/studio/turn` (`app/api/studio/turn/route.ts`, `server/studio-agent.ts`), which makes the Claude call. No key reaches the browser |
+
+No agent on the dashboard has a tool that sends money.
 
 ## PayPal pieces used
 
@@ -281,9 +298,10 @@ Everything here runs on the PayPal sandbox: real Payouts batches and real PayPal
 4. 03 Approve shows every reward with its note and every held-back customer as a dotted thread. Optionally press **Have Claude write the notes** for one personal note per customer from their own past items. Press **Approve this exact plan**: Mend seals the plan and shows its fingerprint. Press **Review the payout**.
 5. On 04 Payout, press **Send with PayPal**. Mend sends one Payouts batch and shows PayPal's batch id. Watch the threads: each one is stitched as PayPal confirms that customer's payment, usually within about a minute. The first customer in the list is the one real sandbox account, so when the random draw pays it, PayPal marks its reward claimed. The stand-ins have no PayPal account, so PayPal holds their cashback as unclaimed. Press **See the results**.
 6. 05 Results compares the paid group with the held-back group and gives the verdict, which for a five-person demo group is "too early to tell". Press **Simulate a return purchase**: Mend buys from the shop with PayPal's sandbox test card for the customer you pick, and the return is counted for their group as simulated.
-7. Press **Take back** (the button shows the amount) to cancel the unclaimed cashback. PayPal returns it to the shop, and the results show how much came back. If you leave it, mend-jobs takes it back on its own once it has waited 10 minutes.
-8. Ask Mend in the side panel, for example "How many quiet regulars does my shop have right now?". It answers from live data and says which tools it used.
-9. Choose **06 Break it** at the end of the step rail and press **Run every attack**. Each card sends a real request from your browser and shows what came back: a goal asking Claude for USD 5,000 clamped to USD 10, a draft over the caps refused by the engine, a changed fingerprint refused, an unapproved send that sends nothing, a fake PayPal webhook refused, and six more. [We tried to break it](https://mend-web.onrender.com/docs/security/try-to-break-it) lists the test behind each one.
+7. Press **Open the dashboard** on the results screen (step 07 in the rail). It opens on This campaign: the verdict, the money and every customer's thread. Look at The shop and The proof, then open the Mend analyst panel on the left and ask "Did this campaign work?". It reads the campaign result with a read tool and answers from it. On a desktop, **Edit layout** lets you rearrange the widgets. **Back to the demo** returns to the results.
+8. Press **Take back** (the button shows the amount) to cancel the unclaimed cashback. PayPal returns it to the shop, and the results show how much came back. If you leave it, mend-jobs takes it back on its own once it has waited 10 minutes.
+9. Ask Mend in the side panel, for example "How many quiet regulars does my shop have right now?". It answers from live data and says which tools it used.
+10. Choose **06 Break it** at the end of the step rail and press **Run every attack**. Each card sends a real request from your browser and shows what came back: a goal asking Claude for USD 5,000 clamped to USD 10, a draft over the caps refused by the engine, a changed fingerprint refused, an unapproved send that sends nothing, a fake PayPal webhook refused, and six more. [We tried to break it](https://mend-web.onrender.com/docs/security/try-to-break-it) lists the test behind each one.
 
 ### The proof we run
 
@@ -364,6 +382,7 @@ The settings in `.env`. `dev:console` will not start without `PAYPAL_CLIENT_ID`,
 | `MEND_DEV` | Local development | Keep `1` |
 | `DATABASE_URL` | Leave empty: the local run uses its own Postgres | |
 | `MEND_OWNER_PASSWORD` | Optional locally: the owner sign-in | Any long random value |
+| `AG_STUDIO_LICENSE_KEY` | Optional: the AG Studio trial key. Without it Studio shows a short trial notice and everything still works | ag-grid.com/studio/license-pricing/?tab=trial |
 | `PAYPAL_WEBHOOK_ID`, `RENDER_API_KEY` | Only for deploying to Render | Not needed locally |
 
 The first run builds the local demo shop: it downloads UCI Online Retail II, imports it and measures the model, which takes about two minutes. Later runs start in seconds. When it prints `console ready: http://localhost:3001/demo`, open that address and follow the judge path above.
@@ -391,6 +410,7 @@ Every route the demo and the join pages call. `GET /api/health` and `GET /api/se
 | GET | `/api/campaigns/<id>/results` | Paid against held back, the verdict, and where each payout stands |
 | POST | `/api/campaigns/<id>/cancel-unclaimed` | Asks PayPal to return every unclaimed reward to the shop |
 | POST | `/api/agent` | One message to Ask Mend, answered through Mend's tools |
+| POST | `/api/studio/turn` | One round of the dashboard's chat panel: Studio's request in, one Claude call, Studio's answer out. Runs no tool |
 | GET | `/api/runs/<runId>` | The answer of a route that was still waiting |
 | GET | `/api/join/consent` | The exact words a customer agrees to by joining |
 | GET, POST | `/api/join/paypal/start` | The join or leave confirmation page, and the click that starts Log in with PayPal |
@@ -414,7 +434,8 @@ Run each suite from its own folder: the engine tests from `packages/engine` with
 ## What it costs
 
 - PayPal: the sandbox charges USD 0.25 per payout item, in test money. A demo campaign of 5 rewards sends USD 10.00 and pays USD 1.25 in sandbox fees.
-- Claude Haiku 5.5: one call reads the goal and one call writes each note, so a demo campaign with personal notes uses 6 calls. The demo is capped at 40 calls a day per session, 80 a day per address and 50 an hour across all visitors, with token budgets on top.
+- Claude Haiku 5.5: one call reads the goal and one call writes each note, so a demo campaign with personal notes uses 6 calls. The demo is capped at 40 calls a day per session, 80 a day per address and 50 an hour across all visitors, with token budgets on top. These limits cover plans, notes and Ask Mend.
+- Claude Haiku 5.5 on the dashboard: the Mend analyst and Studio's agents draw on counts of their own, so a long chat cannot use up the calls the plan and the notes need. The limits are 24 calls an hour and 30 a day per session, 60 a day per address, and 120 an hour across all visitors with the last 20 kept for sessions still on their first question. A session runs one call at a time. The dashboard stops at 150,000 tokens a day per session, 300,000 per address and 3,500,000 across the demo, which always leaves 50,000, 100,000 and 1,500,000 for plans, notes and Ask Mend. Measured: "Did this campaign work?" takes 4 calls and about 11,000 tokens; "Who should I look at next?" takes 7 calls and about 37,000 tokens; adding a chart takes 6 to 7 calls and 32,000 to 42,000 tokens.
 - Hosting: about USD 22 a month on Render: mend-web and mend-engine at about USD 7 each, mend-db at about USD 6, and mend-jobs at USD 1 a month plus run minutes.
 
 ## Project structure
@@ -425,6 +446,7 @@ packages/
     src/app/           pages and API routes
     src/server/        PayPal, MCP client, webhook check, sessions, limits, Claude
     src/components/    the landing page and the console
+      studio/          the dashboard on AG Studio: widgets, theme, pages, data tables and agents
     content/docs/      the /docs pages
     evals/             injected-text and owner-request sets for the AI
     scripts/           dev:console and the local proofs
@@ -444,6 +466,7 @@ LICENSE
 |---|---|
 | Web | Next.js 16.4.2, React 19.3.1, TypeScript 6.0.3, Tailwind CSS 4.3.3, motion 14.7.1, Lenis 1.3.27, zod 4.6.7, node-postgres 8.23.1 |
 | Art | Blender 5.2.3 (Cycles), every model and animation written as Python in `art/world/`; no stock art |
+| Dashboard | AG Studio 3.0.0 (ag-studio, ag-studio-react) |
 | Docs | Fumadocs (fumadocs-ui 16.17.9, fumadocs-core 16.17.9, fumadocs-mdx 15.4.10) serves the `/docs` route from `packages/web/content/docs` |
 | Diagrams | Mermaid 12.2.0, drawn in the browser |
 | AI | Claude Haiku 5.5 (`claude-haiku-5-5`) through `@anthropic-ai/sdk` 1.3.0 |
@@ -461,7 +484,7 @@ LICENSE
 - The engine and the web app connect to the database as separate roles. Neither can change the schema or a trigger, and the audit log only accepts new rows.
 - Webhooks are verified in the app against PayPal's certificate, and each one is only a prompt to re-read the payout from PayPal.
 - The assistant's PayPal keys cannot send payouts, and only four read tools can be called.
-- No customer email reaches Claude: prompts carry opaque references, item names and counts.
+- No customer email reaches Claude: prompts carry opaque references, item names and counts. The dashboard's data agent can also see the shop's made-up display names, such as "Maya R.".
 
 Three review rounds on 26 and 27 Oct 2026 found 16 important issues, and a separate audit on 27 Oct found 15 more, closed on 28 Oct. Every one was fixed with a test that failed before the fix. These are self-audits, not an outside firm's; the [reviews page](https://mend-web.onrender.com/docs/security/reviews) says how they were run. The full threat model is [docs/security/threat-model.md](docs/security/threat-model.md).
 

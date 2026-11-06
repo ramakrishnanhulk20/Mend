@@ -59,15 +59,19 @@ The results show, for each group, how many customers came back, real and simulat
 
 Press **Simulate a return purchase** and pick a customer. Mend makes a real sandbox purchase from the shop with PayPal's test card for that customer and shows PayPal's order id. Within about a minute the return is counted for that customer's group as simulated, and a knot appears at the end of their thread.
 
-## 7. Take back unclaimed cashback
+## 7. Dashboard
+
+Press **Open the dashboard** on the results screen, or choose **07 Dashboard** at the end of the step rail (the "07 Dashboard" button on a phone). It shows the shop, this campaign and the proof on three pages: This campaign, The shop and The proof. The first holds Mend's two own widgets, "Did it work?" and "Every customer's thread". Look at each page, then open the Mend analyst panel on the left and ask "Did this campaign work?". It reads the campaign result with a read tool and answers from it. On a desktop, **Edit layout** lets you rearrange the widgets. **Back to the demo** returns to the results. [The dashboard](/docs/guides/dashboard) explains each page, the analyst and its limits.
+
+## 8. Take back unclaimed cashback
 
 Press **Take back**, which shows the amount still unclaimed. Mend asks PayPal to cancel each unclaimed payment, and the results show how much came back to the shop. If you leave it, Mend's scheduled job takes demo cashback back on its own once it has waited 10 minutes. [Take back unclaimed cashback](/docs/guides/take-back-unclaimed) covers the details, including when PayPal fails one item.
 
-## 8. Ask Mend
+## 9. Ask Mend
 
 Open Ask Mend in the side panel and ask, for example, "How many quiet regulars does my shop have right now?". The assistant answers from live data through Mend's own tools and says which tools it used. It can read, draft and put a plan in the approval queue. It cannot approve, pay or refund. See [Claude in Mend](/docs/developers/ai).
 
-## 9. Break it
+## 10. Break it
 
 Step 06 in the rail (the "06 Break it" button on a phone) runs eleven real attacks from your browser against the live app: over the caps through Claude and around it, a stranger as payee, a changed fingerprint, an unapproved send, a second send, an email slipped to Claude, a request for Claude to pay, a forged PayPal webhook, a campaign that is not yours and a request without the security token. Each card shows the request and the real answer. [We tried to break it](/docs/security/try-to-break-it) lists the test behind each one.
 
@@ -83,4 +87,6 @@ The demo is shared by every visitor, so it has limits. Each one answers with a p
 | Campaigns sent per network | 4 a day |
 | Money sent across all demo visitors | USD 50.00 a day |
 | Simulated purchases | 10 per campaign, 10 an hour per session |
-| Claude calls | 40 a day per session, 80 a day per network, 50 an hour across all visitors |
+| Claude calls for plans, notes and Ask Mend | 40 a day per session, 80 a day per network, 50 an hour across all visitors |
+| Claude calls for the dashboard's agents | 24 an hour and 30 a day per session, 60 a day per network and 120 an hour across all visitors |
+| Claude tokens for the dashboard's agents | They stop at 150,000 a day per session, 300,000 per network and 3,500,000 across the demo, out of 200,000, 400,000 and 5,000,000 |

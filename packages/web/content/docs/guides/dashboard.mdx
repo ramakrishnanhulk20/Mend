@@ -1,0 +1,96 @@
+---
+title: The dashboard
+description: "The owner's dashboard on AG Studio: three pages of live numbers, Mend's two own widgets, Edit layout, and the Mend analyst that answers from the same numbers."
+---
+
+The dashboard is step 07 in the demo console. It shows the shop, the latest campaign and the proof behind the forecast on three pages, built on AG Studio 3.0.0 from AG Grid. Every number comes from Mend's own API, the same answers the other steps read.
+
+Open it with **Open the dashboard** on the results screen, or choose **07 Dashboard** at the end of the step rail (on a phone, the "07 Dashboard" button beside the progress line). It needs a demo session. **Back to the demo** returns to the step you came from.
+
+It opens on This campaign when a campaign is open, and on The shop when none has been planned yet. While a campaign is still moving, its numbers refresh every 20 seconds as long as the tab is visible.
+
+## The three pages
+
+### This campaign
+
+- Did it work?, one of Mend's own widgets: the verdict, and a thread each for the paid group and the held-back group.
+- Four figures in US dollars: Claimed, Waiting, Returned and Fees.
+- Every customer's thread, the other of Mend's widgets.
+- Where the money is: the same four amounts as a donut.
+- Everyone in this campaign: a table with each customer's rank, name, group, amount, payment, whether they came back and whether that was a simulated return.
+
+### The shop
+
+- Four figures: Customers, Quiet regulars, Worth a nudge, and what the quiet regulars spent last year.
+- Quiet regulars by forecast group, Who can be paid, top 50 (joined, demo stand-in or not on the list) and Silent days against expected orders, top 50.
+- Top 50 quiet regulars, as a table.
+
+### The proof
+
+- Quiet regulars who came back on their own: on past orders, the share of each forecast group who came back with no cashback.
+- Ten equal groups of customers ranked by the forecast, and the share of each who came back.
+- A note on where the numbers were measured.
+
+## Mend's two widgets
+
+### Did it work?
+
+The verdict in words, then one thread for the paid group and one for the held-back group, each with how many customers came back. Simulated returns are counted apart from real ones. It shows a share of customers only when Mend has a verdict, so it never hints at a result while the verdict says "too early to tell". [Measuring lift](/docs/concepts/measuring-lift) explains why.
+
+### Every customer's thread
+
+One thread for each customer in the campaign: the name, a thread that shows where the payment stands, and the amount. A thread dotted all the way is a customer held back. A click on a thread filters the page by that payment status.
+
+Both sit in a group called Mend, first in the widget menu in Edit layout, so you can add another copy anywhere. They wear the site's own look: paper, ink, the red accent, a dashed stitch round each widget and Fraunces titles.
+
+## Edit layout
+
+On a screen 860 pixels wide or more, press **Edit layout** above the dashboard. Drag a widget to move it, drag its edge to resize it, add widgets from the menu, and use the edit and data panels on the right to change what a widget shows. Press **Done** to go back to reading. While you edit, the analyst panel steps aside so the page keeps its width.
+
+Mend does not save your changes. They live in this browser tab, they survive the numbers refreshing, and a reload starts again from Mend's layout.
+
+Below 860 pixels the dashboard has its own stacked layout, not the desktop one squeezed in: every widget full width and the figures two to a row. Edit layout is not offered there.
+
+## The Mend analyst
+
+The analyst panel starts closed, on every screen size. Open it from the strip at the left edge. It offers three starter questions: "Did this campaign work?", "Who should I look at next?" and "Add a chart of claimed against waiting". You can also type your own.
+
+It can:
+
+- Say whether the campaign worked. It reads the verdict, quotes it word for word with how many customers each group holds and how many came back, and says "too early to tell" plainly when that is the verdict. It never counts a simulated return as real.
+- Say where the money stands: claimed, waiting, returned and fees.
+- Explain the forecast groups and how each one behaved on past orders.
+- Name who to look at next: the biggest spenders in the worth-a-nudge group, with the days each has been silent. If they are demo stand-ins, it says so.
+- Add a chart or a widget to your dashboard, by asking Studio's page and widget agents to place and set one up.
+
+It cannot:
+
+- Pay, approve, cancel, refund or message anyone, and nor can anyone on its team. None of them has a tool for it. If you ask, it says so and points you to Mend's own screens.
+- Reach anything the page does not already hold. Its three read tools take no input, make no request and write nothing.
+- Change anything outside your own browser tab. A chart it adds is yours alone and is not saved.
+
+Its words are Claude's. The rules it is given, such as quoting the verdict exactly, are instructions to the model. What it can reach is set by its list of tools, not by those instructions, so check any number against the widgets.
+
+Behind the panel is a small team: Mend, the lead, who is the only one that talks to you; the Mend analyst; and Studio's own planning, data, page and widget agents. [Claude in Mend](/docs/developers/ai) covers how they are wired and capped.
+
+## Limits
+
+| What | Limit |
+|---|---|
+| Claude calls from the dashboard | 24 an hour and 30 a day per demo session, and 120 an hour across all demo visitors, with the last 20 of those kept for sessions still on their first question |
+| Claude calls per network | 60 a day, counted apart from the 80 a day that plans, notes and Ask Mend use |
+| Claude tokens | The dashboard stops at 150,000 a day per session, 300,000 per network and 3,500,000 across the demo, so plans, notes and Ask Mend always keep 50,000, 100,000 and 1,500,000 |
+| Rounds per question | At most 8 for the lead, 6 for the analyst, 4 each for planning, page and widget, and 3 for data |
+| Opening the dashboard | Reads the quiet regulars (60 an hour per session), the campaign results (240 an hour) and the plan view for the Amount column (60 an hour), the same limits as the other steps |
+
+A question costs several calls, because each agent takes a round of its own. Measured figures:
+
+| Question | Claude calls | Tokens |
+|---|---|---|
+| Did this campaign work? | 4 | About 11,000 |
+| Who should I look at next? | 7 | About 37,000 |
+| Add a chart | 6 to 7 | 32,000 to 42,000 |
+
+At those costs a session has room for about seven answers to the first question, or about four to the second, in a day.
+
+When a limit is reached, the panel says so in plain words. The pages, the widgets and Edit layout keep working, and so does the rest of Mend. With no Anthropic key on the server, the panel says it needs one and nothing else changes.

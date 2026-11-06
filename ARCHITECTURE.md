@@ -17,6 +17,8 @@ Everything runs against the PayPal sandbox. Security rules referenced as C1 to C
 | Read-only PayPal app | PayPal sandbox, the same business account | A second sandbox app created without the Payouts permission. Its keys (`PAYPAL_READ_CLIENT_ID`, `PAYPAL_READ_CLIENT_SECRET`) live on mend-web only and serve only the agent's four reads. PayPal answers 403 when its token asks for a payout batch, so a leaked read token cannot pay anyone. When the pair is not set, the reads use the main app's keys. |
 | Claude Haiku 5.5 | Anthropic API | Reads the owner's goal into structured campaign settings; writes one note per customer; answers the owner's questions through read-only tools. Never chooses an amount or a recipient (C4, C5, C11). |
 
+The dashboard's agents run in the visitor's browser on AG Studio, and each round reaches Claude through `POST /api/studio/turn` on counts of its own; their tools read what the page already holds and cannot reach money (C20, C31).
+
 Where each PayPal call lives:
 
 | PayPal call | Caller | How |
@@ -265,6 +267,7 @@ The full reference, with every request and answer shape, is the API page of the 
 | `GET /api/campaigns/<id>/results` | own campaigns | Paid against held back, the verdict, and where every payout stands |
 | `POST /api/campaigns/<id>/cancel-unclaimed` | own campaigns | Asks PayPal to return every unclaimed reward to the shop |
 | `POST /api/agent` | demo, owner | One message to the assistant, answered from Mend's tools |
+| `POST /api/studio/turn` | demo, owner | One round of the dashboard's chat panel: one Claude call, no tool run on the server |
 | `GET /api/runs/<runId>` | the session that started the run | The answer of a route that was still waiting |
 
 ## Open items

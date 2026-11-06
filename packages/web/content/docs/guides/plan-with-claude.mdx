@@ -55,7 +55,9 @@ The rule does not judge persuasive wording. You read every note before you appro
 | Limit | Value |
 |---|---|
 | Plans and drafts per demo session | 20 an hour, 5 drafts a day |
-| Claude calls | 40 a day per demo session, 80 a day per network, 50 an hour across all demo visitors |
-| Claude tokens | 200,000 a day per demo session, 400,000 per network, 5,000,000 across the demo |
+| Claude calls for plans, notes and Ask Mend | 40 a day per demo session, 80 a day per network, 50 an hour across all demo visitors |
+| Claude tokens, for every Claude call together | 200,000 a day per demo session, 400,000 per network, 5,000,000 across the demo |
 
 A demo campaign with personal notes uses 6 Claude calls: 1 to read the goal and 1 for each of its 5 notes.
+
+The [dashboard's agents](/docs/guides/dashboard) draw on counts of their own, so chatting there never uses up these calls. They stop at 150,000 of a session's 200,000 tokens, 300,000 of a network's 400,000 and 3,500,000 of the demo's 5,000,000, which always leaves 50,000, 100,000 and 1,500,000 for plans, notes and Ask Mend.

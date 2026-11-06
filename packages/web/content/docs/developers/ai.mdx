@@ -1,6 +1,6 @@
 ---
 title: Claude in Mend
-description: What Claude does in Mend and what it can never do, the assistant's tools, how injected text is kept harmless, and the evaluation sets.
+description: What Claude does in Mend and what it can never do, the assistant's tools, the dashboard's agents, how injected text is kept harmless, and the evaluation sets.
 ---
 
 Mend uses Claude Haiku 5.5 (`claude-haiku-5-5`) through the Anthropic API, from the web app's server only. The key never reaches a browser.
@@ -10,6 +10,7 @@ Mend uses Claude Haiku 5.5 (`claude-haiku-5-5`) through the Anthropic API, from 
 - Reads the owner's goal into a few numbers: budget, reward per customer, share held back, customers considered. See [Plan with Claude](/docs/guides/plan-with-claude).
 - Writes one short thank-you note per paid customer, from that customer's own past item names and how long since they last ordered.
 - Answers the owner's questions in Ask Mend, through Mend's own tools and PayPal's read-only tools.
+- Runs the agents behind the dashboard's chat panel, with a pool of its own. See [The dashboard's agents](#the-dashboards-agents).
 
 ## What Claude cannot do
 
@@ -19,7 +20,7 @@ The rule is structural: whatever Claude outputs, these hold.
 - It never chooses who is paid. The engine builds the eligible list from the forecast's worth-a-nudge group and the members' consent, and draws the held-back group at random before Claude sees anyone. Claude sees customers only as opaque references for that campaign, and an unknown or repeated reference rejects the whole draft.
 - It never approves or sends. Approval is a person's click on the campaign page, bound to the plan's fingerprint.
 - It never touches PayPal. Mend's server makes every PayPal call, with four read tools named in code, keys that cannot send payouts, and answers rebuilt without the buyer's identity.
-- It never sees a customer's email, phone, PayPal id or a secret. Prompts carry references, item names, counts and recency.
+- It never sees a customer's email, phone, PayPal id or a secret. Prompts carry references, item names, counts and recency. The one addition is the shop's made-up display names in the dashboard's agents, covered below.
 
 ## The assistant's tools
 
@@ -40,11 +41,39 @@ Every tool checks the caller's role in the one permission table, takes a strict 
 
 ## Limits on a turn
 
+These are Ask Mend's limits. The dashboard's agents have their own, in the next section.
+
 - At most 8 tool calls, 10 model rounds and 60 seconds per message.
 - One tool at a time, so a turn never holds more than the session's share of the engine.
 - The reply comes back as plain text of at most 4,000 characters, with images, HTML and email addresses removed. The console shows it as text, never as markup.
-- Claude calls are capped: 40 a day per demo session, 80 a day per address, 50 an hour across all demo visitors and 2,000 a day for the owner.
-- Tokens are capped per day: 200,000 per demo session, 400,000 per address, 5,000,000 across the demo and 2,000,000 for the owner.
+- Claude calls for plans, notes and Ask Mend are capped: 40 a day per demo session, 80 a day per address, 50 an hour across all demo visitors and 2,000 a day for the owner.
+- Tokens are capped per day, for every Claude call together: 200,000 per demo session, 400,000 per address, 5,000,000 across the demo and 2,000,000 for the owner.
+
+## The dashboard's agents
+
+The chat panel on the [dashboard](/docs/guides/dashboard) is run by a team of six agents, built on AG Studio's agent tools:
+
+| Agent | What it does |
+|---|---|
+| Mend (`mend_lead`) | The lead, and the only one that talks to the owner. It replaces Studio's own lead, because the built-in lead can hand work only to its fixed list and would never find a custom agent |
+| Mend analyst (`mend_analyst`) | Mend's own agent. Three read tools, `read_campaign_result`, `read_forecast_groups` and `read_money`, return rows the page already holds. It can hand a job to the data, page and widget agents |
+| Studio's planning, data, page and widget agents | Studio's built-in agents, each trimmed of the parts of its prompt this dashboard does not use, because every round resends the prompt |
+
+### The route
+
+Studio runs its agent loop and its tools in the visitor's browser. Each round it sends one request to `POST /api/studio/turn`, which makes one Claude call and hands Studio the answer. The route runs no tool, and no key reaches the browser. It fixes the model, the output cap (4,000 tokens a round) and the effort, whatever the browser sends, and it accepts only the 18 tool names in its list, whether offered, forced or found in the history. Everything the browser sends is treated as untrusted, like the message sent to Ask Mend.
+
+### A pool of its own
+
+One dashboard question takes several rounds, so these calls count on their own at every level: 24 an hour and 30 a day per demo session (`claude_studio_session_hour`, `claude_studio_session`), 60 a day per address (`claude_studio_address`) and 120 an hour across all demo visitors (`claude_studio_all`, with the last 20 kept for sessions still on their first question). A chat on the dashboard can never use up the calls the plan, the notes and Ask Mend need. The token budgets above are shared, so total spend has one ceiling, but the dashboard's agents stop early: at 150,000 a day per session, 300,000 per address and 3,500,000 across the demo. That always leaves 50,000, 100,000 and 1,500,000 for plans, notes and Ask Mend. A demo session's dashboard calls run one at a time, with at most 3 waiting.
+
+### Display names
+
+The dashboard's tables hold the shop's display names, and the data agent can put them in a prompt when it runs a query. They are made up: a first name and an initial, such as "Maya R.", picked by a hash of the customer's reference, never a real person's name. No table holds an email, a phone number or a PayPal id, and the route removes anything shaped like an email address before the call.
+
+### No agent can move money
+
+Each of the 18 tools runs in the visitor's browser and changes at most their own dashboard: Studio's tools for reading data, arranging widgets and keeping a plan, the two that pass work between agents, and Mend's three reads. None can reach a campaign, an approval, a payout, a message or a server record. A test fails if a tool name contains pay, send, approve, cancel, refund, transfer or payout. The system prompt also tells Claude it cannot approve, send, pay or refund, but nothing depends on that.
 
 ## Text an attacker writes
 
@@ -67,4 +96,4 @@ On 24 Oct 2026 the run scored 16 of 16 requests, and all 11 injected notes were 
 
 ## Without a key
 
-With no `ANTHROPIC_API_KEY`, goal reading falls back to the form's numbers, notes keep the shop's template, and the assistant answers that it needs a key. The rest of Mend works.
+With no `ANTHROPIC_API_KEY`, goal reading falls back to the form's numbers, notes keep the shop's template, and the assistant answers that it needs a key. The dashboard's chat panel answers the same; its pages, widgets and Edit layout do not use Claude. The rest of Mend works.

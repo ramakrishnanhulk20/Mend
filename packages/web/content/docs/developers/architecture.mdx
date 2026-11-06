@@ -21,6 +21,9 @@ Everything runs against the PayPal sandbox.
 | PayPal sandbox | PayPal | Payouts, Orders v2, balances, webhooks, Log in with PayPal, the hosted MCP server. |
 | Read-only PayPal app | PayPal sandbox, same business account | A second app without Payouts, used only for the agent's four reads. |
 | Claude Haiku 5.5 | Anthropic API | Reads the owner's goal, writes the notes, answers questions. Never picks an amount or a recipient (C4, C5, C11). |
+| The dashboard's agents | The visitor's browser, on AG Studio | Answer questions about the dashboard and arrange that visitor's widgets. |
+
+The dashboard's agents reach Claude through `POST /api/studio/turn`, one Claude call a round on counts of its own, and their tools cannot reach money (C20, C31).
 
 ### Web app
 

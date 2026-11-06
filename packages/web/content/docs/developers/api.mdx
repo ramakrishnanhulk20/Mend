@@ -98,11 +98,19 @@ Limit: 240 per session an hour. Waits up to 15 seconds.
 
 Own campaigns, once sent. No body. Asks PayPal to return every unclaimed reward. Answers `{"campaignId", "cancelled", "returnedMinor", "stillUnclaimed", "notCancellable", "incomplete", "paypalStatus", "paypalName"}`; when PayPal fails on an item, `incomplete` is true and the last failure's status and short error name are given. `409 not_submitted` before the campaign is sent. Limit: 10 per session an hour. Waits up to 30 seconds.
 
-## The assistant
+## The assistant and the dashboard's agents
 
 ### `POST /api/agent`
 
-Demo or owner. Body, at most 64 KB: `{"message": "...", "history": [...]}`, with a message of 1 to 2,000 characters and at most 10 earlier turns of `{"role": "owner" | "agent", "text": "..."}`. Answers `{"reply", "toolsUsed", "stopped", "aiCalls"}`, where `stopped` is `tool_limit`, `declined` or null. Errors: `503 no_key` without an Anthropic key, `429 limit_reached` and `429 claude_token_cap`. Limits: 40 Claude calls per demo session a day, 80 per address a day, 50 an hour across all demo visitors.
+Demo or owner. Body, at most 64 KB: `{"message": "...", "history": [...]}`, with a message of 1 to 2,000 characters and at most 10 earlier turns of `{"role": "owner" | "agent", "text": "..."}`. Answers `{"reply", "toolsUsed", "stopped", "aiCalls"}`, where `stopped` is `tool_limit`, `declined` or null. Errors: `503 no_key` without an Anthropic key, `429 limit_reached` and `429 claude_token_cap`. Limits: 40 Claude calls per demo session a day, 80 per address a day (shared with the dashboard's route below), 50 an hour across all demo visitors.
+
+### `POST /api/studio/turn`
+
+Demo or owner. One round of the dashboard's chat panel, which runs on AG Studio. Studio runs its agent loop and its tools in the browser; each round it sends this route one request, and the route makes one Claude call and returns the result. The route runs no tool. See [The dashboard's agents](/docs/developers/ai#the-dashboards-agents).
+
+Body, at most 64 KB, Studio's own request: `input` (the history, at most 60 items), `instructions` (at most 20,000 characters), `tools`, `toolChoice`, `responseFormat` (`{"type": "text"}`) and an optional `model`, which must be Mend's own. Only the 18 tool names in the route's list are accepted, whether offered, forced or found in the history; any other name, or any other key, answers 400 `invalid_input`. Answers `{"events", "response"}`: the text and tool-call events Studio reads, and the final response with its token counts. The model, the output cap of 4,000 tokens a round and the effort are fixed by the server, whatever the body asks for.
+
+Errors: `403 csrf_refused`, `not_allowed` without a session, `400 invalid_input`, `413`, `415`, `503 no_key` without an Anthropic key, `429 limit_reached` and `429 claude_token_cap`. Any other Claude failure answers 422 or 503 with a plain message and a `ref`. Limits: these calls count on their own, 24 an hour and 30 a day per demo session, 60 a day per address and 120 an hour across all demo visitors. They stop at 150,000 tokens a day per session, 300,000 per address and 3,500,000 across the demo. A demo session runs one call at a time with at most 3 waiting; past that the route answers `429 limit_reached`.
 
 ## Runs
 

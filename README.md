@@ -305,7 +305,7 @@ Everything here runs on the PayPal sandbox: real Payouts batches and real PayPal
 
 ### The proof we run
 
-`node scripts/deploy/render.mjs prove` checks the live deployment end to end. It needs our Render API key, so judges read its output instead of running it. The last run, on 6 Nov 2026 against mend-web on commit `ea689f4` (mend-engine and mend-jobs on `392915a`), passed 19 of 19:
+`node scripts/deploy/render.mjs prove` checks the live deployment end to end. It needs our Render API key, so judges read its output instead of running it. The last run, on 11 Nov 2026 against mend-web on commit `969eb17` (mend-engine and mend-jobs on `392915a`), passed 19 of 19:
 
 ```text
 PASS  health: https://mend-web.onrender.com/api/health says ok
@@ -316,17 +316,17 @@ PASS  database role: mend_engine is refused a trigger change, an audit_log updat
 PASS  private: mend-engine has no public URL and does not resolve on public DNS
 PASS  journey plan: a demo visitor asked "bring back my quiet regulars, 50 dollars"; Claude read it; 5 rewarded at 200 cents (1000 in total), 5 held back
 PASS  journey notes: Claude wrote 5 personal notes, 0 fell back to the shop's template
-PASS  journey payout: viewed with its hash, approved with that hash and submitted; PayPal holds batch E8FAF9MDPJ95A
+PASS  journey payout: viewed with its hash, approved with that hash and submitted; PayPal holds batch JC7TABN3DLPX6
 PASS  read keys: the read-only app's token carries 27 scopes, none for payouts, and PayPal answers 403 to a payout batch read
-PASS  delivery: PayPal's batch webhook was verified and stored once, processed 1 s after it arrived; the test receiver's item was SUCCESS 50 s after submit
+PASS  delivery: PayPal's batch webhook was verified and stored once, processed 1 s after it arrived; the test receiver's item was SUCCESS 56 s after submit
 PASS  cancel: the 4 unclaimed rewards were cancelled, returnedMinor 800, stillUnclaimed 0, incomplete false
 PASS  demo pool: the campaign counted 1000 cents toward the demo pool before the cancel and 200 after
 PASS  forgery: an altered copy of that delivery was refused by the signature check (400); a replay was answered 200 with nothing stored
-PASS  simulate: a return purchase (PayPal order 3AR23776V6505213N, COMPLETED) was attributed to the rewarded group as simulated; verdict: too early to tell
+PASS  simulate: a return purchase (PayPal order 4LJ06889TH201502K, COMPLETED) was attributed to the rewarded group as simulated; verdict: too early to tell
 PASS  agent: asked "How many quiet regulars does my shop have right now?", it used quiet_regulars and answered 1357
-PASS  jobs: mend-jobs last ran successfully at 2026-11-06T05:35:19Z and the purge is on record in audit_log
+PASS  jobs: mend-jobs last ran successfully at 2026-11-11T04:25:32Z and the purge is on record in audit_log
 PASS  idempotent: `up` would change nothing
-PASS  secrets: no secret value or key shape in the output, render-state.json, 239 answers from mend-web or 445 log lines
+PASS  secrets: no secret value or key shape in the output, render-state.json, 225 answers from mend-web or 268 log lines
 D2 RESULT: PASS
 ```
 
@@ -418,18 +418,18 @@ Every route the demo and the join pages call. `GET /api/health` and `GET /api/se
 
 ## Tests
 
-Run on 6 Nov 2026 in a fresh clone of commit `883abfe`:
+Run on 6 Nov 2026 in a fresh clone of commit `969eb17`:
 
 ```text
 packages/engine$ .venv/Scripts/python.exe -m pytest -q -p no:cacheprovider
 977 passed, 4 skipped
 
 packages/web$ npx vitest run
- Test Files  36 passed (36)
-      Tests  1370 passed (1370)
+ Test Files  43 passed (43)
+      Tests  1535 passed (1535)
 ```
 
-Run each suite from its own folder: the engine tests from `packages/engine` with the virtualenv active (`.venv/bin/python` on macOS and Linux), the web tests from `packages/web`. The engine suite takes about five minutes and the web suite under one. The engine tests need no network; they start a local Postgres. Those 3 extra engine skips are benchmark tests. They pass (980 passed, 1 skipped) once `python -m mend_engine.prove_model`, run from `packages/engine` with the virtualenv active and no keys needed, has downloaded the CDNOW sample once. The live proof, `node scripts/deploy/render.mjs prove`, passed 19 of 19 on 6 Nov (above).
+Run each suite from its own folder: the engine tests from `packages/engine` with the virtualenv active (`.venv/bin/python` on macOS and Linux), the web tests from `packages/web`. The engine suite takes about five minutes and the web suite under one. The engine tests need no network; they start a local Postgres. Those 3 extra engine skips are benchmark tests. They pass (980 passed, 1 skipped) once `python -m mend_engine.prove_model`, run from `packages/engine` with the virtualenv active and no keys needed, has downloaded the CDNOW sample once. The live proof, `node scripts/deploy/render.mjs prove`, passed 19 of 19 on 11 Nov (above).
 
 ## What it costs
 
